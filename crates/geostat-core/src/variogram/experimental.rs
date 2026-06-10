@@ -142,7 +142,9 @@ pub fn experimental_variogram(
                             continue;
                         }
                     }
-                    let bin = ((d / width) as usize).min(n_lags - 1);
+                    // Right-closed lag intervals ((b-1)w, bw], matching the
+                    // gstat/GSLIB convention for pairs exactly on a boundary.
+                    let bin = ((d / width).ceil() as usize - 1).min(n_lags - 1);
                     let dz = values[i] - values[j];
                     acc.sq[bin] += 0.5 * dz * dz;
                     acc.h[bin] += d;
@@ -199,12 +201,13 @@ mod tests {
             direction: None,
         };
         let ev = experimental_variogram(&line_data(), &cfg).unwrap();
-        // Pairs: d=1 (x2, gamma 0.5 each) -> bin 2; d=2 (gamma 2.0) -> bin 3.
+        // Right-closed bins of width 0.5: d=1 (x2, gamma 0.5 each) falls in
+        // (0.5, 1.0] -> bin 1; d=2 (gamma 2.0) in (1.5, 2.0] -> bin 3.
         assert_eq!(ev.bins[0].n_pairs, 0);
-        assert_eq!(ev.bins[1].n_pairs, 0);
-        assert_eq!(ev.bins[2].n_pairs, 2);
-        assert!((ev.bins[2].gamma - 0.5).abs() < 1e-12);
-        assert!((ev.bins[2].h - 1.0).abs() < 1e-12);
+        assert_eq!(ev.bins[1].n_pairs, 2);
+        assert!((ev.bins[1].gamma - 0.5).abs() < 1e-12);
+        assert!((ev.bins[1].h - 1.0).abs() < 1e-12);
+        assert_eq!(ev.bins[2].n_pairs, 0);
         assert_eq!(ev.bins[3].n_pairs, 1);
         assert!((ev.bins[3].gamma - 2.0).abs() < 1e-12);
     }

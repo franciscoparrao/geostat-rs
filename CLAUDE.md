@@ -1,7 +1,8 @@
 # geostat-rs — Motor de geoestadística en Rust ("GSLIB moderno")
 
-> **Estado:** MVP v0.1 implementado (2026-06-10). Workspace `geostat-core` + `geostat-cli`.
-> Pendiente: validación numérica contra gstat (Meuse), PyO3, WASM.
+> **Estado:** MVP v0.1 implementado y **validado contra gstat** (2026-06-10).
+> Paridad a precisión de máquina en variograma/OK/CV sobre Meuse — ver `validation/README.md`.
+> Pendiente: Walker Lake, validación distribucional de SGS, PyO3, WASM.
 > Familia de motores Rust del autor: SurtGIS, Hydroflux, Smelt, Anvil, Cantus, Criterium.
 > Doc madre: `~/proyectos/ideas-motores-rust.md` (idea A1).
 
@@ -41,9 +42,10 @@ Computers & Geosciences.
 - **Smelt**: cuantificación de incertidumbre espacial para ML.
 
 ## Próximos pasos al retomar
-1. ~~Decidir si es crate standalone o módulo `surtgis geostat`~~ → **standalone** (decidido 2026-06-10).
-2. Exportar Meuse desde R (`library(sp); data(meuse)`) y correr el flujo
-   variograma → kriging → CV con el CLI (`geostat variogram/krige/cv`).
-3. Validar paridad numérica del kriging ordinario contra gstat (mismas
-   predicciones ± tolerancia) antes de confiar en SGS para el paper.
-4. `git init` + primer commit (el workspace ya tiene .gitignore).
+1. ~~Decidir si es crate standalone o módulo `surtgis geostat`~~ → **standalone** (2026-06-10).
+2. ~~Exportar Meuse y validar contra gstat~~ → **hecho** (2026-06-10): paridad
+   1e-12 en OK/CV, bins exactos, ajuste coincide a 1e-6. `validation/compare.py`.
+3. ~~git init + primer commit~~ → repo en https://github.com/franciscoparrao/geostat-rs (privado).
+4. Validación Walker Lake + SGS distribucional vs gstat (`krige(..., nsim)`).
+5. v0.2: co-kriging, KED, SIS, anisotropía en modelos, kd-tree, benches criterion.
+6. Bindings PyO3 y demo WASM; luego draft para Mathematical Geosciences.
