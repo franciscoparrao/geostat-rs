@@ -1,0 +1,19 @@
+[package]
+name = "geostat-cli"
+description = "Command-line interface for the geostat-rs geostatistics engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "geostat"
+path = "src/main.rs"
+
+[dependencies]
+geostat-core = { path = "../geostat-core" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+csv = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,68 @@
+//! # geostat-core
+//!
+//! Geostatistics engine in pure Rust: variography, kriging and sequential
+//! Gaussian simulation. No I/O, no heavy dependencies — a modern take on
+//! the GSLIB/gstat feature set, designed for native (Rayon), Python (PyO3)
+//! and WASM targets.
+//!
+//! ## Feature overview
+//!
+//! - Experimental variograms, omnidirectional and directional.
+//! - Theoretical models: spherical, exponential, Gaussian, Matérn (ν = 3/2,
+//!   5/2), nested structures plus nugget.
+//! - Weighted least-squares model fitting (Nelder–Mead, gstat-style weights).
+//! - Simple, ordinary and universal kriging with optional search
+//!   neighborhoods, in parallel over prediction targets.
+//! - Leave-one-out cross-validation (ME, MAE, RMSE, MSDR).
+//! - Conditional sequential Gaussian simulation with deterministic seeding.
+//!
+//! ## Example
+//!
+//! ```
+//! use geostat_core::{
+//!     Kriging, KrigingConfig, ModelKind, PointSet, Structure, VariogramModel,
+//! };
+//!
+//! let data = PointSet::new(
+//!     vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.2]],
+//!     vec![1.0, 2.0, 1.5, 2.5, 1.2],
+//! )
+//! .unwrap();
+//! let model = VariogramModel::new(
+//!     0.0,
+//!     vec![Structure::new(ModelKind::Spherical, 1.0, 2.0)],
+//! )
+//! .unwrap();
+//! let kriging = Kriging::new(&data, &model, KrigingConfig::default()).unwrap();
+//! let est = kriging.predict([0.5, 0.5]).unwrap();
+//! assert!(est.value.is_finite() && est.variance >= 0.0);
+//! ```
+
+#![warn(missing_docs)]
+// `!(x > 0.0)` is used deliberately throughout parameter validation: unlike
+// `x <= 0.0`, it also rejects NaN.
+#![allow(clippy::neg_cmp_op_on_partial_ord)]
+
+pub mod data;
+pub mod error;
+pub mod grid;
+pub mod kriging;
+pub mod linalg;
+pub mod rng;
+pub mod simulation;
+pub mod transform;
+pub mod validation;
+pub mod variogram;
+
+pub use data::PointSet;
+pub use error::{GeostatError, Result};
+pub use grid::Grid2D;
+pub use kriging::{Kriging, KrigingConfig, KrigingEstimate, KrigingMethod};
+pub use rng::Rng;
+pub use simulation::{SgsConfig, SgsResult, sequential_gaussian_simulation};
+pub use transform::NormalScore;
+pub use validation::{CvResult, leave_one_out};
+pub use variogram::{
+    DirectionConfig, ExperimentalVariogram, FitResult, LagBin, ModelKind, Structure,
+    VariogramConfig, VariogramModel, experimental_variogram, fit_best, fit_model,
+};

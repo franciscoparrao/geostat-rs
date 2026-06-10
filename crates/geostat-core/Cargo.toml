@@ -1,0 +1,16 @@
+[package]
+name = "geostat-core"
+description = "Geostatistics engine: variography, kriging and sequential Gaussian simulation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords = ["geostatistics", "kriging", "variogram", "simulation", "spatial"]
+categories = ["science", "mathematics"]
+
+[dependencies]
+ndarray = { workspace = true }
+rayon = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
