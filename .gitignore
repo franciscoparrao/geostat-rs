@@ -1,5 +1,4 @@
 /target
-Cargo.lock
 *.csv
 !tests/data/*.csv
 .vscode/
