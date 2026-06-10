@@ -1,8 +1,9 @@
 # geostat-rs — Motor de geoestadística en Rust ("GSLIB moderno")
 
-> **Estado:** MVP v0.1 implementado y **validado contra gstat** (2026-06-10).
-> Paridad a precisión de máquina en variograma/OK/CV sobre Meuse — ver `validation/README.md`.
-> Pendiente: Walker Lake, validación distribucional de SGS, PyO3, WASM.
+> **Estado:** MVP v0.1 implementado y **validado contra gstat** (2026-06-10):
+> paridad a precisión de máquina en variograma/OK/CV sobre **Meuse y Walker Lake**,
+> y SGS estadísticamente indistinguible (1000 realizaciones, ensemble vs ensemble).
+> Ver `validation/README.md`. Pendiente: PyO3, WASM, paper.
 > Familia de motores Rust del autor: SurtGIS, Hydroflux, Smelt, Anvil, Cantus, Criterium.
 > Doc madre: `~/proyectos/ideas-motores-rust.md` (idea A1).
 
@@ -46,6 +47,10 @@ Computers & Geosciences.
 2. ~~Exportar Meuse y validar contra gstat~~ → **hecho** (2026-06-10): paridad
    1e-12 en OK/CV, bins exactos, ajuste coincide a 1e-6. `validation/compare.py`.
 3. ~~git init + primer commit~~ → repo en https://github.com/franciscoparrao/geostat-rs (privado).
-4. Validación Walker Lake + SGS distribucional vs gstat (`krige(..., nsim)`).
+4. ~~Validación Walker Lake + SGS distribucional~~ → **hecho** (2026-06-10):
+   paridad 1e-12 en OK/CV; SGS a 1000 realizaciones pasa todos los chequeos
+   distribucionales (`validation/compare_walker.py`). geostat-rs 7× más
+   rápido que gstat en SGS. Caveat documentado: despiking de empates antes
+   de SGS es responsabilidad del usuario (práctica GSLIB).
 5. v0.2: co-kriging, KED, SIS, anisotropía en modelos, kd-tree, benches criterion.
 6. Bindings PyO3 y demo WASM; luego draft para Mathematical Geosciences.
