@@ -1,9 +1,10 @@
 # geostat-rs — Motor de geoestadística en Rust ("GSLIB moderno")
 
-> **Estado:** MVP v0.1 implementado y **validado contra gstat** (2026-06-10):
-> paridad a precisión de máquina en variograma/OK/CV sobre **Meuse y Walker Lake**,
-> y SGS estadísticamente indistinguible (1000 realizaciones, ensemble vs ensemble).
-> Ver `validation/README.md`. Pendiente: PyO3, WASM, paper.
+> **Estado:** v0.2 completa y **validada contra gstat** (2026-06-11):
+> v0.1 (variograma/OK/UK/SK/CV/SGS) + v0.2 (co-kriging LMC, KED, SIS,
+> anisotropía, kd-tree, benches) — paridad a precisión de máquina en todo lo
+> determinista (Meuse + Walker Lake); SGS validado distribucionalmente.
+> Ver `validation/README.md`. Pendiente: PyO3, WASM, 3-D, paper.
 > Familia de motores Rust del autor: SurtGIS, Hydroflux, Smelt, Anvil, Cantus, Criterium.
 > Doc madre: `~/proyectos/ideas-motores-rust.md` (idea A1).
 
@@ -23,8 +24,11 @@ bindings modernos). No hay un motor geoestadístico Rust con WASM/Python.
 - [x] Cross-validation (LOO) y mapas de varianza de kriging.
 - [x] Simulación secuencial gaussiana (SGS) → realizaciones + incertidumbre.
       RNG determinista (xoshiro256++), reproducible cross-platform.
-- [ ] (v0.2) Co-kriging, kriging con deriva externa, SIS, anisotropía en
-      modelos, kd-tree para búsqueda de vecinos, benches con criterion.
+- [x] (v0.2) Co-kriging ordinario con LMC (+ fit Goulard-style con proyección
+      PSD), kriging con deriva externa, SIS (sisim-style), anisotropía
+      geométrica en modelos, kd-tree (kriging) + bucket grid (simulación),
+      benches con criterion. Todo lo determinista validado contra gstat.
+- [ ] (v0.3) PyO3, WASM, soporte 3-D, kriging por bloques.
 
 ## Arquitectura tentativa
 - `geostat-core`: variograma, sistemas de kriging, RNG determinista.
@@ -52,5 +56,7 @@ Computers & Geosciences.
    distribucionales (`validation/compare_walker.py`). geostat-rs 7× más
    rápido que gstat en SGS. Caveat documentado: despiking de empates antes
    de SGS es responsabilidad del usuario (práctica GSLIB).
-5. v0.2: co-kriging, KED, SIS, anisotropía en modelos, kd-tree, benches criterion.
+5. ~~v0.2: co-kriging, KED, SIS, anisotropía, kd-tree, benches~~ → **hecho**
+   (2026-06-11), validado contra gstat a 1e-12 (KED/aniso/co-kriging);
+   SIS con tests internos (sills de indicador ≈ p(1-p)).
 6. Bindings PyO3 y demo WASM; luego draft para Mathematical Geosciences.

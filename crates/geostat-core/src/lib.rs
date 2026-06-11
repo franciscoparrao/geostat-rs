@@ -43,26 +43,32 @@
 // `x <= 0.0`, it also rejects NaN.
 #![allow(clippy::neg_cmp_op_on_partial_ord)]
 
+pub mod cokriging;
 pub mod data;
 pub mod error;
 pub mod grid;
 pub mod kriging;
 pub mod linalg;
 pub mod rng;
+mod search;
 pub mod simulation;
+pub mod sis;
 pub mod transform;
 pub mod validation;
 pub mod variogram;
 
+pub use cokriging::{CoKriging, CoKrigingConfig, Lmc, LmcStructure, fit_lmc};
 pub use data::PointSet;
 pub use error::{GeostatError, Result};
 pub use grid::Grid2D;
 pub use kriging::{Kriging, KrigingConfig, KrigingEstimate, KrigingMethod};
 pub use rng::Rng;
 pub use simulation::{SgsConfig, SgsResult, sequential_gaussian_simulation};
+pub use sis::{SisConfig, sequential_indicator_simulation};
 pub use transform::NormalScore;
-pub use validation::{CvResult, leave_one_out};
+pub use validation::{CvResult, leave_one_out, leave_one_out_with_drift};
 pub use variogram::{
-    DirectionConfig, ExperimentalVariogram, FitResult, LagBin, ModelKind, Structure,
-    VariogramConfig, VariogramModel, experimental_variogram, fit_best, fit_model,
+    Anisotropy, DirectionConfig, ExperimentalVariogram, FitResult, LagBin, ModelKind, Structure,
+    VariogramConfig, VariogramModel, experimental_cross_variogram, experimental_variogram,
+    fit_best, fit_model,
 };

@@ -12,21 +12,28 @@ prediction out of the box.
 | `geostat-core` | Library: no I/O, no heavy dependencies. Targets native (Rayon), Python (PyO3, planned) and WASM (planned). |
 | `geostat-cli` | `geostat` command-line tool: CSV in, CSV/JSON out. |
 
-## Features (v0.1 MVP)
+## Features (v0.2)
 
-- **Experimental variograms** — omnidirectional and directional
-  (azimuth + angular tolerance, gstat/GSLIB convention).
+- **Experimental variograms** — omnidirectional, directional (azimuth +
+  angular tolerance, gstat/GSLIB convention) and cross-variograms.
 - **Theoretical models** — spherical, exponential, Gaussian, Matérn
-  (ν = 3/2, 5/2), nested structures plus nugget.
+  (ν = 3/2, 5/2), nested structures plus nugget, with optional geometric
+  anisotropy per structure (major-axis azimuth + ratio).
 - **Model fitting** — weighted least squares (`N_j / h_j²` weights,
-  gstat's default) via Nelder–Mead; automatic best-family selection.
-- **Kriging** — simple, ordinary and universal (linear/quadratic drift),
-  global or moving neighborhood (k-nearest, search radius), parallel
-  over prediction targets, kriging variance maps.
-- **Validation** — leave-one-out cross-validation: ME, MAE, RMSE, MSDR.
-- **Simulation** — conditional sequential Gaussian simulation with
-  normal-score transform and a deterministic, platform-independent RNG
-  (xoshiro256++): same seed, same realizations, on any machine.
+  gstat's default) via Nelder–Mead; automatic best-family selection;
+  2-variable LMC fitting with PSD projection.
+- **Kriging** — simple, ordinary, universal (polynomial drift) and
+  **external drift** (KED); **ordinary co-kriging** under a linear model
+  of coregionalization; kd-tree moving neighborhoods; parallel over
+  targets; kriging variance maps.
+- **Validation** — leave-one-out cross-validation (ME, MAE, RMSE, MSDR),
+  with or without external drift.
+- **Simulation** — conditional sequential **Gaussian** simulation
+  (normal-score transform) and sequential **indicator** simulation
+  (GSLIB-style ccdf with order-relation corrections), both with a
+  deterministic, platform-independent RNG (xoshiro256++) and incremental
+  bucket-grid neighbor search: same seed, same realizations, anywhere.
+- **Benchmarks** — criterion suite (`cargo bench -p geostat-core`).
 
 ## Build
 
@@ -54,6 +61,18 @@ geostat krige -i meuse.csv --value-col zinc -m model.json \
 # 4. Conditional SGS, 100 realizations, reproducible
 geostat sgs -i meuse.csv --value-col zinc \
     --nx 100 --ny 100 -n 100 --seed 42 -o sims.csv
+
+# 5. Kriging with external drift (covariates in data and targets CSVs)
+geostat krige -i meuse.csv --value-col lzinc -m model.json \
+    --drift-cols sdist --targets grid_with_sdist.csv -o ked.csv
+
+# 6. Ordinary co-kriging with a collocated secondary variable
+geostat cokrige -i meuse.csv --value-col lzinc --secondary-col llead \
+    --nx 100 --ny 100 -o cokriged.csv     # LMC auto-fitted (or --lmc lmc.json)
+
+# 7. Sequential indicator simulation at the quartiles
+geostat sis -i meuse.csv --value-col zinc --quantiles 0.25,0.5,0.75 \
+    --nx 100 --ny 100 -n 50 --seed 42 -o sis.csv
 ```
 
 Other useful flags: `--azimuth/--tolerance` (directional variograms),
@@ -104,12 +123,13 @@ scaling), so ranges are comparable across families.
 
 ## Roadmap
 
-- v0.1: ✅ variography, OK/UK/SK kriging, LOO CV, SGS — paridad numérica
-  con gstat pendiente.
-- v0.2: co-kriging, kriging with external drift, sequential indicator
-  simulation (SIS), anisotropy in models (not just experimental),
-  kd-tree neighbor search, `criterion` benchmarks.
-- Targets: Python bindings (PyO3), WASM demo.
+- v0.1: ✅ variography, OK/UK/SK kriging, LOO CV, SGS. Validated against
+  gstat at machine precision (Meuse, Walker Lake) — see `validation/`.
+- v0.2: ✅ co-kriging (LMC), KED, SIS, model anisotropy, kd-tree/bucket
+  neighbor search, criterion benchmarks. KED/anisotropy/co-kriging also
+  validated against gstat at machine precision.
+- Next: Python bindings (PyO3), WASM demo, 3-D support, paper draft
+  (Mathematical Geosciences).
 
 ## License
 

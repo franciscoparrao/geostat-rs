@@ -97,20 +97,73 @@ impl fmt::Display for ModelKind {
 }
 
 /// One nested structure: a model family with its partial sill and range.
+/// Geometric (range) anisotropy, gstat/GSLIB convention: `azimuth_deg` is
+/// the direction of the *major* axis in degrees clockwise from north, and
+/// `ratio = minor_range / major_range` in `(0, 1]`. The structure's `range`
+/// is the major-axis range.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Anisotropy {
+    /// Major-axis direction, degrees clockwise from north.
+    pub azimuth_deg: f64,
+    /// Minor/major range ratio in `(0, 1]`.
+    pub ratio: f64,
+}
+
+/// One nested structure: a model family with its partial sill, range and
+/// optional geometric anisotropy.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Structure {
     /// Model family.
     pub kind: ModelKind,
     /// Partial sill (variance contribution of this structure).
     pub sill: f64,
-    /// Range parameter, in coordinate units.
+    /// Range parameter, in coordinate units (major-axis range if anisotropic).
     pub range: f64,
+    /// Optional geometric anisotropy (isotropic when `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anis: Option<Anisotropy>,
 }
 
 impl Structure {
-    /// Convenience constructor.
+    /// Isotropic structure.
     pub fn new(kind: ModelKind, sill: f64, range: f64) -> Self {
-        Self { kind, sill, range }
+        Self {
+            kind,
+            sill,
+            range,
+            anis: None,
+        }
+    }
+
+    /// Structure with geometric anisotropy.
+    pub fn with_anisotropy(
+        kind: ModelKind,
+        sill: f64,
+        range: f64,
+        azimuth_deg: f64,
+        ratio: f64,
+    ) -> Self {
+        Self {
+            kind,
+            sill,
+            range,
+            anis: Some(Anisotropy { azimuth_deg, ratio }),
+        }
+    }
+
+    /// Effective isotropic-equivalent lag distance for a separation vector:
+    /// the vector is rotated into the (major, minor) frame and the minor
+    /// component stretched by `1/ratio`.
+    fn effective_h(&self, dh: [f64; 2]) -> f64 {
+        match self.anis {
+            None => (dh[0] * dh[0] + dh[1] * dh[1]).sqrt(),
+            Some(a) => {
+                let (s, c) = a.azimuth_deg.to_radians().sin_cos();
+                let h_major = dh[0] * s + dh[1] * c;
+                let h_minor = (dh[0] * c - dh[1] * s) / a.ratio;
+                (h_major * h_major + h_minor * h_minor).sqrt()
+            }
+        }
     }
 }
 
@@ -145,6 +198,19 @@ impl VariogramModel {
                     s.range
                 )));
             }
+            if let Some(a) = s.anis {
+                if !(a.ratio > 0.0) || a.ratio > 1.0 {
+                    return Err(GeostatError::InvalidParameter(format!(
+                        "anisotropy ratio must be in (0, 1], got {}",
+                        a.ratio
+                    )));
+                }
+                if !a.azimuth_deg.is_finite() {
+                    return Err(GeostatError::InvalidParameter(
+                        "anisotropy azimuth must be finite".into(),
+                    ));
+                }
+            }
         }
         let model = Self { nugget, structures };
         if !(model.total_sill() > 0.0) {
@@ -155,7 +221,9 @@ impl VariogramModel {
         Ok(model)
     }
 
-    /// Semivariance at lag `h` (`gamma(0) = 0` by convention).
+    /// Semivariance at scalar lag `h` (`gamma(0) = 0` by convention).
+    /// For anisotropic structures, `h` is interpreted as a distance along
+    /// the major axis; use [`VariogramModel::gamma_dh`] for full vectors.
     pub fn gamma(&self, h: f64) -> f64 {
         if h <= 0.0 {
             return 0.0;
@@ -168,15 +236,34 @@ impl VariogramModel {
                 .sum::<f64>()
     }
 
+    /// Semivariance for a separation vector `dh`, honoring per-structure
+    /// geometric anisotropy.
+    pub fn gamma_dh(&self, dh: [f64; 2]) -> f64 {
+        if dh[0] == 0.0 && dh[1] == 0.0 {
+            return 0.0;
+        }
+        self.nugget
+            + self
+                .structures
+                .iter()
+                .map(|s| s.sill * s.kind.g(s.effective_h(dh), s.range))
+                .sum::<f64>()
+    }
+
     /// Total sill: nugget plus all partial sills.
     pub fn total_sill(&self) -> f64 {
         self.nugget + self.structures.iter().map(|s| s.sill).sum::<f64>()
     }
 
-    /// Covariance at lag `h` under second-order stationarity:
+    /// Covariance at scalar lag `h` under second-order stationarity:
     /// `C(h) = total_sill - gamma(h)`, with `C(0) = total_sill`.
     pub fn covariance(&self, h: f64) -> f64 {
         self.total_sill() - self.gamma(h)
+    }
+
+    /// Covariance for a separation vector `dh`, honoring anisotropy.
+    pub fn covariance_dh(&self, dh: [f64; 2]) -> f64 {
+        self.total_sill() - self.gamma_dh(dh)
     }
 }
 
@@ -242,6 +329,49 @@ mod tests {
         );
         // Pure nugget is valid.
         assert!(VariogramModel::new(1.0, vec![]).is_ok());
+    }
+
+    #[test]
+    fn anisotropy_stretches_minor_axis() {
+        // Major axis N-S (azimuth 0), ratio 0.5: range 100 along N-S,
+        // 50 along E-W.
+        let m = VariogramModel::new(
+            0.0,
+            vec![Structure::with_anisotropy(
+                ModelKind::Spherical,
+                1.0,
+                100.0,
+                0.0,
+                0.5,
+            )],
+        )
+        .unwrap();
+        // Along the major axis: same as isotropic with range 100.
+        assert!((m.gamma_dh([0.0, 100.0]) - 1.0).abs() < 1e-12);
+        assert!(m.gamma_dh([0.0, 50.0]) < 1.0 - 1e-6);
+        // Along the minor axis the sill is reached at 50.
+        assert!((m.gamma_dh([50.0, 0.0]) - 1.0).abs() < 1e-12);
+        // Same lag distance hits harder across the minor axis.
+        assert!(m.gamma_dh([30.0, 0.0]) > m.gamma_dh([0.0, 30.0]));
+        // Isotropic structures: gamma_dh agrees with scalar gamma.
+        let iso = VariogramModel::new(0.1, vec![Structure::new(ModelKind::Exponential, 0.9, 40.0)])
+            .unwrap();
+        let h = (3.0_f64 * 3.0 + 4.0 * 4.0).sqrt();
+        assert!((iso.gamma_dh([3.0, 4.0]) - iso.gamma(h)).abs() < 1e-12);
+        // Invalid ratio rejected.
+        assert!(
+            VariogramModel::new(
+                0.0,
+                vec![Structure::with_anisotropy(
+                    ModelKind::Spherical,
+                    1.0,
+                    100.0,
+                    0.0,
+                    1.5
+                )]
+            )
+            .is_err()
+        );
     }
 
     #[test]

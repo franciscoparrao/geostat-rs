@@ -1,0 +1,694 @@
+//! Ordinary co-kriging under a linear model of coregionalization (LMC).
+//!
+//! The LMC shares structure shapes (kind, range, anisotropy) across all
+//! variables; each structure carries a symmetric positive semi-definite
+//! matrix of (co)sills. Unbiasedness follows the traditional convention:
+//! primary weights sum to 1, each secondary variable's weights sum to 0.
+
+use ndarray::Array2;
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+
+use crate::data::PointSet;
+use crate::error::{GeostatError, Result};
+use crate::grid::Grid2D;
+use crate::kriging::KrigingEstimate;
+use crate::linalg::solve;
+use crate::search::KdTree;
+use crate::variogram::{Anisotropy, ExperimentalVariogram, ModelKind, VariogramModel};
+
+/// One shared structure of the LMC with its matrix of (co)sills.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LmcStructure {
+    /// Model family (shared by all variable pairs).
+    pub kind: ModelKind,
+    /// Range parameter (shared).
+    pub range: f64,
+    /// Optional geometric anisotropy (shared).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anis: Option<Anisotropy>,
+    /// Symmetric PSD matrix of partial (co)sills, `sills[u][v]`.
+    pub sills: Vec<Vec<f64>>,
+}
+
+/// Linear model of coregionalization: a nugget matrix plus shared
+/// structures with per-structure sill matrices.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Lmc {
+    /// Symmetric PSD nugget matrix, `nugget[u][v]`.
+    pub nugget: Vec<Vec<f64>>,
+    /// Shared structures.
+    pub structures: Vec<LmcStructure>,
+}
+
+/// Checks that `m` is square of size `n`, symmetric and PSD (via Cholesky
+/// with a relative tolerance).
+#[allow(clippy::needless_range_loop)]
+fn check_psd(m: &[Vec<f64>], n: usize, what: &str) -> Result<()> {
+    if m.len() != n || m.iter().any(|r| r.len() != n) {
+        return Err(GeostatError::DimensionMismatch(format!(
+            "{what} matrix must be {n}x{n}"
+        )));
+    }
+    let scale = m
+        .iter()
+        .flatten()
+        .fold(0.0_f64, |a, v| a.max(v.abs()))
+        .max(f64::MIN_POSITIVE);
+    for i in 0..n {
+        for j in 0..i {
+            if (m[i][j] - m[j][i]).abs() > 1e-9 * scale {
+                return Err(GeostatError::InvalidParameter(format!(
+                    "{what} matrix is not symmetric at ({i},{j})"
+                )));
+            }
+        }
+        if !m[i][i].is_finite() || m[i][i] < -1e-12 * scale {
+            return Err(GeostatError::InvalidParameter(format!(
+                "{what} matrix has negative diagonal at {i}"
+            )));
+        }
+    }
+    // Cholesky with tolerance: fails on a meaningfully negative pivot.
+    let mut a: Vec<Vec<f64>> = m.to_vec();
+    for k in 0..n {
+        for j in 0..k {
+            a[k][k] -= a[k][j] * a[k][j];
+        }
+        if a[k][k] < -1e-9 * scale {
+            return Err(GeostatError::InvalidParameter(format!(
+                "{what} matrix is not positive semi-definite (pivot {k})"
+            )));
+        }
+        let d = a[k][k].max(0.0).sqrt();
+        for i in (k + 1)..n {
+            for j in 0..k {
+                a[i][k] -= a[i][j] * a[k][j];
+            }
+            a[i][k] = if d > 1e-12 * scale.sqrt() {
+                a[i][k] / d
+            } else {
+                0.0
+            };
+        }
+    }
+    Ok(())
+}
+
+impl Lmc {
+    /// Builds and validates an LMC: consistent dimensions, symmetric PSD
+    /// matrices, valid structure parameters.
+    pub fn new(nugget: Vec<Vec<f64>>, structures: Vec<LmcStructure>) -> Result<Self> {
+        let n = nugget.len();
+        if n == 0 {
+            return Err(GeostatError::InvalidParameter(
+                "LMC needs at least one variable".into(),
+            ));
+        }
+        check_psd(&nugget, n, "nugget")?;
+        for (s, st) in structures.iter().enumerate() {
+            if !(st.range > 0.0) || !st.range.is_finite() {
+                return Err(GeostatError::InvalidParameter(format!(
+                    "structure {s}: range must be finite and > 0, got {}",
+                    st.range
+                )));
+            }
+            if let Some(a) = st.anis
+                && (!(a.ratio > 0.0) || a.ratio > 1.0 || !a.azimuth_deg.is_finite())
+            {
+                return Err(GeostatError::InvalidParameter(format!(
+                    "structure {s}: invalid anisotropy"
+                )));
+            }
+            check_psd(&st.sills, n, &format!("structure {s} sill"))?;
+        }
+        let lmc = Self { nugget, structures };
+        for v in 0..n {
+            if !(lmc.total_sill(v, v) > 0.0) {
+                return Err(GeostatError::InvalidParameter(format!(
+                    "variable {v} has non-positive total sill"
+                )));
+            }
+        }
+        Ok(lmc)
+    }
+
+    /// Number of variables.
+    pub fn n_vars(&self) -> usize {
+        self.nugget.len()
+    }
+
+    /// Total (co)sill for a variable pair.
+    pub fn total_sill(&self, u: usize, v: usize) -> f64 {
+        self.nugget[u][v] + self.structures.iter().map(|s| s.sills[u][v]).sum::<f64>()
+    }
+
+    /// Cross-semivariance for a separation vector.
+    pub fn gamma_dh(&self, u: usize, v: usize, dh: [f64; 2]) -> f64 {
+        if dh[0] == 0.0 && dh[1] == 0.0 {
+            return 0.0;
+        }
+        let mut g = self.nugget[u][v];
+        for st in &self.structures {
+            // Reuse the single-variable structure math for the shape.
+            let shape = crate::variogram::Structure {
+                kind: st.kind,
+                sill: 1.0,
+                range: st.range,
+                anis: st.anis,
+            };
+            let m = VariogramModel {
+                nugget: 0.0,
+                structures: vec![shape],
+            };
+            g += st.sills[u][v] * m.gamma_dh(dh);
+        }
+        g
+    }
+
+    /// Cross-covariance for a separation vector:
+    /// `C_uv(dh) = total_sill_uv - gamma_uv(dh)`.
+    pub fn covariance_dh(&self, u: usize, v: usize, dh: [f64; 2]) -> f64 {
+        self.total_sill(u, v) - self.gamma_dh(u, v, dh)
+    }
+
+    /// The direct (single-variable) model of variable `v`.
+    pub fn direct_model(&self, v: usize) -> Result<VariogramModel> {
+        VariogramModel::new(
+            self.nugget[v][v],
+            self.structures
+                .iter()
+                .map(|s| crate::variogram::Structure {
+                    kind: s.kind,
+                    sill: s.sills[v][v],
+                    range: s.range,
+                    anis: s.anis,
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Co-kriging search configuration (applied per variable).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CoKrigingConfig {
+    /// Maximum nearest neighbors per variable (all points when unset).
+    pub max_neighbors: Option<usize>,
+    /// Search radius per variable.
+    pub search_radius: Option<f64>,
+}
+
+/// Ordinary co-kriging predictor. `datasets[0]` is the primary variable
+/// (the one being predicted); the rest are secondaries.
+#[derive(Debug)]
+pub struct CoKriging<'a> {
+    datasets: Vec<&'a PointSet>,
+    lmc: &'a Lmc,
+    config: CoKrigingConfig,
+    trees: Vec<Option<KdTree>>,
+}
+
+impl<'a> CoKriging<'a> {
+    /// Builds the predictor, validating dimensions.
+    pub fn new(datasets: Vec<&'a PointSet>, lmc: &'a Lmc, config: CoKrigingConfig) -> Result<Self> {
+        if datasets.len() < 2 {
+            return Err(GeostatError::InvalidParameter(
+                "co-kriging needs a primary and at least one secondary variable".into(),
+            ));
+        }
+        if datasets.len() != lmc.n_vars() {
+            return Err(GeostatError::DimensionMismatch(format!(
+                "{} datasets vs {} LMC variables",
+                datasets.len(),
+                lmc.n_vars()
+            )));
+        }
+        if config.max_neighbors == Some(0) {
+            return Err(GeostatError::InvalidParameter(
+                "max_neighbors must be at least 1".into(),
+            ));
+        }
+        if let Some(r) = config.search_radius
+            && !(r > 0.0)
+        {
+            return Err(GeostatError::InvalidParameter(format!(
+                "search radius must be positive, got {r}"
+            )));
+        }
+        let local = config.max_neighbors.is_some() || config.search_radius.is_some();
+        let trees = datasets
+            .iter()
+            .map(|d| local.then(|| KdTree::build(d.coords())))
+            .collect();
+        Ok(Self {
+            datasets,
+            lmc,
+            config,
+            trees,
+        })
+    }
+
+    fn neighbors(&self, v: usize, target: [f64; 2]) -> Vec<usize> {
+        match &self.trees[v] {
+            None => (0..self.datasets[v].len()).collect(),
+            Some(tree) => tree.k_nearest(
+                target,
+                self.config.max_neighbors.unwrap_or(self.datasets[v].len()),
+                self.config.search_radius,
+            ),
+        }
+    }
+
+    /// Co-kriging estimate of the primary variable at a target location.
+    pub fn predict(&self, target: [f64; 2]) -> Result<KrigingEstimate> {
+        let n_vars = self.datasets.len();
+        let nbs: Vec<Vec<usize>> = (0..n_vars).map(|v| self.neighbors(v, target)).collect();
+        if nbs[0].is_empty() {
+            return Err(GeostatError::NoNeighbors);
+        }
+        let counts: Vec<usize> = nbs.iter().map(Vec::len).collect();
+        let n_total: usize = counts.iter().sum();
+        // Block offsets per variable.
+        let mut offset = vec![0usize; n_vars];
+        for v in 1..n_vars {
+            offset[v] = offset[v - 1] + counts[v - 1];
+        }
+        let dim = n_total + n_vars;
+
+        let mut a = Array2::<f64>::zeros((dim, dim));
+        let mut b = vec![0.0; dim];
+        for v in 0..n_vars {
+            for (ii, &i) in nbs[v].iter().enumerate() {
+                let pi = self.datasets[v].coord(i);
+                let row = offset[v] + ii;
+                for w in v..n_vars {
+                    for (jj, &j) in nbs[w].iter().enumerate() {
+                        let col = offset[w] + jj;
+                        if col < row {
+                            continue;
+                        }
+                        let pj = self.datasets[w].coord(j);
+                        let c = self.lmc.covariance_dh(v, w, [pi[0] - pj[0], pi[1] - pj[1]]);
+                        a[[row, col]] = c;
+                        a[[col, row]] = c;
+                    }
+                }
+                // Unbiasedness: one Lagrange multiplier per variable.
+                a[[row, n_total + v]] = 1.0;
+                a[[n_total + v, row]] = 1.0;
+                b[row] = self
+                    .lmc
+                    .covariance_dh(v, 0, [pi[0] - target[0], pi[1] - target[1]]);
+            }
+        }
+        // Primary weights sum to 1, secondary weights to 0.
+        b[n_total] = 1.0;
+
+        let b0 = b.clone();
+        let w = solve(a, b)?;
+
+        let mut value = 0.0;
+        for v in 0..n_vars {
+            for (ii, &i) in nbs[v].iter().enumerate() {
+                value += w[offset[v] + ii] * self.datasets[v].value(i);
+            }
+        }
+        let reduction: f64 = (0..dim).map(|i| w[i] * b0[i]).sum();
+        let variance = (self.lmc.total_sill(0, 0) - reduction).max(0.0);
+        Ok(KrigingEstimate { value, variance })
+    }
+
+    /// Estimates at many targets, in parallel (NaN on failed systems).
+    pub fn predict_many(&self, targets: &[[f64; 2]]) -> Vec<KrigingEstimate> {
+        targets
+            .par_iter()
+            .map(|&t| {
+                self.predict(t).unwrap_or(KrigingEstimate {
+                    value: f64::NAN,
+                    variance: f64::NAN,
+                })
+            })
+            .collect()
+    }
+
+    /// Co-kriging over all grid cell centers.
+    pub fn predict_grid(&self, grid: &Grid2D) -> (Vec<f64>, Vec<f64>) {
+        let ests = self.predict_many(&grid.centers());
+        ests.into_iter().map(|e| (e.value, e.variance)).unzip()
+    }
+}
+
+/// Fits a 2-variable LMC by linear weighted least squares.
+///
+/// The structure shapes (nugget presence, kinds, ranges, anisotropy) are
+/// taken from `template` (typically a fit of the primary variable). For each
+/// variable pair, the (co)sills are solved by WLS (weights `N/h²`) — the
+/// problem is linear once shapes are fixed — and each per-structure sill
+/// matrix is then projected onto the PSD cone (eigenvalue clipping).
+pub fn fit_lmc(
+    direct_a: &ExperimentalVariogram,
+    direct_b: &ExperimentalVariogram,
+    cross_ab: &ExperimentalVariogram,
+    template: &VariogramModel,
+) -> Result<Lmc> {
+    let n_str = template.structures.len();
+    let n_par = 1 + n_str; // nugget + one sill per structure
+
+    // Solve the WLS sills for one experimental curve.
+    let fit_pair = |ev: &ExperimentalVariogram| -> Result<Vec<f64>> {
+        let pts: Vec<(f64, f64, f64)> = ev
+            .bins
+            .iter()
+            .filter(|b| b.n_pairs > 0 && b.h > 0.0 && b.gamma.is_finite())
+            .map(|b| (b.h, b.gamma, b.n_pairs as f64 / (b.h * b.h)))
+            .collect();
+        if pts.len() < n_par + 1 {
+            return Err(GeostatError::InsufficientData(format!(
+                "LMC fit needs more non-empty lag bins than parameters ({n_par})"
+            )));
+        }
+        // Normal equations for gamma(h) = x0 + sum_s x_s * g_s(h).
+        let mut ata = Array2::<f64>::zeros((n_par, n_par));
+        let mut atb = vec![0.0; n_par];
+        let mut basis = vec![0.0; n_par];
+        for &(h, gamma, wgt) in &pts {
+            basis[0] = 1.0;
+            for (s, st) in template.structures.iter().enumerate() {
+                let unit = VariogramModel {
+                    nugget: 0.0,
+                    structures: vec![crate::variogram::Structure {
+                        kind: st.kind,
+                        sill: 1.0,
+                        range: st.range,
+                        anis: None,
+                    }],
+                };
+                basis[1 + s] = unit.gamma(h);
+            }
+            for r in 0..n_par {
+                for c in 0..n_par {
+                    ata[[r, c]] += wgt * basis[r] * basis[c];
+                }
+                atb[r] += wgt * basis[r] * gamma;
+            }
+        }
+        // Tiny ridge: with a degenerate template (range far smaller or larger
+        // than the lag span) the basis columns become collinear.
+        let trace_scale = (0..n_par).map(|r| ata[[r, r]]).fold(0.0_f64, f64::max);
+        for r in 0..n_par {
+            ata[[r, r]] += 1e-9 * trace_scale.max(f64::MIN_POSITIVE);
+        }
+        solve(ata, atb)
+    };
+
+    let sa = fit_pair(direct_a)?;
+    let sb = fit_pair(direct_b)?;
+    let sab = fit_pair(cross_ab)?;
+
+    // Assemble per-structure 2x2 matrices and project each onto PSD.
+    let assemble = |k: usize| -> Vec<Vec<f64>> {
+        // Direct sills cannot be negative; clamp before projection.
+        let aa = sa[k].max(0.0);
+        let bb = sb[k].max(0.0);
+        project_psd_2x2(aa, sab[k], bb)
+    };
+
+    let nugget = assemble(0);
+    let structures = template
+        .structures
+        .iter()
+        .enumerate()
+        .map(|(s, st)| LmcStructure {
+            kind: st.kind,
+            range: st.range,
+            anis: st.anis,
+            sills: assemble(1 + s),
+        })
+        .collect();
+    Lmc::new(nugget, structures)
+}
+
+/// Projects a symmetric 2x2 matrix `[[a, b], [b, c]]` onto the PSD cone by
+/// clipping negative eigenvalues.
+fn project_psd_2x2(a: f64, b: f64, c: f64) -> Vec<Vec<f64>> {
+    let tr = a + c;
+    let disc = ((a - c) * (a - c) + 4.0 * b * b).sqrt();
+    let l1 = 0.5 * (tr + disc);
+    let l2 = 0.5 * (tr - disc);
+    if l2 >= 0.0 {
+        return vec![vec![a, b], vec![b, c]];
+    }
+    // Eigenvector for l1.
+    let (vx, vy) = if b.abs() > 1e-300 {
+        (l1 - c, b)
+    } else if a >= c {
+        (1.0, 0.0)
+    } else {
+        (0.0, 1.0)
+    };
+    let norm = (vx * vx + vy * vy).sqrt().max(f64::MIN_POSITIVE);
+    let (vx, vy) = (vx / norm, vy / norm);
+    let l1 = l1.max(0.0);
+    vec![
+        vec![l1 * vx * vx, l1 * vx * vy],
+        vec![l1 * vx * vy, l1 * vy * vy],
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kriging::{Kriging, KrigingConfig};
+    use crate::variogram::{
+        Structure, VariogramConfig, experimental_cross_variogram, experimental_variogram,
+    };
+
+    fn primary() -> PointSet {
+        PointSet::new(
+            vec![
+                [0.0, 0.0],
+                [10.0, 0.0],
+                [0.0, 10.0],
+                [10.0, 10.0],
+                [4.0, 6.0],
+            ],
+            vec![1.0, 2.0, 1.5, 2.5, 1.7],
+        )
+        .unwrap()
+    }
+
+    fn secondary() -> PointSet {
+        // Collocated, correlated variable plus an extra location.
+        PointSet::new(
+            vec![
+                [0.0, 0.0],
+                [10.0, 0.0],
+                [0.0, 10.0],
+                [10.0, 10.0],
+                [4.0, 6.0],
+                [6.0, 3.0],
+            ],
+            vec![2.1, 4.2, 3.0, 5.1, 3.5, 3.9],
+        )
+        .unwrap()
+    }
+
+    fn lmc(cross: f64) -> Lmc {
+        Lmc::new(
+            vec![vec![0.05, 0.0], vec![0.0, 0.1]],
+            vec![LmcStructure {
+                kind: ModelKind::Spherical,
+                range: 15.0,
+                anis: None,
+                sills: vec![vec![1.0, cross], vec![cross, 2.0]],
+            }],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn lmc_validation() {
+        // Non-PSD sill matrix rejected (cross > sqrt(1*2)).
+        assert!(
+            Lmc::new(
+                vec![vec![0.0, 0.0], vec![0.0, 0.0]],
+                vec![LmcStructure {
+                    kind: ModelKind::Spherical,
+                    range: 10.0,
+                    anis: None,
+                    sills: vec![vec![1.0, 1.6], vec![1.6, 2.0]],
+                }]
+            )
+            .is_err()
+        );
+        // Asymmetric rejected.
+        assert!(Lmc::new(vec![vec![1.0, 0.5], vec![0.2, 1.0]], vec![]).is_err());
+        // Valid model passes and exposes direct models.
+        let m = lmc(0.8);
+        let d0 = m.direct_model(0).unwrap();
+        assert!((d0.total_sill() - 1.05).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cokriging_is_exact_at_primary_data() {
+        let p = primary();
+        let s = secondary();
+        let m = lmc(0.8);
+        let ck = CoKriging::new(vec![&p, &s], &m, CoKrigingConfig::default()).unwrap();
+        for i in 0..p.len() {
+            let est = ck.predict(p.coord(i)).unwrap();
+            assert!(
+                (est.value - p.value(i)).abs() < 1e-7,
+                "point {i}: {} vs {}",
+                est.value,
+                p.value(i)
+            );
+            assert!(est.variance < 1e-7);
+        }
+    }
+
+    #[test]
+    fn zero_cross_correlation_reduces_to_ordinary_kriging() {
+        let p = primary();
+        let s = secondary();
+        let m = lmc(0.0);
+        let ck = CoKriging::new(vec![&p, &s], &m, CoKrigingConfig::default()).unwrap();
+        let direct = m.direct_model(0).unwrap();
+        let ok = Kriging::new(&p, &direct, KrigingConfig::default()).unwrap();
+        for target in [[5.0, 5.0], [2.0, 8.0], [12.0, 4.0]] {
+            let a = ck.predict(target).unwrap();
+            let b = ok.predict(target).unwrap();
+            assert!(
+                (a.value - b.value).abs() < 1e-9,
+                "{target:?}: {} vs {}",
+                a.value,
+                b.value
+            );
+            assert!((a.variance - b.variance).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn secondary_reduces_variance() {
+        let p = primary();
+        let s = secondary();
+        let with_cross = lmc(1.2);
+        let without = lmc(0.0);
+        let target = [6.0, 3.0]; // a secondary-only location
+        let ck1 = CoKriging::new(vec![&p, &s], &with_cross, CoKrigingConfig::default()).unwrap();
+        let ck0 = CoKriging::new(vec![&p, &s], &without, CoKrigingConfig::default()).unwrap();
+        let v1 = ck1.predict(target).unwrap().variance;
+        let v0 = ck0.predict(target).unwrap().variance;
+        assert!(
+            v1 < v0,
+            "correlated secondary must reduce variance: {v1} vs {v0}"
+        );
+    }
+
+    #[test]
+    fn fit_lmc_recovers_synthetic_sills() {
+        // Build synthetic experimental curves exactly on a known LMC.
+        let truth = lmc(0.9);
+        let cfg = VariogramConfig {
+            n_lags: 12,
+            max_dist: 24.0,
+            direction: None,
+        };
+        let mk = |u: usize, v: usize| -> ExperimentalVariogram {
+            let width = cfg.max_dist / cfg.n_lags as f64;
+            let bins = (0..cfg.n_lags)
+                .map(|i| {
+                    let h = (i as f64 + 0.5) * width;
+                    crate::variogram::LagBin {
+                        h,
+                        gamma: truth.gamma_dh(u, v, [h, 0.0]),
+                        n_pairs: 50,
+                    }
+                })
+                .collect();
+            ExperimentalVariogram {
+                bins,
+                max_dist: cfg.max_dist,
+            }
+        };
+        let template =
+            VariogramModel::new(0.05, vec![Structure::new(ModelKind::Spherical, 1.0, 15.0)])
+                .unwrap();
+        let fitted = fit_lmc(&mk(0, 0), &mk(1, 1), &mk(0, 1), &template).unwrap();
+        assert!((fitted.structures[0].sills[0][0] - 1.0).abs() < 0.05);
+        assert!((fitted.structures[0].sills[1][1] - 2.0).abs() < 0.05);
+        assert!((fitted.structures[0].sills[0][1] - 0.9).abs() < 0.05);
+        assert!((fitted.nugget[0][0] - 0.05).abs() < 0.02);
+    }
+
+    #[test]
+    fn fit_lmc_projects_to_psd() {
+        // Cross sills exceeding the Cauchy-Schwarz bound get projected.
+        let cfg_width = 2.0;
+        let mk_gamma = |sill: f64, nug: f64| -> ExperimentalVariogram {
+            let m =
+                VariogramModel::new(nug, vec![Structure::new(ModelKind::Spherical, sill, 15.0)])
+                    .unwrap();
+            let bins = (0..12)
+                .map(|i| {
+                    let h = (i as f64 + 0.5) * cfg_width;
+                    crate::variogram::LagBin {
+                        h,
+                        gamma: m.gamma(h),
+                        n_pairs: 50,
+                    }
+                })
+                .collect();
+            ExperimentalVariogram {
+                bins,
+                max_dist: 24.0,
+            }
+        };
+        let template =
+            VariogramModel::new(0.0, vec![Structure::new(ModelKind::Spherical, 1.0, 15.0)])
+                .unwrap();
+        // Direct sills 1 and 1, "cross" sill 1.8 (impossible): must clip.
+        let fitted = fit_lmc(
+            &mk_gamma(1.0, 0.0),
+            &mk_gamma(1.0, 0.0),
+            &mk_gamma(1.8, 0.0),
+            &template,
+        )
+        .unwrap();
+        let s = &fitted.structures[0].sills;
+        assert!(s[0][1] * s[0][1] <= s[0][0] * s[1][1] + 1e-9);
+    }
+
+    #[test]
+    fn cross_variogram_feeds_lmc_fit() {
+        // End-to-end smoke: experimental direct + cross variograms from
+        // correlated synthetic data fit into a valid LMC.
+        let mut rng = crate::rng::Rng::new(3);
+        let mut coords = Vec::new();
+        let mut va = Vec::new();
+        let mut vb = Vec::new();
+        for _ in 0..150 {
+            let x = rng.uniform() * 100.0;
+            let y = rng.uniform() * 100.0;
+            let base = (x / 25.0).sin() + (y / 25.0).cos();
+            coords.push([x, y]);
+            va.push(base + 0.1 * rng.normal());
+            vb.push(2.0 * base + 0.2 * rng.normal());
+        }
+        let a = PointSet::new(coords.clone(), va).unwrap();
+        let b = PointSet::new(coords, vb).unwrap();
+        let cfg = VariogramConfig {
+            n_lags: 12,
+            max_dist: 50.0,
+            direction: None,
+        };
+        let ea = experimental_variogram(&a, &cfg).unwrap();
+        let eb = experimental_variogram(&b, &cfg).unwrap();
+        let eab = experimental_cross_variogram(&a, &b, &cfg).unwrap();
+        let template = crate::variogram::fit_best(&ea, &[ModelKind::Spherical]).unwrap();
+        let lmc = fit_lmc(&ea, &eb, &eab, &template.model).unwrap();
+        assert_eq!(lmc.n_vars(), 2);
+        // Positive cross-correlation captured.
+        assert!(lmc.total_sill(0, 1) > 0.0);
+    }
+}

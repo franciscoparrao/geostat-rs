@@ -84,7 +84,20 @@ pub fn experimental_variogram(
     data: &PointSet,
     cfg: &VariogramConfig,
 ) -> Result<ExperimentalVariogram> {
-    if data.len() < 2 {
+    pair_bins(data.coords(), data.values(), data.values(), cfg)
+}
+
+/// Shared pair-accumulation kernel: bins
+/// `0.5 * (a_i - a_j) * (b_i - b_j)` by pair distance. With `a == b` this is
+/// the direct semivariogram; with two collocated variables, the cross
+/// semivariogram.
+pub(crate) fn pair_bins(
+    coords: &[[f64; 2]],
+    values_a: &[f64],
+    values_b: &[f64],
+    cfg: &VariogramConfig,
+) -> Result<ExperimentalVariogram> {
+    if coords.len() < 2 {
         return Err(GeostatError::InsufficientData(
             "experimental variogram requires at least 2 points".into(),
         ));
@@ -109,15 +122,13 @@ pub fn experimental_variogram(
         )));
     }
 
-    let n = data.len();
+    let n = coords.len();
     let n_lags = cfg.n_lags;
     let width = cfg.max_dist / n_lags as f64;
     let dir = cfg
         .direction
         .as_ref()
         .map(|d| (d.azimuth_deg.to_radians(), d.tolerance_deg.to_radians()));
-    let coords = data.coords();
-    let values = data.values();
 
     let acc = (0..n)
         .into_par_iter()
@@ -145,8 +156,7 @@ pub fn experimental_variogram(
                     // Right-closed lag intervals ((b-1)w, bw], matching the
                     // gstat/GSLIB convention for pairs exactly on a boundary.
                     let bin = ((d / width).ceil() as usize - 1).min(n_lags - 1);
-                    let dz = values[i] - values[j];
-                    acc.sq[bin] += 0.5 * dz * dz;
+                    acc.sq[bin] += 0.5 * (values_a[i] - values_a[j]) * (values_b[i] - values_b[j]);
                     acc.h[bin] += d;
                     acc.n[bin] += 1;
                 }

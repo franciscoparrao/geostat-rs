@@ -116,39 +116,6 @@ pub fn dist(a: [f64; 2], b: [f64; 2]) -> f64 {
     (dx * dx + dy * dy).sqrt()
 }
 
-/// Indices of the up-to-`k` nearest points to `target`, optionally restricted
-/// to a search `radius`. Result is sorted by increasing distance.
-pub(crate) fn k_nearest(
-    coords: &[[f64; 2]],
-    target: [f64; 2],
-    k: usize,
-    radius: Option<f64>,
-) -> Vec<usize> {
-    if k == 0 {
-        return Vec::new();
-    }
-    let r2 = radius.map(|r| r * r);
-    let mut cand: Vec<(f64, usize)> = coords
-        .iter()
-        .enumerate()
-        .filter_map(|(i, c)| {
-            let dx = c[0] - target[0];
-            let dy = c[1] - target[1];
-            let d2 = dx * dx + dy * dy;
-            match r2 {
-                Some(r2) if d2 > r2 => None,
-                _ => Some((d2, i)),
-            }
-        })
-        .collect();
-    if cand.len() > k {
-        cand.select_nth_unstable_by(k - 1, |a, b| a.0.total_cmp(&b.0));
-        cand.truncate(k);
-    }
-    cand.sort_by(|a, b| a.0.total_cmp(&b.0));
-    cand.into_iter().map(|(_, i)| i).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,15 +144,5 @@ mod tests {
         let sub = ps.excluding(1);
         assert_eq!(sub.len(), 2);
         assert_eq!(sub.value(1), 3.0);
-    }
-
-    #[test]
-    fn k_nearest_orders_and_limits() {
-        let coords = vec![[0.0, 0.0], [3.0, 0.0], [1.0, 0.0], [10.0, 0.0]];
-        let nb = k_nearest(&coords, [0.1, 0.0], 2, None);
-        assert_eq!(nb, vec![0, 2]);
-        let nb = k_nearest(&coords, [0.1, 0.0], 10, Some(4.0));
-        assert_eq!(nb, vec![0, 2, 1]);
-        assert!(k_nearest(&coords, [0.0, 0.0], 0, None).is_empty());
     }
 }

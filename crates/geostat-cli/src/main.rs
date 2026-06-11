@@ -7,16 +7,17 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use geostat_core::{
-    DirectionConfig, Grid2D, Kriging, KrigingConfig, KrigingMethod, ModelKind, PointSet, SgsConfig,
-    VariogramConfig, experimental_variogram, fit_best, leave_one_out,
-    sequential_gaussian_simulation,
+    CoKriging, CoKrigingConfig, DirectionConfig, Grid2D, Kriging, KrigingConfig, KrigingMethod,
+    ModelKind, PointSet, SgsConfig, SisConfig, VariogramConfig, VariogramModel,
+    experimental_cross_variogram, experimental_variogram, fit_best, fit_lmc, leave_one_out,
+    leave_one_out_with_drift, sequential_gaussian_simulation, sequential_indicator_simulation,
 };
 
 #[derive(Parser)]
 #[command(
     name = "geostat",
     version,
-    about = "Geostatistics engine: variography, kriging and sequential Gaussian simulation"
+    about = "Geostatistics engine: variography, kriging, co-kriging and sequential simulation"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -27,12 +28,16 @@ struct Cli {
 enum Command {
     /// Compute an experimental variogram and optionally fit a model
     Variogram(VariogramCmd),
-    /// Kriging interpolation onto a regular grid
+    /// Kriging interpolation (ordinary/simple/universal/external drift)
     Krige(KrigeCmd),
+    /// Ordinary co-kriging with a secondary variable (LMC)
+    Cokrige(CokrigeCmd),
     /// Leave-one-out cross-validation of a variogram model
     Cv(CvCmd),
     /// Conditional sequential Gaussian simulation
     Sgs(SgsCmd),
+    /// Conditional sequential indicator simulation
+    Sis(SisCmd),
 }
 
 #[derive(Args)]
@@ -54,6 +59,16 @@ struct InputOpts {
 impl InputOpts {
     fn read(&self) -> Result<PointSet> {
         io_utils::read_points(&self.input, &self.x_col, &self.y_col, &self.value_col)
+    }
+
+    fn read_with_extras(&self, extras: &[String]) -> Result<(PointSet, Vec<Vec<f64>>)> {
+        io_utils::read_points_with_extras(
+            &self.input,
+            &self.x_col,
+            &self.y_col,
+            &self.value_col,
+            extras,
+        )
     }
 }
 
@@ -137,7 +152,7 @@ enum MethodArg {
 
 #[derive(Args)]
 struct MethodOpts {
-    /// Kriging method
+    /// Kriging method (ignored when --drift-cols is given: external drift)
     #[arg(long, value_enum, default_value_t = MethodArg::Ordinary)]
     method: MethodArg,
     /// Drift polynomial degree for universal kriging (1 or 2)
@@ -189,6 +204,37 @@ struct KrigeCmd {
     model: PathBuf,
     #[command(flatten)]
     method: MethodOpts,
+    /// External drift columns (comma-separated; requires --targets)
+    #[arg(long)]
+    drift_cols: Option<String>,
+    /// Targets CSV with x, y and the drift columns (external drift only)
+    #[arg(long)]
+    targets: Option<PathBuf>,
+    #[command(flatten)]
+    grid: GridOpts,
+    #[command(flatten)]
+    neighbors: NeighborOpts,
+    /// Output CSV file (x,y,prediction,variance)
+    #[arg(short, long)]
+    output: PathBuf,
+}
+
+#[derive(Args)]
+struct CokrigeCmd {
+    #[command(flatten)]
+    input: InputOpts,
+    /// Column with the (collocated) secondary variable
+    #[arg(long)]
+    secondary_col: String,
+    /// LMC model (JSON). If omitted, an LMC is fitted automatically from the
+    /// direct and cross variograms
+    #[arg(long)]
+    lmc: Option<PathBuf>,
+    /// Write the (fitted) LMC to a JSON file
+    #[arg(long)]
+    lmc_out: Option<PathBuf>,
+    #[command(flatten)]
+    vario: VariogramOpts,
     #[command(flatten)]
     grid: GridOpts,
     #[command(flatten)]
@@ -207,6 +253,9 @@ struct CvCmd {
     model: PathBuf,
     #[command(flatten)]
     method: MethodOpts,
+    /// External drift columns (comma-separated): cross-validate KED
+    #[arg(long)]
+    drift_cols: Option<String>,
     #[command(flatten)]
     neighbors: NeighborOpts,
     /// Write per-point residuals to a CSV file
@@ -246,12 +295,54 @@ struct SgsCmd {
     output: PathBuf,
 }
 
+#[derive(Args)]
+struct SisCmd {
+    #[command(flatten)]
+    input: InputOpts,
+    #[command(flatten)]
+    grid: GridOpts,
+    #[command(flatten)]
+    vario: VariogramOpts,
+    /// Indicator cutoffs as data quantiles, comma-separated
+    #[arg(long, default_value = "0.25,0.5,0.75")]
+    quantiles: String,
+    /// Explicit indicator cutoffs (overrides --quantiles)
+    #[arg(long)]
+    cutoffs: Option<String>,
+    /// Model kinds to try when fitting indicator variograms
+    #[arg(long, default_value = "spherical,exponential")]
+    fit: String,
+    /// Number of realizations
+    #[arg(short = 'n', long, default_value_t = 10)]
+    realizations: usize,
+    /// Random seed
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+    /// Maximum conditioning points per node
+    #[arg(long, default_value_t = 16)]
+    max_neighbors: usize,
+    /// Search radius for conditioning points
+    #[arg(long)]
+    radius: Option<f64>,
+    /// Lower tail bound (default: data minimum)
+    #[arg(long)]
+    tail_min: Option<f64>,
+    /// Upper tail bound (default: data maximum)
+    #[arg(long)]
+    tail_max: Option<f64>,
+    /// Output CSV file (x,y,sim1..simN)
+    #[arg(short, long)]
+    output: PathBuf,
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Variogram(cmd) => run_variogram(cmd),
         Command::Krige(cmd) => run_krige(cmd),
+        Command::Cokrige(cmd) => run_cokrige(cmd),
         Command::Cv(cmd) => run_cv(cmd),
         Command::Sgs(cmd) => run_sgs(cmd),
+        Command::Sis(cmd) => run_sis(cmd),
     }
 }
 
@@ -298,9 +389,52 @@ fn run_variogram(cmd: VariogramCmd) -> Result<()> {
 }
 
 fn run_krige(cmd: KrigeCmd) -> Result<()> {
-    let data = cmd.input.read()?;
     let model = io_utils::read_model(&cmd.model)?;
-    println!("Loaded {} points; model: {}", data.len(), model);
+
+    if let Some(drift_spec) = &cmd.drift_cols {
+        // External drift kriging at explicit targets.
+        let drift_cols: Vec<String> = drift_spec
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect();
+        let targets_path = cmd
+            .targets
+            .as_ref()
+            .context("--drift-cols requires --targets (CSV with x, y and drift columns)")?;
+        let (data, drift_data) = cmd.input.read_with_extras(&drift_cols)?;
+        println!(
+            "Loaded {} points; model: {model}; drift: {}",
+            data.len(),
+            drift_cols.join(", ")
+        );
+        let config = KrigingConfig {
+            method: KrigingMethod::ExternalDrift {
+                n_vars: drift_cols.len(),
+            },
+            max_neighbors: cmd.neighbors.max_neighbors,
+            search_radius: cmd.neighbors.radius,
+        };
+        let kriging = Kriging::with_external_drift(&data, &model, config, drift_data)?;
+        let (coords, target_drift) = io_utils::read_targets(
+            targets_path,
+            &cmd.input.x_col,
+            &cmd.input.y_col,
+            &drift_cols,
+        )?;
+        let ests = kriging.predict_many_with_drift(&coords, &target_drift)?;
+        let n_nan = ests.iter().filter(|e| e.value.is_nan()).count();
+        println!(
+            "Kriged {} target points (external drift); {} failed",
+            coords.len(),
+            n_nan
+        );
+        io_utils::write_estimates_csv(&cmd.output, &coords, &ests)?;
+        println!("Output written to {}", cmd.output.display());
+        return Ok(());
+    }
+
+    let data = cmd.input.read()?;
+    println!("Loaded {} points; model: {model}", data.len());
 
     let grid = cmd.grid.build(&data)?;
     let config = KrigingConfig {
@@ -331,17 +465,106 @@ fn run_krige(cmd: KrigeCmd) -> Result<()> {
     Ok(())
 }
 
-fn run_cv(cmd: CvCmd) -> Result<()> {
-    let data = cmd.input.read()?;
-    let model = io_utils::read_model(&cmd.model)?;
-    println!("Loaded {} points; model: {}", data.len(), model);
+fn run_cokrige(cmd: CokrigeCmd) -> Result<()> {
+    let (primary, extras) = cmd
+        .input
+        .read_with_extras(std::slice::from_ref(&cmd.secondary_col))?;
+    let secondary = PointSet::new(
+        primary.coords().to_vec(),
+        extras.iter().map(|r| r[0]).collect(),
+    )?;
+    println!(
+        "Loaded {} collocated points ({} + {})",
+        primary.len(),
+        cmd.input.value_col,
+        cmd.secondary_col
+    );
 
-    let config = KrigingConfig {
-        method: cmd.method.build(&data),
+    let lmc = match &cmd.lmc {
+        Some(path) => {
+            let lmc = io_utils::read_lmc(path)?;
+            println!("LMC loaded from {}", path.display());
+            lmc
+        }
+        None => {
+            let cfg = cmd.vario.config(&primary);
+            let ea = experimental_variogram(&primary, &cfg)?;
+            let eb = experimental_variogram(&secondary, &cfg)?;
+            let eab = experimental_cross_variogram(&primary, &secondary, &cfg)?;
+            let template = fit_best(&ea, &ModelKind::ALL)?;
+            let lmc = fit_lmc(&ea, &eb, &eab, &template.model)?;
+            println!(
+                "LMC auto-fitted (template {} {}, range {:.1}):",
+                template.model.structures[0].sill,
+                template.model.structures[0].kind,
+                template.model.structures[0].range,
+            );
+            println!("  nugget matrix: {:?}", lmc.nugget);
+            for s in &lmc.structures {
+                println!("  {} ({:.1}): {:?}", s.kind, s.range, s.sills);
+            }
+            lmc
+        }
+    };
+    if let Some(path) = &cmd.lmc_out {
+        io_utils::write_lmc(path, &lmc)?;
+        println!("LMC written to {}", path.display());
+    }
+
+    let grid = cmd.grid.build(&primary)?;
+    let config = CoKrigingConfig {
         max_neighbors: cmd.neighbors.max_neighbors,
         search_radius: cmd.neighbors.radius,
     };
-    let cv = leave_one_out(&data, &model, &config)?;
+    let ck = CoKriging::new(vec![&primary, &secondary], &lmc, config)?;
+    let (values, variances) = ck.predict_grid(&grid);
+    let n_nan = values.iter().filter(|v| v.is_nan()).count();
+    println!(
+        "Co-kriged {} cells ({} x {}); {} empty",
+        grid.n_cells(),
+        grid.nx,
+        grid.ny,
+        n_nan
+    );
+    io_utils::write_grid_csv(&cmd.output, &grid, &values, &variances)?;
+    println!("Output written to {}", cmd.output.display());
+    Ok(())
+}
+
+fn run_cv(cmd: CvCmd) -> Result<()> {
+    let model = io_utils::read_model(&cmd.model)?;
+
+    let (data, cv) = if let Some(drift_spec) = &cmd.drift_cols {
+        let drift_cols: Vec<String> = drift_spec
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect();
+        let (data, drift_data) = cmd.input.read_with_extras(&drift_cols)?;
+        println!(
+            "Loaded {} points; model: {model}; drift: {}",
+            data.len(),
+            drift_cols.join(", ")
+        );
+        let config = KrigingConfig {
+            method: KrigingMethod::ExternalDrift {
+                n_vars: drift_cols.len(),
+            },
+            max_neighbors: cmd.neighbors.max_neighbors,
+            search_radius: cmd.neighbors.radius,
+        };
+        let cv = leave_one_out_with_drift(&data, &drift_data, &model, &config)?;
+        (data, cv)
+    } else {
+        let data = cmd.input.read()?;
+        println!("Loaded {} points; model: {model}", data.len());
+        let config = KrigingConfig {
+            method: cmd.method.build(&data),
+            max_neighbors: cmd.neighbors.max_neighbors,
+            search_radius: cmd.neighbors.radius,
+        };
+        let cv = leave_one_out(&data, &model, &config)?;
+        (data, cv)
+    };
 
     println!("\nLeave-one-out cross-validation ({} points):", data.len());
     println!("  Mean error (bias): {:>12.6}", cv.mean_error());
@@ -371,7 +594,6 @@ fn run_sgs(cmd: SgsCmd) -> Result<()> {
             m
         }
         None => {
-            // Fit a model to the variogram of the normal scores.
             let ns = geostat_core::NormalScore::fit(data.values())?;
             let scores: Vec<f64> = data.values().iter().map(|&v| ns.transform(v)).collect();
             let ns_data = PointSet::new(data.coords().to_vec(), scores)?;
@@ -406,6 +628,84 @@ fn run_sgs(cmd: SgsCmd) -> Result<()> {
     Ok(())
 }
 
+fn run_sis(cmd: SisCmd) -> Result<()> {
+    let data = cmd.input.read()?;
+    println!(
+        "Loaded {} points from {}",
+        data.len(),
+        cmd.input.input.display()
+    );
+
+    // Cutoffs: explicit values or data quantiles.
+    let cutoffs: Vec<f64> = match &cmd.cutoffs {
+        Some(spec) => parse_floats(spec)?,
+        None => {
+            let qs = parse_floats(&cmd.quantiles)?;
+            let mut sorted = data.values().to_vec();
+            sorted.sort_by(f64::total_cmp);
+            qs.iter()
+                .map(|&q| {
+                    if !(0.0..=1.0).contains(&q) {
+                        bail!("quantile {q} outside [0, 1]");
+                    }
+                    let idx = ((q * sorted.len() as f64) as usize).min(sorted.len() - 1);
+                    Ok(sorted[idx])
+                })
+                .collect::<Result<_>>()?
+        }
+    };
+    println!(
+        "Cutoffs: {}",
+        cutoffs
+            .iter()
+            .map(|c| format!("{c:.4}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    // Fit an indicator variogram model per cutoff.
+    let kinds = parse_kinds(&cmd.fit)?;
+    let cfg_v = cmd.vario.config(&data);
+    let mut models: Vec<VariogramModel> = Vec::with_capacity(cutoffs.len());
+    for &c in &cutoffs {
+        let indicators: Vec<f64> = data
+            .values()
+            .iter()
+            .map(|&v| if v <= c { 1.0 } else { 0.0 })
+            .collect();
+        let ind_data = PointSet::new(data.coords().to_vec(), indicators)?;
+        let ev = experimental_variogram(&ind_data, &cfg_v)?;
+        let fit = fit_best(&ev, &kinds)?;
+        println!("Indicator model at cutoff {c:.4}: {}", fit.model);
+        models.push(fit.model);
+    }
+
+    let grid = cmd.grid.build(&data)?;
+    let cfg = SisConfig {
+        cutoffs,
+        models,
+        n_realizations: cmd.realizations,
+        seed: cmd.seed,
+        max_neighbors: cmd.max_neighbors,
+        search_radius: cmd.radius,
+        tail_min: cmd.tail_min,
+        tail_max: cmd.tail_max,
+    };
+    let res = sequential_indicator_simulation(&data, &grid, &cfg)?;
+
+    println!(
+        "Simulated {} realizations on {} cells ({} x {}), seed {}",
+        cfg.n_realizations,
+        grid.n_cells(),
+        grid.nx,
+        grid.ny,
+        cfg.seed
+    );
+    io_utils::write_sims_csv(&cmd.output, &grid, &res.realizations)?;
+    println!("Output written to {}", cmd.output.display());
+    Ok(())
+}
+
 fn parse_kinds(spec: &str) -> Result<Vec<ModelKind>> {
     let spec = spec.trim();
     if spec.eq_ignore_ascii_case("best") || spec.eq_ignore_ascii_case("all") {
@@ -416,11 +716,18 @@ fn parse_kinds(spec: &str) -> Result<Vec<ModelKind>> {
         .collect()
 }
 
+fn parse_floats(spec: &str) -> Result<Vec<f64>> {
+    spec.split(',')
+        .map(|p| {
+            p.trim()
+                .parse::<f64>()
+                .with_context(|| format!("invalid number '{}'", p.trim()))
+        })
+        .collect()
+}
+
 fn parse_bbox(s: &str) -> Result<([f64; 2], [f64; 2])> {
-    let parts: Vec<f64> = s
-        .split(',')
-        .map(|p| p.trim().parse::<f64>().context("invalid bbox number"))
-        .collect::<Result<_>>()?;
+    let parts = parse_floats(s)?;
     if parts.len() != 4 {
         bail!("bbox must be \"xmin,ymin,xmax,ymax\", got '{s}'");
     }

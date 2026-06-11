@@ -15,11 +15,12 @@
 use ndarray::Array2;
 use rayon::prelude::*;
 
-use crate::data::{PointSet, dist, k_nearest};
+use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
 use crate::grid::Grid2D;
 use crate::linalg::solve;
 use crate::rng::{Rng, splitmix64};
+use crate::search::BucketGrid;
 use crate::transform::NormalScore;
 use crate::variogram::VariogramModel;
 
@@ -114,7 +115,7 @@ fn simulate_one(
     let mut rng = Rng::new(seed);
     let centers = grid.centers();
     let n_cells = centers.len();
-    let c0 = model.covariance(0.0);
+    let c0 = model.covariance_dh([0.0, 0.0]);
     // Tiny diagonal stabilizer: previously simulated nodes can sit arbitrarily
     // close to data points, which makes exact systems near-singular.
     let stabilizer = c0 * 1e-9;
@@ -122,13 +123,24 @@ fn simulate_one(
     let mut path: Vec<usize> = (0..n_cells).collect();
     rng.shuffle(&mut path);
 
+    // Conditioning store: bucket grid covering data and simulation extents.
+    let (dmin, dmax) = data.bbox();
+    let min = [dmin[0].min(grid.x0), dmin[1].min(grid.y0)];
+    let max = [
+        dmax[0].max(grid.x0 + grid.dx * grid.nx as f64),
+        dmax[1].max(grid.y0 + grid.dy * grid.ny as f64),
+    ];
+    let mut search = BucketGrid::new(min, max, data.len() + n_cells);
     let mut cond_coords: Vec<[f64; 2]> = data.coords().to_vec();
     let mut cond_vals: Vec<f64> = data_scores.to_vec();
+    for &p in data.coords() {
+        search.insert(p);
+    }
     let mut sim_ns = vec![0.0_f64; n_cells];
 
     for &cell in &path {
         let target = centers[cell];
-        let nb = k_nearest(&cond_coords, target, cfg.max_neighbors, cfg.search_radius);
+        let nb = search.k_nearest(target, cfg.max_neighbors, cfg.search_radius);
 
         let (mean, var) = if nb.is_empty() {
             (0.0, c0)
@@ -138,6 +150,7 @@ fn simulate_one(
 
         let z = mean + var.max(0.0).sqrt() * rng.normal();
         sim_ns[cell] = z;
+        search.insert(target);
         cond_coords.push(target);
         cond_vals.push(z);
     }
@@ -159,13 +172,15 @@ fn simple_kriging_ns(
     let mut a = Array2::<f64>::zeros((n, n));
     let mut b = vec![0.0; n];
     for (ii, &i) in nb.iter().enumerate() {
+        let pi = coords[i];
         a[[ii, ii]] = c0 + stabilizer;
         for (jj, &j) in nb.iter().enumerate().skip(ii + 1) {
-            let c = model.covariance(dist(coords[i], coords[j]));
+            let pj = coords[j];
+            let c = model.covariance_dh([pi[0] - pj[0], pi[1] - pj[1]]);
             a[[ii, jj]] = c;
             a[[jj, ii]] = c;
         }
-        b[ii] = model.covariance(dist(coords[i], target));
+        b[ii] = model.covariance_dh([pi[0] - target[0], pi[1] - target[1]]);
     }
     let b0 = b.clone();
     let w = solve(a, b)?;

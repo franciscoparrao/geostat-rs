@@ -66,6 +66,41 @@ internal transform reduces to the identity and the comparison isolates the
 simulator. For real spiky data, despiking ahead of SGS is the user's
 responsibility (as in GSLIB practice).
 
+## v0.2 results (Meuse: KED, anisotropy, co-kriging)
+
+Deterministic parity on meuse.grid (3103 cells), same models on both sides:
+
+| Check | Predictions | Variances |
+|---|---|---|
+| KED `log(zinc) ~ sqrt(dist)` (gstat-fitted model) | 4.7e-13 | 1.4e-13 |
+| OK with anisotropic model (Sph 900, anis 30°/0.5) | 2.0e-14 | 9.4e-16 |
+| Ordinary co-kriging `log(zinc)+log(lead)`, `fit.lmc` LMC | 1.5e-12 | 1.2e-13 |
+
+SIS has no direct gstat counterpart in this harness; it is covered by unit
+tests (ensemble proportions track the global cdf, order-relation
+corrections, reproducibility) plus a CLI smoke test on Walker Lake — the
+auto-fitted indicator sills come out at the theoretical `p(1-p)`.
+
+Reproduce v0.2:
+
+```sh
+Rscript validation/v02_gstat.R
+BIN=target/release/geostat
+$BIN krige -i validation/out/meuse_multi.csv --value-col lzinc \
+    -m validation/out/gstat_ked_model.json \
+    --drift-cols sdist --targets validation/out/grid_targets.csv \
+    -o validation/out/rust_ked.csv
+$BIN krige -i validation/out/meuse_multi.csv --value-col lzinc \
+    -m validation/out/aniso_model.json \
+    --bbox 178440,329600,181560,333760 --nx 78 --ny 104 \
+    -o validation/out/rust_aniso.csv
+$BIN cokrige -i validation/out/meuse_multi.csv --value-col lzinc \
+    --secondary-col llead --lmc validation/out/gstat_lmc.json \
+    --bbox 178440,329600,181560,333760 --nx 78 --ny 104 \
+    -o validation/out/rust_cokrige.csv
+python3 validation/compare_v02.py
+```
+
 ## Reproduce
 
 ```sh

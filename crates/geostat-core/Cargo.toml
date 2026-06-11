@@ -14,3 +14,13 @@ ndarray = { workspace = true }
 rayon = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+
+[lib]
+bench = false
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "engine"
+harness = false

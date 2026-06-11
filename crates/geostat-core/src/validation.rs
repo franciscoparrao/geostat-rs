@@ -92,6 +92,46 @@ pub fn leave_one_out(
     })
 }
 
+/// Leave-one-out cross-validation for external-drift kriging. `drift_data[i]`
+/// holds the covariates at data point `i`.
+pub fn leave_one_out_with_drift(
+    data: &PointSet,
+    drift_data: &[Vec<f64>],
+    model: &VariogramModel,
+    config: &KrigingConfig,
+) -> Result<CvResult> {
+    if data.len() < 3 {
+        return Err(GeostatError::InsufficientData(
+            "leave-one-out cross-validation requires at least 3 points".into(),
+        ));
+    }
+    if drift_data.len() != data.len() {
+        return Err(GeostatError::DimensionMismatch(format!(
+            "{} drift rows vs {} data points",
+            drift_data.len(),
+            data.len()
+        )));
+    }
+    let estimates: Vec<(f64, f64)> = (0..data.len())
+        .into_par_iter()
+        .map(|i| -> Result<(f64, f64)> {
+            let sub = data.excluding(i);
+            let mut sub_drift = drift_data.to_vec();
+            sub_drift.remove(i);
+            let kriging = Kriging::with_external_drift(&sub, model, config.clone(), sub_drift)?;
+            let est = kriging.predict_with_drift(data.coord(i), &drift_data[i])?;
+            Ok((est.value, est.variance))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let (predicted, variance) = estimates.into_iter().unzip();
+    Ok(CvResult {
+        observed: data.values().to_vec(),
+        predicted,
+        variance,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

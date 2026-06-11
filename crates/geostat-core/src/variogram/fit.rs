@@ -65,11 +65,7 @@ pub fn fit_model(exp_v: &ExperimentalVariogram, kind: ModelKind) -> Result<FitRe
         }
         let model = VariogramModel {
             nugget,
-            structures: vec![Structure {
-                kind,
-                sill: psill,
-                range,
-            }],
+            structures: vec![Structure::new(kind, psill, range)],
         };
         pts.iter()
             .map(|&(h, g, w)| {
