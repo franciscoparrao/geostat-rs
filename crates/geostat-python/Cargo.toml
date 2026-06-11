@@ -1,0 +1,17 @@
+[package]
+name = "geostat-python"
+description = "Python bindings for the geostat-rs geostatistics engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "geostat_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+geostat-core = { path = "../geostat-core" }
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
+serde_json = { workspace = true }

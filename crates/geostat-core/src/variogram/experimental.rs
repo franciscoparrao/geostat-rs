@@ -2,10 +2,9 @@
 
 use std::f64::consts::{FRAC_PI_2, PI};
 
-use rayon::prelude::*;
-
 use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
+use crate::parallel::{n_chunks, par_map};
 
 /// Directional tolerance for anisotropic variograms.
 ///
@@ -130,40 +129,44 @@ pub(crate) fn pair_bins(
         .as_ref()
         .map(|d| (d.azimuth_deg.to_radians(), d.tolerance_deg.to_radians()));
 
-    let acc = (0..n)
-        .into_par_iter()
-        .fold(
-            || Acc::new(n_lags),
-            |mut acc, i| {
-                for j in (i + 1)..n {
-                    let dx = coords[j][0] - coords[i][0];
-                    let dy = coords[j][1] - coords[i][1];
-                    let d = (dx * dx + dy * dy).sqrt();
-                    if d <= 0.0 || d > cfg.max_dist {
+    // Pair accumulation, split into row chunks for parallelism.
+    let chunks = n_chunks();
+    let rows_per_chunk = n.div_ceil(chunks);
+    let acc = par_map(chunks, |c| {
+        let mut acc = Acc::new(n_lags);
+        let lo = c * rows_per_chunk;
+        let hi = ((c + 1) * rows_per_chunk).min(n);
+        for i in lo..hi {
+            for j in (i + 1)..n {
+                let dx = coords[j][0] - coords[i][0];
+                let dy = coords[j][1] - coords[i][1];
+                let d = (dx * dx + dy * dy).sqrt();
+                if d <= 0.0 || d > cfg.max_dist {
+                    continue;
+                }
+                if let Some((az, tol)) = dir {
+                    // Azimuth of the pair vector, clockwise from north.
+                    let ang = dx.atan2(dy);
+                    let mut diff = (ang - az).rem_euclid(PI);
+                    if diff > FRAC_PI_2 {
+                        diff -= PI;
+                    }
+                    if diff.abs() > tol {
                         continue;
                     }
-                    if let Some((az, tol)) = dir {
-                        // Azimuth of the pair vector, clockwise from north.
-                        let ang = dx.atan2(dy);
-                        let mut diff = (ang - az).rem_euclid(PI);
-                        if diff > FRAC_PI_2 {
-                            diff -= PI;
-                        }
-                        if diff.abs() > tol {
-                            continue;
-                        }
-                    }
-                    // Right-closed lag intervals ((b-1)w, bw], matching the
-                    // gstat/GSLIB convention for pairs exactly on a boundary.
-                    let bin = ((d / width).ceil() as usize - 1).min(n_lags - 1);
-                    acc.sq[bin] += 0.5 * (values_a[i] - values_a[j]) * (values_b[i] - values_b[j]);
-                    acc.h[bin] += d;
-                    acc.n[bin] += 1;
                 }
-                acc
-            },
-        )
-        .reduce(|| Acc::new(n_lags), Acc::merge);
+                // Right-closed lag intervals ((b-1)w, bw], matching the
+                // gstat/GSLIB convention for pairs exactly on a boundary.
+                let bin = ((d / width).ceil() as usize - 1).min(n_lags - 1);
+                acc.sq[bin] += 0.5 * (values_a[i] - values_a[j]) * (values_b[i] - values_b[j]);
+                acc.h[bin] += d;
+                acc.n[bin] += 1;
+            }
+        }
+        acc
+    })
+    .into_iter()
+    .fold(Acc::new(n_lags), |a, b| a.merge(b));
 
     let bins = (0..n_lags)
         .map(|b| {

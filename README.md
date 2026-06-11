@@ -9,10 +9,12 @@ prediction out of the box.
 
 | Crate | Description |
 |---|---|
-| `geostat-core` | Library: no I/O, no heavy dependencies. Targets native (Rayon), Python (PyO3, planned) and WASM (planned). |
+| `geostat-core` | Library: no I/O, no heavy dependencies. `parallel` feature (rayon, default on) — disable for wasm32. |
 | `geostat-cli` | `geostat` command-line tool: CSV in, CSV/JSON out. |
+| `geostat-python` | Python module `geostat_rs` (PyO3, abi3 ≥ 3.9). Build with maturin. |
+| `geostat-wasm` | WebAssembly bindings (wasm-bindgen); demo in `examples/wasm-demo/`. |
 
-## Features (v0.2)
+## Features (v0.3)
 
 - **Experimental variograms** — omnidirectional, directional (azimuth +
   angular tolerance, gstat/GSLIB convention) and cross-variograms.
@@ -24,8 +26,8 @@ prediction out of the box.
   2-variable LMC fitting with PSD projection.
 - **Kriging** — simple, ordinary, universal (polynomial drift) and
   **external drift** (KED); **ordinary co-kriging** under a linear model
-  of coregionalization; kd-tree moving neighborhoods; parallel over
-  targets; kriging variance maps.
+  of coregionalization; **block kriging** with explicit discretization;
+  kd-tree moving neighborhoods; parallel over targets; variance maps.
 - **Validation** — leave-one-out cross-validation (ME, MAE, RMSE, MSDR),
   with or without external drift.
 - **Simulation** — conditional sequential **Gaussian** simulation
@@ -34,6 +36,8 @@ prediction out of the box.
   deterministic, platform-independent RNG (xoshiro256++) and incremental
   bucket-grid neighbor search: same seed, same realizations, anywhere.
 - **Benchmarks** — criterion suite (`cargo bench -p geostat-core`).
+- **Bindings** — Python (`import geostat_rs`: variography, kriging, CV,
+  SGS, SIS) and WebAssembly (browser demo in `examples/wasm-demo/`).
 
 ## Build
 
@@ -128,8 +132,28 @@ scaling), so ranges are comparable across families.
 - v0.2: ✅ co-kriging (LMC), KED, SIS, model anisotropy, kd-tree/bucket
   neighbor search, criterion benchmarks. KED/anisotropy/co-kriging also
   validated against gstat at machine precision.
-- Next: Python bindings (PyO3), WASM demo, 3-D support, paper draft
+- v0.3: ✅ Python bindings (PyO3, bit-identical with the CLI), WASM
+  bindings + browser demo, block kriging (validated vs gstat at machine
+  precision, including the nugget-free C̄(B,B) convention).
+- Next (v0.4): 3-D support, heterotopic co-kriging, paper draft
   (Mathematical Geosciences).
+
+## Python quickstart
+
+```sh
+pip install maturin
+maturin develop -m crates/geostat-python/Cargo.toml --release
+```
+
+```python
+import geostat_rs as gs
+
+model = gs.fit_variogram(x, y, z, n_lags=15, max_dist=1500.0)
+pred, var = gs.krige_grid(x, y, z, model, bbox=(0, 0, 100, 100), nx=50, ny=50,
+                          max_neighbors=32)
+sims = gs.sgs(x, y, z, model_ns, bbox=(0, 0, 100, 100), nx=50, ny=50,
+              n_realizations=100, seed=42)
+```
 
 ## License
 

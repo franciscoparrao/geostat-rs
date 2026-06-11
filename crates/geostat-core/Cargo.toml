@@ -9,9 +9,14 @@ repository.workspace = true
 keywords = ["geostatistics", "kriging", "variogram", "simulation", "spatial"]
 categories = ["science", "mathematics"]
 
+[features]
+default = ["parallel"]
+# Parallel execution via rayon. Disable for single-threaded targets (wasm32).
+parallel = ["dep:rayon"]
+
 [dependencies]
 ndarray = { workspace = true }
-rayon = { workspace = true }
+rayon = { workspace = true, optional = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 

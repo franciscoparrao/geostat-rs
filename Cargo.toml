@@ -1,9 +1,14 @@
 [workspace]
 resolver = "3"
-members = ["crates/geostat-core", "crates/geostat-cli"]
+members = [
+    "crates/geostat-core",
+    "crates/geostat-cli",
+    "crates/geostat-python",
+    "crates/geostat-wasm",
+]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Francisco Parra-O."]

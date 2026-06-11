@@ -210,6 +210,12 @@ struct KrigeCmd {
     /// Targets CSV with x, y and the drift columns (external drift only)
     #[arg(long)]
     targets: Option<PathBuf>,
+    /// Block kriging: block size "width,height" centered on each cell
+    #[arg(long)]
+    block: Option<String>,
+    /// Block discretization points per axis "nx,ny"
+    #[arg(long, default_value = "4,4")]
+    block_discr: String,
     #[command(flatten)]
     grid: GridOpts,
     #[command(flatten)]
@@ -443,7 +449,25 @@ fn run_krige(cmd: KrigeCmd) -> Result<()> {
         search_radius: cmd.neighbors.radius,
     };
     let kriging = Kriging::new(&data, &model, config)?;
-    let (values, variances) = kriging.predict_grid(&grid);
+    let (values, variances) = match &cmd.block {
+        Some(spec) => {
+            let size = parse_floats(spec)?;
+            let discr = parse_floats(&cmd.block_discr)?;
+            if size.len() != 2 || discr.len() != 2 {
+                bail!("--block and --block-discr take two comma-separated values");
+            }
+            println!(
+                "Block kriging: {} x {} blocks, {} x {} discretization",
+                size[0], size[1], discr[0], discr[1]
+            );
+            kriging.predict_block_grid(
+                &grid,
+                [size[0], size[1]],
+                [discr[0] as usize, discr[1] as usize],
+            )?
+        }
+        None => kriging.predict_grid(&grid),
+    };
 
     let n_nan = values.iter().filter(|v| v.is_nan()).count();
     let finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();

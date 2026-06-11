@@ -8,7 +8,6 @@
 //! interpolation within classes and linear tails to `[tail_min, tail_max]`.
 
 use ndarray::Array2;
-use rayon::prelude::*;
 
 use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
@@ -120,14 +119,11 @@ pub fn sequential_indicator_simulation(
         ));
     }
 
-    let realizations: Vec<Vec<f64>> = (0..cfg.n_realizations)
-        .into_par_iter()
-        .map(|r| {
-            let mut seed_state = cfg.seed ^ (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            let seed_r = splitmix64(&mut seed_state);
-            simulate_one(data, grid, cfg, &props, tail_min, tail_max, seed_r)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let realizations: Vec<Vec<f64>> = crate::parallel::par_try_map(cfg.n_realizations, |r| {
+        let mut seed_state = cfg.seed ^ (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let seed_r = splitmix64(&mut seed_state);
+        simulate_one(data, grid, cfg, &props, tail_min, tail_max, seed_r)
+    })?;
 
     Ok(SgsResult {
         grid: grid.clone(),

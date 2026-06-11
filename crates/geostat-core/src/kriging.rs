@@ -1,7 +1,6 @@
 //! Simple, ordinary, universal and external-drift kriging.
 
 use ndarray::Array2;
-use rayon::prelude::*;
 
 use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
@@ -369,10 +368,9 @@ impl<'a> Kriging<'a> {
     /// Kriging estimates at many targets, in parallel. Targets whose system
     /// fails (e.g. no neighbors) yield NaN estimates.
     pub fn predict_many(&self, targets: &[[f64; 2]]) -> Vec<KrigingEstimate> {
-        targets
-            .par_iter()
-            .map(|&t| self.predict(t).unwrap_or(NAN_ESTIMATE))
-            .collect()
+        crate::parallel::par_map(targets.len(), |i| {
+            self.predict(targets[i]).unwrap_or(NAN_ESTIMATE)
+        })
     }
 
     /// External-drift estimates at many targets, in parallel. `drifts[i]`
@@ -389,11 +387,10 @@ impl<'a> Kriging<'a> {
                 drifts.len()
             )));
         }
-        Ok(targets
-            .par_iter()
-            .zip(drifts)
-            .map(|(&t, d)| self.predict_with_drift(t, d).unwrap_or(NAN_ESTIMATE))
-            .collect())
+        Ok(crate::parallel::par_map(targets.len(), |i| {
+            self.predict_with_drift(targets[i], &drifts[i])
+                .unwrap_or(NAN_ESTIMATE)
+        }))
     }
 
     /// Kriging over all cell centers of a grid. Returns `(values, variances)`
@@ -402,6 +399,145 @@ impl<'a> Kriging<'a> {
         let ests = self.predict_many(&grid.centers());
         ests.into_iter().map(|e| (e.value, e.variance)).unzip()
     }
+
+    /// Block kriging estimate: predicts the average of a block centered at
+    /// `center`, discretized at `center + offsets[u]`. Supported for simple
+    /// and ordinary kriging (polynomial or external drift would require
+    /// averaging the drift over the block).
+    pub fn predict_block(&self, center: [f64; 2], offsets: &[[f64; 2]]) -> Result<KrigingEstimate> {
+        match self.config.method {
+            KrigingMethod::Simple { .. } | KrigingMethod::Ordinary => {}
+            _ => {
+                return Err(GeostatError::InvalidParameter(
+                    "block kriging supports simple and ordinary kriging only".into(),
+                ));
+            }
+        }
+        if offsets.is_empty() {
+            return Err(GeostatError::InvalidParameter(
+                "block discretization needs at least one point".into(),
+            ));
+        }
+        let nb = self.neighbors(center);
+        if nb.is_empty() {
+            return Err(GeostatError::NoNeighbors);
+        }
+        let m = self.config.method.n_drift();
+        let n = nb.len();
+        let dim = n + m;
+        let c0 = self.model.covariance_dh([0.0, 0.0]);
+        let nu = offsets.len() as f64;
+
+        let mut a = Array2::<f64>::zeros((dim, dim));
+        let mut b = vec![0.0; dim];
+        for (ii, &i) in nb.iter().enumerate() {
+            let pi = self.data.coord(i);
+            a[[ii, ii]] = c0;
+            for (jj, &j) in nb.iter().enumerate().skip(ii + 1) {
+                let pj = self.data.coord(j);
+                let c = self.model.covariance_dh([pi[0] - pj[0], pi[1] - pj[1]]);
+                a[[ii, jj]] = c;
+                a[[jj, ii]] = c;
+            }
+            if m == 1 {
+                a[[ii, n]] = 1.0;
+                a[[n, ii]] = 1.0;
+            }
+            // Point-to-block covariance: average over discretization points.
+            b[ii] = offsets
+                .iter()
+                .map(|off| {
+                    self.model
+                        .covariance_dh([pi[0] - (center[0] + off[0]), pi[1] - (center[1] + off[1])])
+                })
+                .sum::<f64>()
+                / nu;
+        }
+        if m == 1 {
+            b[n] = 1.0;
+        }
+
+        // Within-block covariance C̄(B,B). For coincident discretization
+        // points (u = v) the nugget is excluded: it is a measure-zero
+        // discontinuity in the block integral (gstat/GSLIB convention).
+        let c0_continuous = c0 - self.model.nugget;
+        let mut cbb = 0.0;
+        for (ui, u) in offsets.iter().enumerate() {
+            for (vi, v) in offsets.iter().enumerate() {
+                cbb += if ui == vi {
+                    c0_continuous
+                } else {
+                    self.model.covariance_dh([u[0] - v[0], u[1] - v[1]])
+                };
+            }
+        }
+        cbb /= nu * nu;
+
+        let b0 = b.clone();
+        let w = solve(a, b)?;
+        let (value, variance) = match self.config.method {
+            KrigingMethod::Simple { mean } => {
+                let mut v = mean;
+                let mut reduction = 0.0;
+                for ii in 0..n {
+                    v += w[ii] * (self.data.value(nb[ii]) - mean);
+                    reduction += w[ii] * b0[ii];
+                }
+                (v, cbb - reduction)
+            }
+            _ => {
+                let v: f64 = (0..n).map(|ii| w[ii] * self.data.value(nb[ii])).sum();
+                let reduction: f64 = (0..dim).map(|i| w[i] * b0[i]).sum();
+                (v, cbb - reduction)
+            }
+        };
+        Ok(KrigingEstimate {
+            value,
+            variance: variance.max(0.0),
+        })
+    }
+
+    /// Block kriging over all grid cells, with blocks of `block_size`
+    /// discretized as a regular `discr[0]` x `discr[1]` point grid.
+    pub fn predict_block_grid(
+        &self,
+        grid: &Grid2D,
+        block_size: [f64; 2],
+        discr: [usize; 2],
+    ) -> Result<(Vec<f64>, Vec<f64>)> {
+        let offsets = block_offsets(block_size, discr)?;
+        let centers = grid.centers();
+        let ests = crate::parallel::par_map(centers.len(), |i| {
+            self.predict_block(centers[i], &offsets)
+                .unwrap_or(NAN_ESTIMATE)
+        });
+        Ok(ests.into_iter().map(|e| (e.value, e.variance)).unzip())
+    }
+}
+
+/// Regular block-discretization offsets: an `n[0]` x `n[1]` grid of cell
+/// centers covering a block of `size`, centered on the origin.
+pub fn block_offsets(size: [f64; 2], n: [usize; 2]) -> Result<Vec<[f64; 2]>> {
+    if n[0] == 0 || n[1] == 0 {
+        return Err(GeostatError::InvalidParameter(
+            "block discretization needs at least 1 point per axis".into(),
+        ));
+    }
+    if !(size[0] > 0.0) || !(size[1] > 0.0) {
+        return Err(GeostatError::InvalidParameter(format!(
+            "block size must be positive, got {size:?}"
+        )));
+    }
+    let mut offsets = Vec::with_capacity(n[0] * n[1]);
+    for iy in 0..n[1] {
+        for ix in 0..n[0] {
+            offsets.push([
+                ((ix as f64 + 0.5) / n[0] as f64 - 0.5) * size[0],
+                ((iy as f64 + 0.5) / n[1] as f64 - 0.5) * size[1],
+            ]);
+        }
+    }
+    Ok(offsets)
 }
 
 #[cfg(test)]
@@ -598,6 +734,52 @@ mod tests {
         assert_eq!(vars.len(), 20);
         assert!(vals.iter().all(|v| v.is_finite()));
         assert!(vars.iter().all(|v| *v >= 0.0));
+    }
+
+    #[test]
+    fn block_kriging_averages_point_predictions() {
+        // With a global neighborhood, the BLUP of the block average equals
+        // the average of point BLUPs (linearity); the block variance must be
+        // smaller than the central point variance.
+        let data = sample_data();
+        let m = model();
+        let k = Kriging::new(&data, &m, KrigingConfig::default()).unwrap();
+        let center = [0.6, 0.4];
+        let offsets = block_offsets([0.4, 0.4], [4, 4]).unwrap();
+        let block = k.predict_block(center, &offsets).unwrap();
+        let mean_pts = offsets
+            .iter()
+            .map(|o| {
+                k.predict([center[0] + o[0], center[1] + o[1]])
+                    .unwrap()
+                    .value
+            })
+            .sum::<f64>()
+            / offsets.len() as f64;
+        assert!(
+            (block.value - mean_pts).abs() < 1e-10,
+            "block {} vs mean of points {mean_pts}",
+            block.value
+        );
+        let point_var = k.predict(center).unwrap().variance;
+        assert!(
+            block.variance < point_var,
+            "{} vs {point_var}",
+            block.variance
+        );
+        // Drift methods are rejected.
+        let uk = Kriging::new(
+            &data,
+            &m,
+            KrigingConfig {
+                method: KrigingMethod::Universal { degree: 1 },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(uk.predict_block(center, &offsets).is_err());
+        assert!(block_offsets([0.0, 1.0], [4, 4]).is_err());
+        assert!(block_offsets([1.0, 1.0], [0, 4]).is_err());
     }
 
     #[test]

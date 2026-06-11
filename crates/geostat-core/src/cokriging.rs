@@ -6,7 +6,6 @@
 //! primary weights sum to 1, each secondary variable's weights sum to 0.
 
 use ndarray::Array2;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::data::PointSet;
@@ -320,15 +319,12 @@ impl<'a> CoKriging<'a> {
 
     /// Estimates at many targets, in parallel (NaN on failed systems).
     pub fn predict_many(&self, targets: &[[f64; 2]]) -> Vec<KrigingEstimate> {
-        targets
-            .par_iter()
-            .map(|&t| {
-                self.predict(t).unwrap_or(KrigingEstimate {
-                    value: f64::NAN,
-                    variance: f64::NAN,
-                })
+        crate::parallel::par_map(targets.len(), |i| {
+            self.predict(targets[i]).unwrap_or(KrigingEstimate {
+                value: f64::NAN,
+                variance: f64::NAN,
             })
-            .collect()
+        })
     }
 
     /// Co-kriging over all grid cell centers.

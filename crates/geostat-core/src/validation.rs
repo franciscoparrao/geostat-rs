@@ -1,6 +1,6 @@
 //! Leave-one-out cross-validation for kriging models.
 
-use rayon::prelude::*;
+use crate::parallel::par_try_map;
 
 use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
@@ -74,15 +74,12 @@ pub fn leave_one_out(
             "leave-one-out cross-validation requires at least 3 points".into(),
         ));
     }
-    let estimates: Vec<(f64, f64)> = (0..data.len())
-        .into_par_iter()
-        .map(|i| -> Result<(f64, f64)> {
-            let sub = data.excluding(i);
-            let kriging = Kriging::new(&sub, model, config.clone())?;
-            let est = kriging.predict(data.coord(i))?;
-            Ok((est.value, est.variance))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let estimates: Vec<(f64, f64)> = par_try_map(data.len(), |i| {
+        let sub = data.excluding(i);
+        let kriging = Kriging::new(&sub, model, config.clone())?;
+        let est = kriging.predict(data.coord(i))?;
+        Ok((est.value, est.variance))
+    })?;
 
     let (predicted, variance) = estimates.into_iter().unzip();
     Ok(CvResult {
@@ -112,17 +109,14 @@ pub fn leave_one_out_with_drift(
             data.len()
         )));
     }
-    let estimates: Vec<(f64, f64)> = (0..data.len())
-        .into_par_iter()
-        .map(|i| -> Result<(f64, f64)> {
-            let sub = data.excluding(i);
-            let mut sub_drift = drift_data.to_vec();
-            sub_drift.remove(i);
-            let kriging = Kriging::with_external_drift(&sub, model, config.clone(), sub_drift)?;
-            let est = kriging.predict_with_drift(data.coord(i), &drift_data[i])?;
-            Ok((est.value, est.variance))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let estimates: Vec<(f64, f64)> = par_try_map(data.len(), |i| {
+        let sub = data.excluding(i);
+        let mut sub_drift = drift_data.to_vec();
+        sub_drift.remove(i);
+        let kriging = Kriging::with_external_drift(&sub, model, config.clone(), sub_drift)?;
+        let est = kriging.predict_with_drift(data.coord(i), &drift_data[i])?;
+        Ok((est.value, est.variance))
+    })?;
 
     let (predicted, variance) = estimates.into_iter().unzip();
     Ok(CvResult {

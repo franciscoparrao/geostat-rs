@@ -1,10 +1,11 @@
 # geostat-rs — Motor de geoestadística en Rust ("GSLIB moderno")
 
-> **Estado:** v0.2 completa y **validada contra gstat** (2026-06-11):
-> v0.1 (variograma/OK/UK/SK/CV/SGS) + v0.2 (co-kriging LMC, KED, SIS,
-> anisotropía, kd-tree, benches) — paridad a precisión de máquina en todo lo
-> determinista (Meuse + Walker Lake); SGS validado distribucionalmente.
-> Ver `validation/README.md`. Pendiente: PyO3, WASM, 3-D, paper.
+> **Estado:** v0.3 completa y **validada contra gstat** (2026-06-11).
+> v0.1 (variografía/OK/UK/SK/CV/SGS) + v0.2 (co-kriging LMC, KED, SIS,
+> anisotropía, kd-tree, benches) + v0.3 (bindings PyO3 bit-idénticos al CLI,
+> WASM + demo browser, block kriging) — paridad a precisión de máquina en
+> todo lo determinista (Meuse + Walker Lake); SGS validado distribucionalmente.
+> Ver `validation/README.md`. Pendiente v0.4: 3-D, co-kriging heterotópico, paper.
 > Familia de motores Rust del autor: SurtGIS, Hydroflux, Smelt, Anvil, Cantus, Criterium.
 > Doc madre: `~/proyectos/ideas-motores-rust.md` (idea A1).
 
@@ -28,7 +29,12 @@ bindings modernos). No hay un motor geoestadístico Rust con WASM/Python.
       PSD), kriging con deriva externa, SIS (sisim-style), anisotropía
       geométrica en modelos, kd-tree (kriging) + bucket grid (simulación),
       benches con criterion. Todo lo determinista validado contra gstat.
-- [ ] (v0.3) PyO3, WASM, soporte 3-D, kriging por bloques.
+- [x] (v0.3) PyO3 (`import geostat_rs`, abi3≥3.9, maturin), WASM
+      (wasm-bindgen + demo en `examples/wasm-demo/`), kriging por bloques
+      (validado vs gstat; C̄(B,B) sin nugget en puntos coincidentes),
+      feature `parallel` para compilar sin rayon en wasm32.
+- [ ] (v0.4) Soporte 3-D, co-kriging heterotópico, kriging de indicadores
+      standalone; luego draft del paper.
 
 ## Arquitectura tentativa
 - `geostat-core`: variograma, sistemas de kriging, RNG determinista.
@@ -59,4 +65,8 @@ Computers & Geosciences.
 5. ~~v0.2: co-kriging, KED, SIS, anisotropía, kd-tree, benches~~ → **hecho**
    (2026-06-11), validado contra gstat a 1e-12 (KED/aniso/co-kriging);
    SIS con tests internos (sills de indicador ≈ p(1-p)).
-6. Bindings PyO3 y demo WASM; luego draft para Mathematical Geosciences.
+6. ~~Bindings PyO3 y demo WASM~~ → **hecho** (2026-06-11) + block kriging
+   validado a 1e-14. Python: paridad bit a bit con el CLI.
+7. v0.4: 3-D (la mayor brecha restante vs GSLIB), co-kriging heterotópico.
+8. Draft para Mathematical Geosciences (paridad 7 métodos × 2 datasets,
+   benchmark 7× vs gstat, reproducibilidad determinista cross-platform).

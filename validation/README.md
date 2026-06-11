@@ -101,6 +101,20 @@ $BIN cokrige -i validation/out/meuse_multi.csv --value-col lzinc \
 python3 validation/compare_v02.py
 ```
 
+## v0.3 results (Meuse: block kriging; Python bindings)
+
+| Check | Predictions | Variances |
+|---|---|---|
+| Block kriging 40×40 m, explicit 4×4 discretization | 4.1e-14 | 1.5e-15 |
+| Python bindings vs CLI (same model, 200 grid points) | 0.0 (bit-identical) | 0.0 |
+
+Convention caught by this exercise: in `C̄(B,B)` gstat/GSLIB exclude the
+nugget for coincident discretization points (a measure-zero discontinuity
+in the block integral); including it shifts every block variance by
+exactly `nugget / n_discr`. Reproduce: `Rscript validation/v03_gstat.R`,
+then the `geostat krige --block` call in `compare_v03.py`'s docstring,
+then `python3 validation/compare_v03.py`.
+
 ## Reproduce
 
 ```sh
