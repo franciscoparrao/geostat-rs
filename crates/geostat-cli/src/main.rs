@@ -7,10 +7,11 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use geostat_core::{
-    CoKriging, CoKrigingConfig, DirectionConfig, Grid2D, Kriging, KrigingConfig, KrigingMethod,
-    ModelKind, PointSet, SgsConfig, SisConfig, VariogramConfig, VariogramModel,
-    experimental_cross_variogram, experimental_variogram, fit_best, fit_lmc, leave_one_out,
-    leave_one_out_with_drift, sequential_gaussian_simulation, sequential_indicator_simulation,
+    CoKriging, CoKrigingConfig, DirectionConfig, Grid2D, IkConfig, Kriging, KrigingConfig,
+    KrigingMethod, ModelKind, PointSet, SgsConfig, SisConfig, VariogramConfig, VariogramModel,
+    experimental_cross_variogram, experimental_variogram, fit_best, fit_lmc, indicator_kriging,
+    leave_one_out, leave_one_out_with_drift, sequential_gaussian_simulation,
+    sequential_indicator_simulation,
 };
 
 #[derive(Parser)]
@@ -38,6 +39,8 @@ enum Command {
     Sgs(SgsCmd),
     /// Conditional sequential indicator simulation
     Sis(SisCmd),
+    /// Indicator kriging: local ccdf, E-type estimate and conditional variance
+    Ik(IkCmd),
 }
 
 #[derive(Args)]
@@ -51,12 +54,27 @@ struct InputOpts {
     /// Column name for the Y coordinate
     #[arg(long, default_value = "y")]
     y_col: String,
+    /// Column name for the Z coordinate: switches 3-D mode on
+    /// (variogram, krige with --targets, cv)
+    #[arg(long)]
+    z_col: Option<String>,
     /// Column name for the variable of interest
     #[arg(long, default_value = "z")]
     value_col: String,
 }
 
 impl InputOpts {
+    fn read3(&self) -> Result<PointSet<3>> {
+        let z_col = self.z_col.as_ref().expect("z_col checked by caller");
+        io_utils::read_points3(
+            &self.input,
+            &self.x_col,
+            &self.y_col,
+            z_col,
+            &self.value_col,
+        )
+    }
+
     fn read(&self) -> Result<PointSet> {
         io_utils::read_points(&self.input, &self.x_col, &self.y_col, &self.value_col)
     }
@@ -86,17 +104,24 @@ struct VariogramOpts {
     /// Angular tolerance in degrees for the directional variogram
     #[arg(long, default_value_t = 22.5)]
     tolerance: f64,
+    /// Dip in degrees (positive downward) for 3-D directional variograms
+    #[arg(long, default_value_t = 0.0)]
+    dip: f64,
 }
 
 impl VariogramOpts {
-    fn config(&self, data: &PointSet) -> VariogramConfig {
+    fn config<const D: usize>(&self, data: &PointSet<D>) -> VariogramConfig {
         let (min, max) = data.bbox();
-        let diag = ((max[0] - min[0]).powi(2) + (max[1] - min[1]).powi(2)).sqrt();
+        let diag = (0..D)
+            .map(|d| (max[d] - min[d]).powi(2))
+            .sum::<f64>()
+            .sqrt();
         VariogramConfig {
             n_lags: self.n_lags,
             max_dist: self.max_dist.unwrap_or(diag / 3.0),
             direction: self.azimuth.map(|az| DirectionConfig {
                 azimuth_deg: az,
+                dip_deg: self.dip,
                 tolerance_deg: self.tolerance,
             }),
         }
@@ -164,7 +189,7 @@ struct MethodOpts {
 }
 
 impl MethodOpts {
-    fn build(&self, data: &PointSet) -> KrigingMethod {
+    fn build<const D: usize>(&self, data: &PointSet<D>) -> KrigingMethod {
         match self.method {
             MethodArg::Ordinary => KrigingMethod::Ordinary,
             MethodArg::Simple => KrigingMethod::Simple {
@@ -229,11 +254,15 @@ struct KrigeCmd {
 struct CokrigeCmd {
     #[command(flatten)]
     input: InputOpts,
-    /// Column with the (collocated) secondary variable
+    /// Column with the secondary variable
     #[arg(long)]
     secondary_col: String,
+    /// Separate CSV with the secondary variable (heterotopic co-kriging;
+    /// same coordinate column names). Requires --lmc
+    #[arg(long)]
+    secondary_input: Option<PathBuf>,
     /// LMC model (JSON). If omitted, an LMC is fitted automatically from the
-    /// direct and cross variograms
+    /// direct and cross variograms (collocated data only)
     #[arg(long)]
     lmc: Option<PathBuf>,
     /// Write the (fitted) LMC to a JSON file
@@ -341,6 +370,40 @@ struct SisCmd {
     output: PathBuf,
 }
 
+#[derive(Args)]
+struct IkCmd {
+    #[command(flatten)]
+    input: InputOpts,
+    #[command(flatten)]
+    grid: GridOpts,
+    #[command(flatten)]
+    vario: VariogramOpts,
+    /// Indicator cutoffs as data quantiles, comma-separated
+    #[arg(long, default_value = "0.25,0.5,0.75")]
+    quantiles: String,
+    /// Explicit indicator cutoffs (overrides --quantiles)
+    #[arg(long)]
+    cutoffs: Option<String>,
+    /// Indicator model JSONs, comma-separated, one per cutoff
+    /// (default: auto-fit per cutoff)
+    #[arg(long)]
+    models: Option<String>,
+    /// Model kinds to try when auto-fitting indicator variograms
+    #[arg(long, default_value = "spherical,exponential")]
+    fit: String,
+    #[command(flatten)]
+    neighbors: NeighborOpts,
+    /// Lower tail bound (default: data minimum)
+    #[arg(long)]
+    tail_min: Option<f64>,
+    /// Upper tail bound (default: data maximum)
+    #[arg(long)]
+    tail_max: Option<f64>,
+    /// Output CSV file (x,y,F1..FK,e_type,cond_var)
+    #[arg(short, long)]
+    output: PathBuf,
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Variogram(cmd) => run_variogram(cmd),
@@ -349,19 +412,28 @@ fn main() -> Result<()> {
         Command::Cv(cmd) => run_cv(cmd),
         Command::Sgs(cmd) => run_sgs(cmd),
         Command::Sis(cmd) => run_sis(cmd),
+        Command::Ik(cmd) => run_ik(cmd),
     }
 }
 
 fn run_variogram(cmd: VariogramCmd) -> Result<()> {
+    if cmd.input.z_col.is_some() {
+        let data = cmd.input.read3()?;
+        println!("Loaded {} 3-D points", data.len());
+        return variogram_report(&data, &cmd);
+    }
     let data = cmd.input.read()?;
     println!(
         "Loaded {} points from {}",
         data.len(),
         cmd.input.input.display()
     );
+    variogram_report(&data, &cmd)
+}
 
-    let cfg = cmd.vario.config(&data);
-    let ev = experimental_variogram(&data, &cfg)?;
+fn variogram_report<const D: usize>(data: &PointSet<D>, cmd: &VariogramCmd) -> Result<()> {
+    let cfg = cmd.vario.config(data);
+    let ev = experimental_variogram(data, &cfg)?;
 
     println!("\nExperimental variogram (max_dist = {:.2}):", cfg.max_dist);
     println!("{:>4} {:>12} {:>12} {:>8}", "lag", "h", "gamma", "pairs");
@@ -396,6 +468,33 @@ fn run_variogram(cmd: VariogramCmd) -> Result<()> {
 
 fn run_krige(cmd: KrigeCmd) -> Result<()> {
     let model = io_utils::read_model(&cmd.model)?;
+
+    if let Some(z_col) = &cmd.input.z_col {
+        // 3-D kriging at explicit targets.
+        if cmd.drift_cols.is_some() || cmd.block.is_some() {
+            bail!("3-D mode supports plain point kriging only (no --drift-cols/--block)");
+        }
+        let targets_path = cmd
+            .targets
+            .as_ref()
+            .context("3-D kriging requires --targets (CSV with x, y, z)")?;
+        let data = cmd.input.read3()?;
+        println!("Loaded {} 3-D points; model: {model}", data.len());
+        let config = KrigingConfig {
+            method: cmd.method.build(&data),
+            max_neighbors: cmd.neighbors.max_neighbors,
+            search_radius: cmd.neighbors.radius,
+        };
+        let kriging: Kriging<'_, 3> = Kriging::new(&data, &model, config)?;
+        let targets =
+            io_utils::read_targets3(targets_path, &cmd.input.x_col, &cmd.input.y_col, z_col)?;
+        let ests = kriging.predict_many(&targets);
+        let n_nan = ests.iter().filter(|e| e.value.is_nan()).count();
+        println!("Kriged {} 3-D targets; {} failed", targets.len(), n_nan);
+        io_utils::write_estimates3_csv(&cmd.output, &targets, &ests)?;
+        println!("Output written to {}", cmd.output.display());
+        return Ok(());
+    }
 
     if let Some(drift_spec) = &cmd.drift_cols {
         // External drift kriging at explicit targets.
@@ -490,19 +589,46 @@ fn run_krige(cmd: KrigeCmd) -> Result<()> {
 }
 
 fn run_cokrige(cmd: CokrigeCmd) -> Result<()> {
-    let (primary, extras) = cmd
-        .input
-        .read_with_extras(std::slice::from_ref(&cmd.secondary_col))?;
-    let secondary = PointSet::new(
-        primary.coords().to_vec(),
-        extras.iter().map(|r| r[0]).collect(),
-    )?;
-    println!(
-        "Loaded {} collocated points ({} + {})",
-        primary.len(),
-        cmd.input.value_col,
-        cmd.secondary_col
-    );
+    let (primary, secondary) = match &cmd.secondary_input {
+        Some(path) => {
+            // Heterotopic: the secondary variable has its own locations.
+            if cmd.lmc.is_none() {
+                bail!(
+                    "--secondary-input (heterotopic co-kriging) requires --lmc: \
+                     automatic LMC fitting needs collocated data"
+                );
+            }
+            let primary = cmd.input.read()?;
+            let secondary = io_utils::read_points(
+                path,
+                &cmd.input.x_col,
+                &cmd.input.y_col,
+                &cmd.secondary_col,
+            )?;
+            println!(
+                "Loaded {} primary + {} secondary points (heterotopic)",
+                primary.len(),
+                secondary.len()
+            );
+            (primary, secondary)
+        }
+        None => {
+            let (primary, extras) = cmd
+                .input
+                .read_with_extras(std::slice::from_ref(&cmd.secondary_col))?;
+            let secondary = PointSet::new(
+                primary.coords().to_vec(),
+                extras.iter().map(|r| r[0]).collect(),
+            )?;
+            println!(
+                "Loaded {} collocated points ({} + {})",
+                primary.len(),
+                cmd.input.value_col,
+                cmd.secondary_col
+            );
+            (primary, secondary)
+        }
+    };
 
     let lmc = match &cmd.lmc {
         Some(path) => {
@@ -557,6 +683,29 @@ fn run_cokrige(cmd: CokrigeCmd) -> Result<()> {
 
 fn run_cv(cmd: CvCmd) -> Result<()> {
     let model = io_utils::read_model(&cmd.model)?;
+
+    if cmd.input.z_col.is_some() {
+        if cmd.drift_cols.is_some() {
+            bail!("3-D cross-validation does not support --drift-cols");
+        }
+        let data = cmd.input.read3()?;
+        println!("Loaded {} 3-D points; model: {model}", data.len());
+        let config = KrigingConfig {
+            method: cmd.method.build(&data),
+            max_neighbors: cmd.neighbors.max_neighbors,
+            search_radius: cmd.neighbors.radius,
+        };
+        let cv = leave_one_out(&data, &model, &config)?;
+        println!("\nLeave-one-out cross-validation ({} points):", data.len());
+        println!("  Mean error (bias): {:>12.6}", cv.mean_error());
+        println!("  MAE:               {:>12.6}", cv.mae());
+        println!("  RMSE:              {:>12.6}", cv.rmse());
+        println!("  MSDR (ideal ~1):   {:>12.6}", cv.msdr());
+        if cmd.output.is_some() {
+            bail!("--output is not supported in 3-D mode yet");
+        }
+        return Ok(());
+    }
 
     let (data, cv) = if let Some(drift_spec) = &cmd.drift_cols {
         let drift_cols: Vec<String> = drift_spec
@@ -726,6 +875,96 @@ fn run_sis(cmd: SisCmd) -> Result<()> {
         cfg.seed
     );
     io_utils::write_sims_csv(&cmd.output, &grid, &res.realizations)?;
+    println!("Output written to {}", cmd.output.display());
+    Ok(())
+}
+
+fn run_ik(cmd: IkCmd) -> Result<()> {
+    let data = cmd.input.read()?;
+    println!(
+        "Loaded {} points from {}",
+        data.len(),
+        cmd.input.input.display()
+    );
+
+    let cutoffs: Vec<f64> = match &cmd.cutoffs {
+        Some(spec) => parse_floats(spec)?,
+        None => {
+            let qs = parse_floats(&cmd.quantiles)?;
+            let mut sorted = data.values().to_vec();
+            sorted.sort_by(f64::total_cmp);
+            qs.iter()
+                .map(|&q| {
+                    if !(0.0..=1.0).contains(&q) {
+                        bail!("quantile {q} outside [0, 1]");
+                    }
+                    let idx = ((q * sorted.len() as f64) as usize).min(sorted.len() - 1);
+                    Ok(sorted[idx])
+                })
+                .collect::<Result<_>>()?
+        }
+    };
+    println!(
+        "Cutoffs: {}",
+        cutoffs
+            .iter()
+            .map(|c| format!("{c:.4}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let models: Vec<VariogramModel> = match &cmd.models {
+        Some(spec) => {
+            let paths: Vec<&str> = spec.split(',').map(str::trim).collect();
+            if paths.len() != cutoffs.len() {
+                bail!("{} models for {} cutoffs", paths.len(), cutoffs.len());
+            }
+            paths
+                .iter()
+                .map(|p| io_utils::read_model(std::path::Path::new(p)))
+                .collect::<Result<_>>()?
+        }
+        None => {
+            let kinds = parse_kinds(&cmd.fit)?;
+            let cfg_v = cmd.vario.config(&data);
+            cutoffs
+                .iter()
+                .map(|&c| {
+                    let indicators: Vec<f64> = data
+                        .values()
+                        .iter()
+                        .map(|&v| if v <= c { 1.0 } else { 0.0 })
+                        .collect();
+                    let ind = PointSet::new(data.coords().to_vec(), indicators)?;
+                    let ev = experimental_variogram(&ind, &cfg_v)?;
+                    let fit = fit_best(&ev, &kinds)?;
+                    println!("Indicator model at cutoff {c:.4}: {}", fit.model);
+                    Ok(fit.model)
+                })
+                .collect::<Result<_>>()?
+        }
+    };
+
+    let grid = cmd.grid.build(&data)?;
+    let n_cutoffs = cutoffs.len();
+    let cfg = IkConfig {
+        cutoffs,
+        models,
+        max_neighbors: cmd.neighbors.max_neighbors,
+        search_radius: cmd.neighbors.radius,
+        tail_min: cmd.tail_min,
+        tail_max: cmd.tail_max,
+    };
+    let centers = grid.centers();
+    let ests = indicator_kriging(&data, &centers, &cfg)?;
+    println!(
+        "Indicator kriging on {} cells ({} x {}), {} cutoffs",
+        grid.n_cells(),
+        grid.nx,
+        grid.ny,
+        n_cutoffs
+    );
+    io_utils::write_ik_csv(&cmd.output, &centers, &ests, n_cutoffs)?;
     println!("Output written to {}", cmd.output.display());
     Ok(())
 }

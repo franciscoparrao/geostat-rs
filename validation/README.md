@@ -115,6 +115,29 @@ exactly `nugget / n_discr`. Reproduce: `Rscript validation/v03_gstat.R`,
 then the `geostat krige --block` call in `compare_v03.py`'s docstring,
 then `python3 validation/compare_v03.py`.
 
+## v0.4 results (3-D, heterotopic co-kriging, indicator kriging)
+
+| Check | Predictions | Variances |
+|---|---|---|
+| 3-D ordinary kriging (256 targets, fixed Sph model) | 9.5e-15 | 2.8e-15 |
+| 3-D LOO cross-validation (200 points, RMSE) | matches to 1e-7 | — |
+| Heterotopic co-kriging, shared LMC (meuse.grid, 3103 cells) | 2.6e-14 | 1.3e-15 |
+| Indicator kriging, F(cutoff) where gstat stayed in [0,1] | 7.4e-10 | — |
+
+The 3-D synthetic dataset and targets are shared between R and Rust
+(`synth3d.csv`, `targets3d.csv`); the heterotopic case gives the secondary
+variable (log lead) only half the locations of the primary (log zinc) and
+injects the same LMC into both engines.
+
+**Indicator-kriging note caught by this exercise:** with a single cutoff
+gstat does plain simple kriging of the indicator and applies *no*
+order-relation correction, so 500 of 3103 grid nodes get an estimated
+probability outside `[0, 1]`. geostat-rs clamps `F` to a valid
+probability; at those nodes the clamp is exactly `max(0, min(1, ·))` (0
+mismatches), and everywhere gstat stayed in range the two engines agree to
+7.4e-10. The clamp is the correct behavior — a ccdf value must be a
+probability.
+
 ## Reproduce
 
 ```sh
@@ -159,6 +182,30 @@ $BIN sgs -i validation/out/walker_scores.csv --value-col score \
     -o validation/out/rust_sgs.csv
 
 python3 validation/compare_walker.py
+```
+
+v0.4 (3-D, heterotopic co-kriging, indicator kriging):
+
+```sh
+Rscript validation/v04_gstat.R
+
+$BIN krige -i validation/out/synth3d.csv --x-col x --y-col y --z-col z \
+    --value-col v -m validation/out/model3d.json \
+    --targets validation/out/targets3d.csv -o validation/out/rust_krige3d.csv
+$BIN cv -i validation/out/synth3d.csv --x-col x --y-col y --z-col z \
+    --value-col v -m validation/out/model3d.json   # prints RMSE
+$BIN cokrige -i validation/out/meuse_primary.csv --value-col lzinc \
+    --secondary-col llead --secondary-input validation/out/meuse_secondary.csv \
+    --lmc validation/out/lmc_hetero.json \
+    --bbox 178440,329600,181560,333760 --nx 78 --ny 104 \
+    -o validation/out/rust_cokrige_hetero.csv
+$BIN ik -i validation/out/meuse_ik.csv --value-col lzinc \
+    --cutoffs "$(cat validation/out/ik_cutoff.txt)" \
+    --models validation/out/ik_model.json \
+    --bbox 178440,329600,181560,333760 --nx 78 --ny 104 \
+    -o validation/out/rust_ik.csv
+
+python3 validation/compare_v04.py
 ```
 
 `validation/out/` is regenerated on each run and not tracked by git.

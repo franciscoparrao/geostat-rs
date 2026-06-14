@@ -54,12 +54,25 @@ impl Default for SisConfig {
     }
 }
 
-/// Runs conditional sequential indicator simulation on a grid.
+/// Runs conditional sequential indicator simulation on a 2-D grid.
 pub fn sequential_indicator_simulation(
     data: &PointSet,
     grid: &Grid2D,
     cfg: &SisConfig,
 ) -> Result<SgsResult> {
+    let realizations = sis_at(data, &grid.centers(), cfg)?;
+    Ok(SgsResult {
+        grid: grid.clone(),
+        realizations,
+    })
+}
+
+/// SIS at an arbitrary set of simulation nodes.
+pub fn sis_at<const D: usize>(
+    data: &PointSet<D>,
+    nodes: &[[f64; D]],
+    cfg: &SisConfig,
+) -> Result<Vec<Vec<f64>>> {
     let nc = cfg.cutoffs.len();
     if nc == 0 {
         return Err(GeostatError::InvalidParameter(
@@ -119,22 +132,22 @@ pub fn sequential_indicator_simulation(
         ));
     }
 
-    let realizations: Vec<Vec<f64>> = crate::parallel::par_try_map(cfg.n_realizations, |r| {
+    if nodes.is_empty() {
+        return Err(GeostatError::InvalidParameter(
+            "no simulation nodes given".into(),
+        ));
+    }
+    crate::parallel::par_try_map(cfg.n_realizations, |r| {
         let mut seed_state = cfg.seed ^ (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let seed_r = splitmix64(&mut seed_state);
-        simulate_one(data, grid, cfg, &props, tail_min, tail_max, seed_r)
-    })?;
-
-    Ok(SgsResult {
-        grid: grid.clone(),
-        realizations,
+        simulate_one(data, nodes, cfg, &props, tail_min, tail_max, seed_r)
     })
 }
 
 #[allow(clippy::too_many_arguments)]
-fn simulate_one(
-    data: &PointSet,
-    grid: &Grid2D,
+fn simulate_one<const D: usize>(
+    data: &PointSet<D>,
+    centers: &[[f64; D]],
     cfg: &SisConfig,
     props: &[f64],
     tail_min: f64,
@@ -143,20 +156,22 @@ fn simulate_one(
 ) -> Result<Vec<f64>> {
     let nc = cfg.cutoffs.len();
     let mut rng = Rng::new(seed);
-    let centers = grid.centers();
     let n_cells = centers.len();
 
     let mut path: Vec<usize> = (0..n_cells).collect();
     rng.shuffle(&mut path);
 
     let (dbmin, dbmax) = data.bbox();
-    let min = [dbmin[0].min(grid.x0), dbmin[1].min(grid.y0)];
-    let max = [
-        dbmax[0].max(grid.x0 + grid.dx * grid.nx as f64),
-        dbmax[1].max(grid.y0 + grid.dy * grid.ny as f64),
-    ];
+    let mut min = dbmin;
+    let mut max = dbmax;
+    for c in centers {
+        for d in 0..D {
+            min[d] = min[d].min(c[d]);
+            max[d] = max[d].max(c[d]);
+        }
+    }
     let mut search = BucketGrid::new(min, max, data.len() + n_cells);
-    let mut cond_coords: Vec<[f64; 2]> = data.coords().to_vec();
+    let mut cond_coords: Vec<[f64; D]> = data.coords().to_vec();
     let mut cond_vals: Vec<f64> = data.values().to_vec();
     for &p in data.coords() {
         search.insert(p);
@@ -196,30 +211,36 @@ fn simulate_one(
 }
 
 /// Simple indicator kriging at one cutoff: `F = p + sum(w_i (i_i - p))`.
-fn indicator_sk(
-    coords: &[[f64; 2]],
+pub(crate) fn indicator_sk<const D: usize>(
+    coords: &[[f64; D]],
     vals: &[f64],
     nb: &[usize],
     cutoff: f64,
     p: f64,
     model: &VariogramModel,
-    target: [f64; 2],
+    target: [f64; D],
 ) -> Result<f64> {
     let n = nb.len();
-    let c0 = model.covariance_dh([0.0, 0.0]);
+    let c0 = model.covariance_dh([0.0; D]);
     let stabilizer = c0 * 1e-9;
     let mut a = Array2::<f64>::zeros((n, n));
     let mut b = vec![0.0; n];
+    let sep = |a: [f64; D], b: [f64; D]| {
+        let mut dh = [0.0; D];
+        for d in 0..D {
+            dh[d] = a[d] - b[d];
+        }
+        dh
+    };
     for (ii, &i) in nb.iter().enumerate() {
         let pi = coords[i];
         a[[ii, ii]] = c0 + stabilizer;
         for (jj, &j) in nb.iter().enumerate().skip(ii + 1) {
-            let pj = coords[j];
-            let c = model.covariance_dh([pi[0] - pj[0], pi[1] - pj[1]]);
+            let c = model.covariance_dh(sep(pi, coords[j]));
             a[[ii, jj]] = c;
             a[[jj, ii]] = c;
         }
-        b[ii] = model.covariance_dh([pi[0] - target[0], pi[1] - target[1]]);
+        b[ii] = model.covariance_dh(sep(pi, target));
     }
     let w = solve(a, b)?;
     let mut est = p;
@@ -232,7 +253,7 @@ fn indicator_sk(
 
 /// GSLIB-style order-relation corrections: clamp to [0, 1], then average an
 /// upward (running max) and a downward (running min) pass.
-fn order_corrections(ccdf: &mut [f64]) {
+pub(crate) fn order_corrections(ccdf: &mut [f64]) {
     let nc = ccdf.len();
     for f in ccdf.iter_mut() {
         *f = f.clamp(0.0, 1.0);

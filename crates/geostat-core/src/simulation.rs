@@ -56,7 +56,7 @@ pub struct SgsResult {
     pub realizations: Vec<Vec<f64>>,
 }
 
-/// Runs conditional sequential Gaussian simulation on a grid.
+/// Runs conditional sequential Gaussian simulation on a 2-D grid.
 ///
 /// `model_ns` must be a variogram model fitted to the *normal scores* of the
 /// data (its total sill should therefore be close to 1).
@@ -66,6 +66,32 @@ pub fn sequential_gaussian_simulation(
     grid: &Grid2D,
     cfg: &SgsConfig,
 ) -> Result<SgsResult> {
+    let realizations = sgs_at(data, model_ns, &grid.centers(), cfg)?;
+    Ok(SgsResult {
+        grid: grid.clone(),
+        realizations,
+    })
+}
+
+/// Runs conditional sequential Gaussian simulation on a 3-D grid, returning
+/// the realizations in grid storage order.
+pub fn sequential_gaussian_simulation_3d(
+    data: &PointSet<3>,
+    model_ns: &VariogramModel,
+    grid: &crate::grid::Grid3D,
+    cfg: &SgsConfig,
+) -> Result<Vec<Vec<f64>>> {
+    sgs_at(data, model_ns, &grid.centers(), cfg)
+}
+
+/// SGS at an arbitrary set of simulation nodes (sequential path over the
+/// node list).
+pub fn sgs_at<const D: usize>(
+    data: &PointSet<D>,
+    model_ns: &VariogramModel,
+    nodes: &[[f64; D]],
+    cfg: &SgsConfig,
+) -> Result<Vec<Vec<f64>>> {
     if cfg.n_realizations == 0 {
         return Err(GeostatError::InvalidParameter(
             "n_realizations must be at least 1".into(),
@@ -84,34 +110,33 @@ pub fn sequential_gaussian_simulation(
         )));
     }
 
+    if nodes.is_empty() {
+        return Err(GeostatError::InvalidParameter(
+            "no simulation nodes given".into(),
+        ));
+    }
     let ns = NormalScore::fit(data.values())?;
     let data_scores: Vec<f64> = data.values().iter().map(|&v| ns.transform(v)).collect();
 
-    let realizations: Vec<Vec<f64>> = crate::parallel::par_try_map(cfg.n_realizations, |r| {
+    crate::parallel::par_try_map(cfg.n_realizations, |r| {
         let mut seed_state = cfg.seed ^ (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let seed_r = splitmix64(&mut seed_state);
-        simulate_one(data, &data_scores, &ns, model_ns, grid, cfg, seed_r)
-    })?;
-
-    Ok(SgsResult {
-        grid: grid.clone(),
-        realizations,
+        simulate_one(data, &data_scores, &ns, model_ns, nodes, cfg, seed_r)
     })
 }
 
-fn simulate_one(
-    data: &PointSet,
+fn simulate_one<const D: usize>(
+    data: &PointSet<D>,
     data_scores: &[f64],
     ns: &NormalScore,
     model: &VariogramModel,
-    grid: &Grid2D,
+    centers: &[[f64; D]],
     cfg: &SgsConfig,
     seed: u64,
 ) -> Result<Vec<f64>> {
     let mut rng = Rng::new(seed);
-    let centers = grid.centers();
     let n_cells = centers.len();
-    let c0 = model.covariance_dh([0.0, 0.0]);
+    let c0 = model.covariance_dh([0.0; D]);
     // Tiny diagonal stabilizer: previously simulated nodes can sit arbitrarily
     // close to data points, which makes exact systems near-singular.
     let stabilizer = c0 * 1e-9;
@@ -121,13 +146,16 @@ fn simulate_one(
 
     // Conditioning store: bucket grid covering data and simulation extents.
     let (dmin, dmax) = data.bbox();
-    let min = [dmin[0].min(grid.x0), dmin[1].min(grid.y0)];
-    let max = [
-        dmax[0].max(grid.x0 + grid.dx * grid.nx as f64),
-        dmax[1].max(grid.y0 + grid.dy * grid.ny as f64),
-    ];
+    let mut min = dmin;
+    let mut max = dmax;
+    for c in centers {
+        for d in 0..D {
+            min[d] = min[d].min(c[d]);
+            max[d] = max[d].max(c[d]);
+        }
+    }
     let mut search = BucketGrid::new(min, max, data.len() + n_cells);
-    let mut cond_coords: Vec<[f64; 2]> = data.coords().to_vec();
+    let mut cond_coords: Vec<[f64; D]> = data.coords().to_vec();
     let mut cond_vals: Vec<f64> = data_scores.to_vec();
     for &p in data.coords() {
         search.insert(p);
@@ -155,11 +183,11 @@ fn simulate_one(
 }
 
 /// Simple kriging with mean 0 in Gaussian space; returns (mean, variance).
-fn simple_kriging_ns(
-    coords: &[[f64; 2]],
+fn simple_kriging_ns<const D: usize>(
+    coords: &[[f64; D]],
     vals: &[f64],
     model: &VariogramModel,
-    target: [f64; 2],
+    target: [f64; D],
     nb: &[usize],
     c0: f64,
     stabilizer: f64,
@@ -167,16 +195,22 @@ fn simple_kriging_ns(
     let n = nb.len();
     let mut a = Array2::<f64>::zeros((n, n));
     let mut b = vec![0.0; n];
+    let sep = |a: [f64; D], b: [f64; D]| {
+        let mut dh = [0.0; D];
+        for d in 0..D {
+            dh[d] = a[d] - b[d];
+        }
+        dh
+    };
     for (ii, &i) in nb.iter().enumerate() {
         let pi = coords[i];
         a[[ii, ii]] = c0 + stabilizer;
         for (jj, &j) in nb.iter().enumerate().skip(ii + 1) {
-            let pj = coords[j];
-            let c = model.covariance_dh([pi[0] - pj[0], pi[1] - pj[1]]);
+            let c = model.covariance_dh(sep(pi, coords[j]));
             a[[ii, jj]] = c;
             a[[jj, ii]] = c;
         }
-        b[ii] = model.covariance_dh([pi[0] - target[0], pi[1] - target[1]]);
+        b[ii] = model.covariance_dh(sep(pi, target));
     }
     let b0 = b.clone();
     let w = solve(a, b)?;

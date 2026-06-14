@@ -47,6 +47,7 @@ pub mod cokriging;
 pub mod data;
 pub mod error;
 pub mod grid;
+pub mod ik;
 pub mod kriging;
 pub mod linalg;
 mod parallel;
@@ -61,11 +62,14 @@ pub mod variogram;
 pub use cokriging::{CoKriging, CoKrigingConfig, Lmc, LmcStructure, fit_lmc};
 pub use data::PointSet;
 pub use error::{GeostatError, Result};
-pub use grid::Grid2D;
+pub use grid::{Grid2D, Grid3D};
+pub use ik::{CcdfEstimate, IkConfig, indicator_kriging};
 pub use kriging::{Kriging, KrigingConfig, KrigingEstimate, KrigingMethod, block_offsets};
 pub use rng::Rng;
-pub use simulation::{SgsConfig, SgsResult, sequential_gaussian_simulation};
-pub use sis::{SisConfig, sequential_indicator_simulation};
+pub use simulation::{
+    SgsConfig, SgsResult, sequential_gaussian_simulation, sequential_gaussian_simulation_3d, sgs_at,
+};
+pub use sis::{SisConfig, sequential_indicator_simulation, sis_at};
 pub use transform::NormalScore;
 pub use validation::{CvResult, leave_one_out, leave_one_out_with_drift};
 pub use variogram::{

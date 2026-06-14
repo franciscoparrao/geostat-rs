@@ -35,16 +35,16 @@ fn into_sorted(heap: BinaryHeap<Entry>) -> Vec<usize> {
     v.into_iter().map(|(_, i)| i as usize).collect()
 }
 
-/// Static 2-D kd-tree over a fixed set of points.
+/// Static D-dimensional kd-tree over a fixed set of points.
 #[derive(Debug)]
-pub(crate) struct KdTree {
+pub(crate) struct KdTree<const D: usize = 2> {
     idx: Vec<u32>,
-    coords: Vec<[f64; 2]>,
+    coords: Vec<[f64; D]>,
 }
 
-impl KdTree {
+impl<const D: usize> KdTree<D> {
     /// Builds the tree in O(n log n) via median splits.
-    pub fn build(coords: &[[f64; 2]]) -> Self {
+    pub fn build(coords: &[[f64; D]]) -> Self {
         let mut idx: Vec<u32> = (0..coords.len() as u32).collect();
         build_rec(&mut idx, coords, 0);
         Self {
@@ -54,7 +54,7 @@ impl KdTree {
     }
 
     /// Up-to-`k` nearest points to `target`, optionally within `radius`.
-    pub fn k_nearest(&self, target: [f64; 2], k: usize, radius: Option<f64>) -> Vec<usize> {
+    pub fn k_nearest(&self, target: [f64; D], k: usize, radius: Option<f64>) -> Vec<usize> {
         if k == 0 || self.idx.is_empty() {
             return Vec::new();
         }
@@ -68,7 +68,7 @@ impl KdTree {
         &self,
         node: &[u32],
         axis: usize,
-        target: [f64; 2],
+        target: [f64; D],
         k: usize,
         r2: f64,
         heap: &mut BinaryHeap<Entry>,
@@ -78,9 +78,11 @@ impl KdTree {
         }
         let mid = node.len() / 2;
         let p = self.coords[node[mid] as usize];
-        let dx = p[0] - target[0];
-        let dy = p[1] - target[1];
-        let d2 = dx * dx + dy * dy;
+        let mut d2 = 0.0;
+        for d in 0..D {
+            let dd = p[d] - target[d];
+            d2 += dd * dd;
+        }
         if d2 <= r2 {
             push_candidate(heap, k, d2, node[mid]);
         }
@@ -90,14 +92,14 @@ impl KdTree {
         } else {
             (&node[mid + 1..], &node[..mid])
         };
-        self.search(near, 1 - axis, target, k, r2, heap);
+        self.search(near, (axis + 1) % D, target, k, r2, heap);
         if diff * diff <= heap_worst(heap, k).min(r2) {
-            self.search(far, 1 - axis, target, k, r2, heap);
+            self.search(far, (axis + 1) % D, target, k, r2, heap);
         }
     }
 }
 
-fn build_rec(idx: &mut [u32], coords: &[[f64; 2]], axis: usize) {
+fn build_rec<const D: usize>(idx: &mut [u32], coords: &[[f64; D]], axis: usize) {
     if idx.len() <= 1 {
         return;
     }
@@ -106,79 +108,99 @@ fn build_rec(idx: &mut [u32], coords: &[[f64; 2]], axis: usize) {
         coords[a as usize][axis].total_cmp(&coords[b as usize][axis])
     });
     let (l, r) = idx.split_at_mut(mid);
-    build_rec(l, coords, 1 - axis);
-    build_rec(&mut r[1..], coords, 1 - axis);
+    build_rec(l, coords, (axis + 1) % D);
+    build_rec(&mut r[1..], coords, (axis + 1) % D);
 }
 
-/// Incremental bucket grid for sequential simulation: O(1) insertion,
-/// ring-expanding nearest-neighbor queries. Indices are insertion order.
+/// Incremental D-dimensional bucket grid for sequential simulation: O(1)
+/// insertion, shell-expanding nearest-neighbor queries. Indices are
+/// insertion order.
 #[derive(Debug)]
-pub(crate) struct BucketGrid {
-    x0: f64,
-    y0: f64,
+pub(crate) struct BucketGrid<const D: usize = 2> {
+    origin: [f64; D],
     cell: f64,
-    nx: usize,
-    ny: usize,
+    n: [usize; D],
+    strides: [usize; D],
     buckets: Vec<Vec<u32>>,
-    pts: Vec<[f64; 2]>,
+    pts: Vec<[f64; D]>,
 }
 
-impl BucketGrid {
+impl<const D: usize> BucketGrid<D> {
     /// Grid covering `[min, max]`, sized for ~1 point per bucket at
     /// `expected` total insertions.
-    pub fn new(min: [f64; 2], max: [f64; 2], expected: usize) -> Self {
-        let w = (max[0] - min[0]).max(f64::MIN_POSITIVE);
-        let h = (max[1] - min[1]).max(f64::MIN_POSITIVE);
-        let cell = (w * h / expected.max(1) as f64).sqrt().max(1e-12);
-        let nx = ((w / cell).ceil() as usize).max(1);
-        let ny = ((h / cell).ceil() as usize).max(1);
+    pub fn new(min: [f64; D], max: [f64; D], expected: usize) -> Self {
+        let mut volume = 1.0_f64;
+        for d in 0..D {
+            volume *= (max[d] - min[d]).max(f64::MIN_POSITIVE);
+        }
+        let cell = volume.powf(1.0 / D as f64).max(1e-12)
+            * (1.0 / (expected.max(1) as f64).powf(1.0 / D as f64));
+        let mut n = [1usize; D];
+        let mut strides = [1usize; D];
+        let mut total = 1usize;
+        for d in 0..D {
+            n[d] = (((max[d] - min[d]) / cell).ceil() as usize).max(1);
+        }
+        for d in 0..D {
+            strides[d] = total;
+            total *= n[d];
+        }
         Self {
-            x0: min[0],
-            y0: min[1],
+            origin: min,
             cell,
-            nx,
-            ny,
-            buckets: vec![Vec::new(); nx * ny],
+            n,
+            strides,
+            buckets: vec![Vec::new(); total],
             pts: Vec::with_capacity(expected),
         }
     }
 
-    fn cell_of(&self, p: [f64; 2]) -> (usize, usize) {
-        let cx = (((p[0] - self.x0) / self.cell) as isize).clamp(0, self.nx as isize - 1);
-        let cy = (((p[1] - self.y0) / self.cell) as isize).clamp(0, self.ny as isize - 1);
-        (cx as usize, cy as usize)
+    fn cell_of(&self, p: [f64; D]) -> [usize; D] {
+        let mut c = [0usize; D];
+        for d in 0..D {
+            c[d] = (((p[d] - self.origin[d]) / self.cell) as isize).clamp(0, self.n[d] as isize - 1)
+                as usize;
+        }
+        c
+    }
+
+    fn bucket_index(&self, c: [usize; D]) -> usize {
+        c.iter().zip(&self.strides).map(|(&ci, &s)| ci * s).sum()
     }
 
     /// Inserts a point; its index is the insertion order.
-    pub fn insert(&mut self, p: [f64; 2]) {
-        let (cx, cy) = self.cell_of(p);
-        self.buckets[cy * self.nx + cx].push(self.pts.len() as u32);
+    pub fn insert(&mut self, p: [f64; D]) {
+        let c = self.cell_of(p);
+        let idx = self.bucket_index(c);
+        self.buckets[idx].push(self.pts.len() as u32);
         self.pts.push(p);
     }
 
     /// Up-to-`k` nearest inserted points, optionally within `radius`.
-    pub fn k_nearest(&self, target: [f64; 2], k: usize, radius: Option<f64>) -> Vec<usize> {
+    pub fn k_nearest(&self, target: [f64; D], k: usize, radius: Option<f64>) -> Vec<usize> {
         if k == 0 || self.pts.is_empty() {
             return Vec::new();
         }
         let r2 = radius.map_or(f64::INFINITY, |r| r * r);
-        let (tcx, tcy) = self.cell_of(target);
-        let max_ring = self.nx.max(self.ny);
+        let tc = self.cell_of(target);
+        let max_ring = self.n.iter().copied().max().unwrap_or(1);
         let mut heap = BinaryHeap::with_capacity(k + 1);
 
         for ring in 0..=max_ring {
             // Smallest possible distance from the target to any cell in
-            // this ring (conservative bound).
+            // this shell (conservative bound).
             let ring_min = (ring as f64 - 1.0).max(0.0) * self.cell;
             if ring_min * ring_min > heap_worst(&heap, k).min(r2) {
                 break;
             }
-            self.for_ring_cells(tcx, tcy, ring, |bucket| {
+            self.for_shell_cells(tc, ring, |bucket| {
                 for &i in bucket {
                     let p = self.pts[i as usize];
-                    let dx = p[0] - target[0];
-                    let dy = p[1] - target[1];
-                    let d2 = dx * dx + dy * dy;
+                    let mut d2 = 0.0;
+                    for d in 0..D {
+                        let dd = p[d] - target[d];
+                        d2 += dd * dd;
+                    }
                     if d2 <= r2 {
                         push_candidate(&mut heap, k, d2, i);
                     }
@@ -188,34 +210,53 @@ impl BucketGrid {
         into_sorted(heap)
     }
 
-    /// Visits the buckets at Chebyshev distance `ring` from `(tcx, tcy)`.
-    fn for_ring_cells<F: FnMut(&[u32])>(&self, tcx: usize, tcy: usize, ring: usize, mut f: F) {
-        let (tcx, tcy, ring) = (tcx as isize, tcy as isize, ring as isize);
-        let visit = |cx: isize, cy: isize, f: &mut F| {
-            if cx >= 0 && cy >= 0 && (cx as usize) < self.nx && (cy as usize) < self.ny {
-                f(&self.buckets[cy as usize * self.nx + cx as usize]);
+    /// Visits the buckets at Chebyshev distance `ring` from `tc` by walking
+    /// the bounding box of the shell and skipping interior cells.
+    fn for_shell_cells<F: FnMut(&[u32])>(&self, tc: [usize; D], ring: usize, mut f: F) {
+        let r = ring as isize;
+        let mut lo = [0isize; D];
+        let mut hi = [0isize; D];
+        for d in 0..D {
+            lo[d] = tc[d] as isize - r;
+            hi[d] = tc[d] as isize + r;
+        }
+        // Odometer over the box [lo, hi]^D.
+        let mut cur = lo;
+        'outer: loop {
+            // Chebyshev distance of this cell from the target cell.
+            let mut cheb = 0isize;
+            let mut in_bounds = true;
+            for d in 0..D {
+                cheb = cheb.max((cur[d] - tc[d] as isize).abs());
+                if cur[d] < 0 || cur[d] >= self.n[d] as isize {
+                    in_bounds = false;
+                }
             }
-        };
-        if ring == 0 {
-            visit(tcx, tcy, &mut f);
-            return;
-        }
-        for cx in (tcx - ring)..=(tcx + ring) {
-            visit(cx, tcy - ring, &mut f);
-            visit(cx, tcy + ring, &mut f);
-        }
-        for cy in (tcy - ring + 1)..(tcy + ring) {
-            visit(tcx - ring, cy, &mut f);
-            visit(tcx + ring, cy, &mut f);
+            if cheb == r && in_bounds {
+                let mut c = [0usize; D];
+                for d in 0..D {
+                    c[d] = cur[d] as usize;
+                }
+                f(&self.buckets[self.bucket_index(c)]);
+            }
+            // Advance the odometer.
+            for d in 0..D {
+                cur[d] += 1;
+                if cur[d] <= hi[d] {
+                    continue 'outer;
+                }
+                cur[d] = lo[d];
+            }
+            break;
         }
     }
 }
 
 /// Brute-force reference implementation for the search tests.
 #[cfg(test)]
-pub(crate) fn k_nearest_brute(
-    coords: &[[f64; 2]],
-    target: [f64; 2],
+pub(crate) fn k_nearest_brute<const D: usize>(
+    coords: &[[f64; D]],
+    target: [f64; D],
     k: usize,
     radius: Option<f64>,
 ) -> Vec<usize> {
@@ -227,9 +268,11 @@ pub(crate) fn k_nearest_brute(
         .iter()
         .enumerate()
         .filter_map(|(i, c)| {
-            let dx = c[0] - target[0];
-            let dy = c[1] - target[1];
-            let d2 = dx * dx + dy * dy;
+            let mut d2 = 0.0;
+            for d in 0..D {
+                let dd = c[d] - target[d];
+                d2 += dd * dd;
+            }
             match r2 {
                 Some(r2) if d2 > r2 => None,
                 _ => Some((d2, i)),

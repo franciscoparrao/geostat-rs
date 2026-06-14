@@ -143,8 +143,8 @@ impl Lmc {
     }
 
     /// Cross-semivariance for a separation vector.
-    pub fn gamma_dh(&self, u: usize, v: usize, dh: [f64; 2]) -> f64 {
-        if dh[0] == 0.0 && dh[1] == 0.0 {
+    pub fn gamma_dh<const D: usize>(&self, u: usize, v: usize, dh: [f64; D]) -> f64 {
+        if dh.iter().all(|&x| x == 0.0) {
             return 0.0;
         }
         let mut g = self.nugget[u][v];
@@ -167,7 +167,7 @@ impl Lmc {
 
     /// Cross-covariance for a separation vector:
     /// `C_uv(dh) = total_sill_uv - gamma_uv(dh)`.
-    pub fn covariance_dh(&self, u: usize, v: usize, dh: [f64; 2]) -> f64 {
+    pub fn covariance_dh<const D: usize>(&self, u: usize, v: usize, dh: [f64; D]) -> f64 {
         self.total_sill(u, v) - self.gamma_dh(u, v, dh)
     }
 
@@ -198,18 +198,23 @@ pub struct CoKrigingConfig {
 }
 
 /// Ordinary co-kriging predictor. `datasets[0]` is the primary variable
-/// (the one being predicted); the rest are secondaries.
+/// (the one being predicted); the rest are secondaries. Datasets need not
+/// be collocated (heterotopic co-kriging is supported).
 #[derive(Debug)]
-pub struct CoKriging<'a> {
-    datasets: Vec<&'a PointSet>,
+pub struct CoKriging<'a, const D: usize = 2> {
+    datasets: Vec<&'a PointSet<D>>,
     lmc: &'a Lmc,
     config: CoKrigingConfig,
-    trees: Vec<Option<KdTree>>,
+    trees: Vec<Option<KdTree<D>>>,
 }
 
-impl<'a> CoKriging<'a> {
+impl<'a, const D: usize> CoKriging<'a, D> {
     /// Builds the predictor, validating dimensions.
-    pub fn new(datasets: Vec<&'a PointSet>, lmc: &'a Lmc, config: CoKrigingConfig) -> Result<Self> {
+    pub fn new(
+        datasets: Vec<&'a PointSet<D>>,
+        lmc: &'a Lmc,
+        config: CoKrigingConfig,
+    ) -> Result<Self> {
         if datasets.len() < 2 {
             return Err(GeostatError::InvalidParameter(
                 "co-kriging needs a primary and at least one secondary variable".into(),
@@ -247,7 +252,7 @@ impl<'a> CoKriging<'a> {
         })
     }
 
-    fn neighbors(&self, v: usize, target: [f64; 2]) -> Vec<usize> {
+    fn neighbors(&self, v: usize, target: [f64; D]) -> Vec<usize> {
         match &self.trees[v] {
             None => (0..self.datasets[v].len()).collect(),
             Some(tree) => tree.k_nearest(
@@ -259,7 +264,7 @@ impl<'a> CoKriging<'a> {
     }
 
     /// Co-kriging estimate of the primary variable at a target location.
-    pub fn predict(&self, target: [f64; 2]) -> Result<KrigingEstimate> {
+    pub fn predict(&self, target: [f64; D]) -> Result<KrigingEstimate> {
         let n_vars = self.datasets.len();
         let nbs: Vec<Vec<usize>> = (0..n_vars).map(|v| self.neighbors(v, target)).collect();
         if nbs[0].is_empty() {
@@ -295,9 +300,11 @@ impl<'a> CoKriging<'a> {
                 // Unbiasedness: one Lagrange multiplier per variable.
                 a[[row, n_total + v]] = 1.0;
                 a[[n_total + v, row]] = 1.0;
-                b[row] = self
-                    .lmc
-                    .covariance_dh(v, 0, [pi[0] - target[0], pi[1] - target[1]]);
+                let mut dht = [0.0; D];
+                for dd in 0..D {
+                    dht[dd] = pi[dd] - target[dd];
+                }
+                b[row] = self.lmc.covariance_dh(v, 0, dht);
             }
         }
         // Primary weights sum to 1, secondary weights to 0.
@@ -318,7 +325,7 @@ impl<'a> CoKriging<'a> {
     }
 
     /// Estimates at many targets, in parallel (NaN on failed systems).
-    pub fn predict_many(&self, targets: &[[f64; 2]]) -> Vec<KrigingEstimate> {
+    pub fn predict_many(&self, targets: &[[f64; D]]) -> Vec<KrigingEstimate> {
         crate::parallel::par_map(targets.len(), |i| {
             self.predict(targets[i]).unwrap_or(KrigingEstimate {
                 value: f64::NAN,
@@ -326,7 +333,9 @@ impl<'a> CoKriging<'a> {
             })
         })
     }
+}
 
+impl CoKriging<'_, 2> {
     /// Co-kriging over all grid cell centers.
     pub fn predict_grid(&self, grid: &Grid2D) -> (Vec<f64>, Vec<f64>) {
         let ests = self.predict_many(&grid.centers());

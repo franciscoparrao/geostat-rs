@@ -22,20 +22,29 @@ fn point_set(x: Vec<f64>, y: Vec<f64>, values: Vec<f64>) -> PyResult<PointSet> {
     PointSet::from_xyz(&x, &y, &values).map_err(err)
 }
 
-fn vario_config(
-    data: &PointSet,
+fn point_set_3d(x: Vec<f64>, y: Vec<f64>, z: Vec<f64>, values: Vec<f64>) -> PyResult<PointSet<3>> {
+    PointSet::<3>::from_xyzv(&x, &y, &z, &values).map_err(err)
+}
+
+fn vario_config<const D: usize>(
+    data: &PointSet<D>,
     n_lags: usize,
     max_dist: Option<f64>,
     azimuth: Option<f64>,
+    dip: f64,
     tolerance: f64,
 ) -> VariogramConfig {
     let (min, max) = data.bbox();
-    let diag = ((max[0] - min[0]).powi(2) + (max[1] - min[1]).powi(2)).sqrt();
+    let diag = (0..D)
+        .map(|d| (max[d] - min[d]).powi(2))
+        .sum::<f64>()
+        .sqrt();
     VariogramConfig {
         n_lags,
         max_dist: max_dist.unwrap_or(diag / 3.0),
         direction: azimuth.map(|az| DirectionConfig {
             azimuth_deg: az,
+            dip_deg: dip,
             tolerance_deg: tolerance,
         }),
     }
@@ -120,7 +129,7 @@ fn experimental_variogram(
     tolerance: f64,
 ) -> PyResult<(Vec<f64>, Vec<f64>, Vec<usize>)> {
     let data = point_set(x, y, values)?;
-    let cfg = vario_config(&data, n_lags, max_dist, azimuth, tolerance);
+    let cfg = vario_config(&data, n_lags, max_dist, azimuth, 0.0, tolerance);
     let ev = core::experimental_variogram(&data, &cfg).map_err(err)?;
     let mut h = Vec::new();
     let mut gamma = Vec::new();
@@ -147,7 +156,7 @@ fn fit_variogram(
     kinds: &str,
 ) -> PyResult<VariogramModel> {
     let data = point_set(x, y, values)?;
-    let cfg = vario_config(&data, n_lags, max_dist, None, 22.5);
+    let cfg = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
     let ev = core::experimental_variogram(&data, &cfg).map_err(err)?;
     let fit = core::fit_best(&ev, &parse_kinds(kinds)?).map_err(err)?;
     Ok(VariogramModel { inner: fit.model })
@@ -323,7 +332,7 @@ fn sis(
 ) -> PyResult<Vec<Vec<f64>>> {
     let data = point_set(x, y, values)?;
     let grid = Grid2D::from_bbox([bbox.0, bbox.1], [bbox.2, bbox.3], nx, ny).map_err(err)?;
-    let cfg_v = vario_config(&data, n_lags, max_dist, None, 22.5);
+    let cfg_v = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
     let kinds = [core::ModelKind::Spherical, core::ModelKind::Exponential];
     let mut models = Vec::with_capacity(cutoffs.len());
     for &c in &cutoffs {
@@ -350,6 +359,176 @@ fn sis(
     Ok(res.realizations)
 }
 
+/// 3-D experimental semivariogram. Returns `(h, gamma, n_pairs)` lists.
+/// `dip` (degrees, positive downward) and `azimuth` enable a directional
+/// cone; omit both for an omnidirectional variogram.
+#[pyfunction]
+#[pyo3(signature = (x, y, z, values, n_lags = 15, max_dist = None,
+    azimuth = None, dip = 0.0, tolerance = 22.5))]
+#[allow(clippy::too_many_arguments)]
+fn experimental_variogram_3d(
+    x: Vec<f64>,
+    y: Vec<f64>,
+    z: Vec<f64>,
+    values: Vec<f64>,
+    n_lags: usize,
+    max_dist: Option<f64>,
+    azimuth: Option<f64>,
+    dip: f64,
+    tolerance: f64,
+) -> PyResult<(Vec<f64>, Vec<f64>, Vec<usize>)> {
+    let data = point_set_3d(x, y, z, values)?;
+    let cfg = vario_config(&data, n_lags, max_dist, azimuth, dip, tolerance);
+    let ev = core::experimental_variogram(&data, &cfg).map_err(err)?;
+    let mut h = Vec::new();
+    let mut gamma = Vec::new();
+    let mut np = Vec::new();
+    for b in &ev.bins {
+        h.push(b.h);
+        gamma.push(b.gamma);
+        np.push(b.n_pairs);
+    }
+    Ok((h, gamma, np))
+}
+
+/// Fits a variogram model to 3-D data by weighted least squares.
+#[pyfunction]
+#[pyo3(signature = (x, y, z, values, n_lags = 15, max_dist = None, kinds = "best"))]
+fn fit_variogram_3d(
+    x: Vec<f64>,
+    y: Vec<f64>,
+    z: Vec<f64>,
+    values: Vec<f64>,
+    n_lags: usize,
+    max_dist: Option<f64>,
+    kinds: &str,
+) -> PyResult<VariogramModel> {
+    let data = point_set_3d(x, y, z, values)?;
+    let cfg = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
+    let ev = core::experimental_variogram(&data, &cfg).map_err(err)?;
+    let fit = core::fit_best(&ev, &parse_kinds(kinds)?).map_err(err)?;
+    Ok(VariogramModel { inner: fit.model })
+}
+
+/// 3-D kriging at arbitrary target locations. Returns
+/// `(predictions, variances)`; failed targets yield NaN. `method` is
+/// "ordinary", "simple" or "universal".
+#[pyfunction]
+#[pyo3(signature = (x, y, z, values, model, target_x, target_y, target_z,
+    method = "ordinary", mean = None, degree = 1, max_neighbors = None, radius = None))]
+#[allow(clippy::too_many_arguments)]
+fn krige_3d(
+    x: Vec<f64>,
+    y: Vec<f64>,
+    z: Vec<f64>,
+    values: Vec<f64>,
+    model: &VariogramModel,
+    target_x: Vec<f64>,
+    target_y: Vec<f64>,
+    target_z: Vec<f64>,
+    method: &str,
+    mean: Option<f64>,
+    degree: u8,
+    max_neighbors: Option<usize>,
+    radius: Option<f64>,
+) -> PyResult<(Vec<f64>, Vec<f64>)> {
+    if target_x.len() != target_y.len() || target_x.len() != target_z.len() {
+        return Err(PyValueError::new_err(
+            "target_x, target_y and target_z differ in length",
+        ));
+    }
+    let data = point_set_3d(x, y, z, values)?;
+    let kmethod = match method {
+        "ordinary" => KrigingMethod::Ordinary,
+        "simple" => KrigingMethod::Simple {
+            mean: mean.unwrap_or_else(|| data.mean()),
+        },
+        "universal" => KrigingMethod::Universal { degree },
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown method '{other}' (expected ordinary, simple or universal)"
+            )));
+        }
+    };
+    let config = KrigingConfig {
+        method: kmethod,
+        max_neighbors,
+        search_radius: radius,
+    };
+    let kriging: Kriging<'_, 3> = Kriging::new(&data, &model.inner, config).map_err(err)?;
+    let targets: Vec<[f64; 3]> = target_x
+        .into_iter()
+        .zip(target_y)
+        .zip(target_z)
+        .map(|((tx, ty), tz)| [tx, ty, tz])
+        .collect();
+    let ests = kriging.predict_many(&targets);
+    Ok(ests.into_iter().map(|e| (e.value, e.variance)).unzip())
+}
+
+/// Indicator kriging at arbitrary target locations. Returns a dict with
+/// `ccdf` (list of per-target ccdf lists), `e_type` and `cond_var`.
+/// Indicator variogram models are fitted automatically per cutoff.
+#[pyfunction]
+#[pyo3(signature = (x, y, values, cutoffs, target_x, target_y,
+    max_neighbors = None, radius = None, n_lags = 15, max_dist = None))]
+#[allow(clippy::too_many_arguments)]
+fn indicator_kriging(
+    py: Python<'_>,
+    x: Vec<f64>,
+    y: Vec<f64>,
+    values: Vec<f64>,
+    cutoffs: Vec<f64>,
+    target_x: Vec<f64>,
+    target_y: Vec<f64>,
+    max_neighbors: Option<usize>,
+    radius: Option<f64>,
+    n_lags: usize,
+    max_dist: Option<f64>,
+) -> PyResult<Py<PyDict>> {
+    if target_x.len() != target_y.len() {
+        return Err(PyValueError::new_err(
+            "target_x and target_y differ in length",
+        ));
+    }
+    let data = point_set(x, y, values)?;
+    let cfg_v = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
+    let kinds = [core::ModelKind::Spherical, core::ModelKind::Exponential];
+    let mut models = Vec::with_capacity(cutoffs.len());
+    for &c in &cutoffs {
+        let indicators: Vec<f64> = data
+            .values()
+            .iter()
+            .map(|&v| if v <= c { 1.0 } else { 0.0 })
+            .collect();
+        let ind = PointSet::new(data.coords().to_vec(), indicators).map_err(err)?;
+        let ev = core::experimental_variogram(&ind, &cfg_v).map_err(err)?;
+        models.push(core::fit_best(&ev, &kinds).map_err(err)?.model);
+    }
+    let cfg = core::IkConfig {
+        cutoffs,
+        models,
+        max_neighbors,
+        search_radius: radius,
+        tail_min: None,
+        tail_max: None,
+    };
+    let targets: Vec<[f64; 2]> = target_x
+        .into_iter()
+        .zip(target_y)
+        .map(|(tx, ty)| [tx, ty])
+        .collect();
+    let ests = core::indicator_kriging(&data, &targets, &cfg).map_err(err)?;
+    let out = PyDict::new(py);
+    let ccdf: Vec<Vec<f64>> = ests.iter().map(|e| e.ccdf.clone()).collect();
+    let e_type: Vec<f64> = ests.iter().map(|e| e.e_type).collect();
+    let cond_var: Vec<f64> = ests.iter().map(|e| e.cond_var).collect();
+    out.set_item("ccdf", ccdf)?;
+    out.set_item("e_type", e_type)?;
+    out.set_item("cond_var", cond_var)?;
+    Ok(out.into())
+}
+
 #[pymodule]
 fn geostat_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<VariogramModel>()?;
@@ -360,6 +539,10 @@ fn geostat_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(loo_cv, m)?)?;
     m.add_function(wrap_pyfunction!(sgs, m)?)?;
     m.add_function(wrap_pyfunction!(sis, m)?)?;
+    m.add_function(wrap_pyfunction!(experimental_variogram_3d, m)?)?;
+    m.add_function(wrap_pyfunction!(fit_variogram_3d, m)?)?;
+    m.add_function(wrap_pyfunction!(krige_3d, m)?)?;
+    m.add_function(wrap_pyfunction!(indicator_kriging, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

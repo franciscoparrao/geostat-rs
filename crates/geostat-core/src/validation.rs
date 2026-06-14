@@ -64,8 +64,8 @@ impl CvResult {
 
 /// Leave-one-out cross-validation: each point is predicted from all others
 /// using the given model and kriging configuration.
-pub fn leave_one_out(
-    data: &PointSet,
+pub fn leave_one_out<const D: usize>(
+    data: &PointSet<D>,
     model: &VariogramModel,
     config: &KrigingConfig,
 ) -> Result<CvResult> {
@@ -91,8 +91,8 @@ pub fn leave_one_out(
 
 /// Leave-one-out cross-validation for external-drift kriging. `drift_data[i]`
 /// holds the covariates at data point `i`.
-pub fn leave_one_out_with_drift(
-    data: &PointSet,
+pub fn leave_one_out_with_drift<const D: usize>(
+    data: &PointSet<D>,
     drift_data: &[Vec<f64>],
     model: &VariogramModel,
     config: &KrigingConfig,

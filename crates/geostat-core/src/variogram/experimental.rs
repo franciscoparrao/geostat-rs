@@ -1,7 +1,5 @@
 //! Experimental (empirical) variogram estimation.
 
-use std::f64::consts::{FRAC_PI_2, PI};
-
 use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
 use crate::parallel::{n_chunks, par_map};
@@ -9,15 +7,29 @@ use crate::parallel::{n_chunks, par_map};
 /// Directional tolerance for anisotropic variograms.
 ///
 /// Azimuth follows the gstat/GSLIB convention: degrees clockwise from north
-/// (0 = N, 90 = E). Pairs are accepted when the angle between the pair vector
-/// and the azimuth is within `tolerance_deg` (modulo 180°). A tolerance of
-/// 90° is equivalent to an omnidirectional variogram.
+/// (0 = N, 90 = E). In 3-D, `dip_deg` tilts the direction vector (positive
+/// downward); pairs are accepted within a cone of half-aperture
+/// `tolerance_deg` around the (sign-agnostic) direction. A tolerance of 90°
+/// is equivalent to an omnidirectional variogram.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DirectionConfig {
     /// Azimuth in degrees clockwise from north.
     pub azimuth_deg: f64,
+    /// Dip in degrees, positive downward (3-D only; 0 in 2-D).
+    pub dip_deg: f64,
     /// Half-aperture tolerance in degrees.
     pub tolerance_deg: f64,
+}
+
+impl DirectionConfig {
+    /// Horizontal direction (zero dip).
+    pub fn horizontal(azimuth_deg: f64, tolerance_deg: f64) -> Self {
+        Self {
+            azimuth_deg,
+            dip_deg: 0.0,
+            tolerance_deg,
+        }
+    }
 }
 
 /// Configuration for the experimental variogram.
@@ -79,8 +91,8 @@ impl Acc {
 
 /// Computes the experimental semivariogram
 /// `gamma(h) = mean(0.5 * (z_i - z_j)^2)` over distance-binned point pairs.
-pub fn experimental_variogram(
-    data: &PointSet,
+pub fn experimental_variogram<const D: usize>(
+    data: &PointSet<D>,
     cfg: &VariogramConfig,
 ) -> Result<ExperimentalVariogram> {
     pair_bins(data.coords(), data.values(), data.values(), cfg)
@@ -90,8 +102,8 @@ pub fn experimental_variogram(
 /// `0.5 * (a_i - a_j) * (b_i - b_j)` by pair distance. With `a == b` this is
 /// the direct semivariogram; with two collocated variables, the cross
 /// semivariogram.
-pub(crate) fn pair_bins(
-    coords: &[[f64; 2]],
+pub(crate) fn pair_bins<const D: usize>(
+    coords: &[[f64; D]],
     values_a: &[f64],
     values_b: &[f64],
     cfg: &VariogramConfig,
@@ -124,10 +136,18 @@ pub(crate) fn pair_bins(
     let n = coords.len();
     let n_lags = cfg.n_lags;
     let width = cfg.max_dist / n_lags as f64;
-    let dir = cfg
-        .direction
-        .as_ref()
-        .map(|d| (d.azimuth_deg.to_radians(), d.tolerance_deg.to_radians()));
+    // Sign-agnostic cone test: |dot(pair, u)| >= |pair| * cos(tol).
+    let dir = cfg.direction.as_ref().map(|d| {
+        let az = d.azimuth_deg.to_radians();
+        let dip = d.dip_deg.to_radians();
+        let mut u = [0.0; D];
+        u[0] = dip.cos() * az.sin();
+        u[1] = dip.cos() * az.cos();
+        if D == 3 {
+            u[2] = -dip.sin(); // dip positive downward
+        }
+        (u, d.tolerance_deg.to_radians().cos())
+    });
 
     // Pair accumulation, split into row chunks for parallelism.
     let chunks = n_chunks();
@@ -138,20 +158,22 @@ pub(crate) fn pair_bins(
         let hi = ((c + 1) * rows_per_chunk).min(n);
         for i in lo..hi {
             for j in (i + 1)..n {
-                let dx = coords[j][0] - coords[i][0];
-                let dy = coords[j][1] - coords[i][1];
-                let d = (dx * dx + dy * dy).sqrt();
+                let mut dh = [0.0; D];
+                let mut d2 = 0.0;
+                for (dd, dhd) in dh.iter_mut().enumerate() {
+                    *dhd = coords[j][dd] - coords[i][dd];
+                    d2 += *dhd * *dhd;
+                }
+                let d = d2.sqrt();
                 if d <= 0.0 || d > cfg.max_dist {
                     continue;
                 }
-                if let Some((az, tol)) = dir {
-                    // Azimuth of the pair vector, clockwise from north.
-                    let ang = dx.atan2(dy);
-                    let mut diff = (ang - az).rem_euclid(PI);
-                    if diff > FRAC_PI_2 {
-                        diff -= PI;
+                if let Some((u, cos_tol)) = dir {
+                    let mut dot = 0.0;
+                    for dd in 0..D {
+                        dot += dh[dd] * u[dd];
                     }
-                    if diff.abs() > tol {
+                    if dot.abs() < d * cos_tol {
                         continue;
                     }
                 }
@@ -238,10 +260,7 @@ mod tests {
         let cfg = VariogramConfig {
             n_lags: 1,
             max_dist: 1.01,
-            direction: Some(DirectionConfig {
-                azimuth_deg: 90.0,
-                tolerance_deg: 10.0,
-            }),
+            direction: Some(DirectionConfig::horizontal(90.0, 10.0)),
         };
         let ev = experimental_variogram(&data, &cfg).unwrap();
         assert_eq!(ev.bins[0].n_pairs, 2);
@@ -252,10 +271,7 @@ mod tests {
         let cfg = VariogramConfig {
             n_lags: 1,
             max_dist: 1.01,
-            direction: Some(DirectionConfig {
-                azimuth_deg: 0.0,
-                tolerance_deg: 10.0,
-            }),
+            direction: Some(DirectionConfig::horizontal(0.0, 10.0)),
         };
         let ev = experimental_variogram(&data, &cfg).unwrap();
         assert_eq!(ev.bins[0].n_pairs, 2);

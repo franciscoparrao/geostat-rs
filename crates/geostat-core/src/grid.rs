@@ -120,3 +120,84 @@ mod tests {
         assert!(Grid2D::from_bbox([0.0, 0.0], [0.0, 1.0], 2, 2).is_err());
     }
 }
+
+/// A regular 3-D grid. `(x0, y0, z0)` is the lower corner *edge*; cells are
+/// stored with index `(iz * ny + iy) * nx + ix` (x fastest, then y, then z).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Grid3D {
+    /// X coordinate of the lower edge.
+    pub x0: f64,
+    /// Y coordinate of the lower edge.
+    pub y0: f64,
+    /// Z coordinate of the lower edge.
+    pub z0: f64,
+    /// Cell width.
+    pub dx: f64,
+    /// Cell depth.
+    pub dy: f64,
+    /// Cell height.
+    pub dz: f64,
+    /// Number of cells in X.
+    pub nx: usize,
+    /// Number of cells in Y.
+    pub ny: usize,
+    /// Number of cells in Z.
+    pub nz: usize,
+}
+
+impl Grid3D {
+    /// Grid covering `[min, max]` with `nx` x `ny` x `nz` cells.
+    pub fn from_bbox(
+        min: [f64; 3],
+        max: [f64; 3],
+        nx: usize,
+        ny: usize,
+        nz: usize,
+    ) -> Result<Self> {
+        if nx == 0 || ny == 0 || nz == 0 {
+            return Err(GeostatError::InvalidParameter(
+                "grid must have at least one cell per axis".into(),
+            ));
+        }
+        for d in 0..3 {
+            if !(max[d] > min[d]) {
+                return Err(GeostatError::InvalidParameter(format!(
+                    "degenerate bbox: min {min:?}, max {max:?}"
+                )));
+            }
+        }
+        Ok(Self {
+            x0: min[0],
+            y0: min[1],
+            z0: min[2],
+            dx: (max[0] - min[0]) / nx as f64,
+            dy: (max[1] - min[1]) / ny as f64,
+            dz: (max[2] - min[2]) / nz as f64,
+            nx,
+            ny,
+            nz,
+        })
+    }
+
+    /// Total number of cells.
+    pub fn n_cells(&self) -> usize {
+        self.nx * self.ny * self.nz
+    }
+
+    /// All cell centers in storage order.
+    pub fn centers(&self) -> Vec<[f64; 3]> {
+        let mut out = Vec::with_capacity(self.n_cells());
+        for iz in 0..self.nz {
+            for iy in 0..self.ny {
+                for ix in 0..self.nx {
+                    out.push([
+                        self.x0 + (ix as f64 + 0.5) * self.dx,
+                        self.y0 + (iy as f64 + 0.5) * self.dy,
+                        self.z0 + (iz as f64 + 0.5) * self.dz,
+                    ]);
+                }
+            }
+        }
+        out
+    }
+}

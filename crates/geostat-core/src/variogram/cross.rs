@@ -7,9 +7,9 @@ use crate::variogram::experimental::{ExperimentalVariogram, VariogramConfig, pai
 /// Computes the experimental cross-semivariogram
 /// `gamma_ab(h) = mean(0.5 * (a_i - a_j)(b_i - b_j))` between two variables
 /// sampled at exactly the same locations (full collocation required).
-pub fn experimental_cross_variogram(
-    a: &PointSet,
-    b: &PointSet,
+pub fn experimental_cross_variogram<const D: usize>(
+    a: &PointSet<D>,
+    b: &PointSet<D>,
     cfg: &VariogramConfig,
 ) -> Result<ExperimentalVariogram> {
     if a.len() != b.len() {

@@ -97,16 +97,30 @@ impl fmt::Display for ModelKind {
 }
 
 /// One nested structure: a model family with its partial sill and range.
+fn one() -> f64 {
+    1.0
+}
+
+fn is_one(v: &f64) -> bool {
+    *v == 1.0
+}
+
 /// Geometric (range) anisotropy, gstat/GSLIB convention: `azimuth_deg` is
 /// the direction of the *major* axis in degrees clockwise from north, and
 /// `ratio = minor_range / major_range` in `(0, 1]`. The structure's `range`
 /// is the major-axis range.
+///
+/// In 3-D, `ratio_z` is the vertical/major range ratio (gstat's second
+/// anisotropy ratio with zero dip/rake rotations); it is ignored in 2-D.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Anisotropy {
     /// Major-axis direction, degrees clockwise from north.
     pub azimuth_deg: f64,
-    /// Minor/major range ratio in `(0, 1]`.
+    /// Minor/major range ratio in `(0, 1]` (horizontal in 3-D).
     pub ratio: f64,
+    /// Vertical/major range ratio in `(0, 1]` (3-D only; default 1).
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub ratio_z: f64,
 }
 
 /// One nested structure: a model family with its partial sill, range and
@@ -147,21 +161,37 @@ impl Structure {
             kind,
             sill,
             range,
-            anis: Some(Anisotropy { azimuth_deg, ratio }),
+            anis: Some(Anisotropy {
+                azimuth_deg,
+                ratio,
+                ratio_z: 1.0,
+            }),
         }
     }
 
     /// Effective isotropic-equivalent lag distance for a separation vector:
-    /// the vector is rotated into the (major, minor) frame and the minor
-    /// component stretched by `1/ratio`.
-    fn effective_h(&self, dh: [f64; 2]) -> f64 {
+    /// the horizontal components are rotated into the (major, minor) frame
+    /// and the minor (and, in 3-D, vertical) components stretched by the
+    /// inverse ratios.
+    fn effective_h<const D: usize>(&self, dh: [f64; D]) -> f64 {
         match self.anis {
-            None => (dh[0] * dh[0] + dh[1] * dh[1]).sqrt(),
+            None => {
+                let mut s = 0.0;
+                for &v in &dh {
+                    s += v * v;
+                }
+                s.sqrt()
+            }
             Some(a) => {
                 let (s, c) = a.azimuth_deg.to_radians().sin_cos();
                 let h_major = dh[0] * s + dh[1] * c;
                 let h_minor = (dh[0] * c - dh[1] * s) / a.ratio;
-                (h_major * h_major + h_minor * h_minor).sqrt()
+                let mut sum = h_major * h_major + h_minor * h_minor;
+                if D == 3 {
+                    let h_z = dh[2] / a.ratio_z;
+                    sum += h_z * h_z;
+                }
+                sum.sqrt()
             }
         }
     }
@@ -199,6 +229,12 @@ impl VariogramModel {
                 )));
             }
             if let Some(a) = s.anis {
+                if !(a.ratio_z > 0.0) || a.ratio_z > 1.0 {
+                    return Err(GeostatError::InvalidParameter(format!(
+                        "anisotropy ratio_z must be in (0, 1], got {}",
+                        a.ratio_z
+                    )));
+                }
                 if !(a.ratio > 0.0) || a.ratio > 1.0 {
                     return Err(GeostatError::InvalidParameter(format!(
                         "anisotropy ratio must be in (0, 1], got {}",
@@ -238,8 +274,8 @@ impl VariogramModel {
 
     /// Semivariance for a separation vector `dh`, honoring per-structure
     /// geometric anisotropy.
-    pub fn gamma_dh(&self, dh: [f64; 2]) -> f64 {
-        if dh[0] == 0.0 && dh[1] == 0.0 {
+    pub fn gamma_dh<const D: usize>(&self, dh: [f64; D]) -> f64 {
+        if dh.iter().all(|&v| v == 0.0) {
             return 0.0;
         }
         self.nugget
@@ -262,7 +298,7 @@ impl VariogramModel {
     }
 
     /// Covariance for a separation vector `dh`, honoring anisotropy.
-    pub fn covariance_dh(&self, dh: [f64; 2]) -> f64 {
+    pub fn covariance_dh<const D: usize>(&self, dh: [f64; D]) -> f64 {
         self.total_sill() - self.gamma_dh(dh)
     }
 }

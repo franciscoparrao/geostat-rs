@@ -78,6 +78,80 @@ pub fn read_points(path: &Path, x_col: &str, y_col: &str, value_col: &str) -> Re
     Ok(read_points_with_extras(path, x_col, y_col, value_col, &[])?.0)
 }
 
+/// Reads 3-D point data (x, y, z, value) from a CSV file.
+pub fn read_points3(
+    path: &Path,
+    x_col: &str,
+    y_col: &str,
+    z_col: &str,
+    value_col: &str,
+) -> Result<PointSet<3>> {
+    let (flat, extras) =
+        read_points_with_extras(path, x_col, y_col, z_col, &[value_col.to_string()])?;
+    // The generic reader yields (x, y) coords with z as "value" and the real
+    // value as the extra column; reassemble into 3-D points.
+    let coords: Vec<[f64; 3]> = flat
+        .coords()
+        .iter()
+        .zip(flat.values())
+        .map(|(c, &z)| [c[0], c[1], z])
+        .collect();
+    Ok(PointSet::new(
+        coords,
+        extras.iter().map(|r| r[0]).collect(),
+    )?)
+}
+
+/// Reads 3-D prediction targets (x, y, z) from a CSV file.
+pub fn read_targets3(path: &Path, x_col: &str, y_col: &str, z_col: &str) -> Result<Vec<[f64; 3]>> {
+    let (coords2, extras) = read_targets(path, x_col, y_col, &[z_col.to_string()])?;
+    Ok(coords2
+        .iter()
+        .zip(&extras)
+        .map(|(c, e)| [c[0], c[1], e[0]])
+        .collect())
+}
+
+/// Writes 3-D per-point predictions as CSV (`x,y,z,prediction,variance`).
+pub fn write_estimates3_csv(
+    path: &Path,
+    coords: &[[f64; 3]],
+    estimates: &[KrigingEstimate],
+) -> Result<()> {
+    let mut w = writer(path)?;
+    writeln!(w, "x,y,z,prediction,variance")?;
+    for (c, e) in coords.iter().zip(estimates) {
+        writeln!(w, "{},{},{},{},{}", c[0], c[1], c[2], e.value, e.variance)?;
+    }
+    Ok(())
+}
+
+/// Writes indicator-kriging ccdfs as CSV
+/// (`x,y,F_1..F_K,e_type,cond_var`).
+pub fn write_ik_csv(
+    path: &Path,
+    coords: &[[f64; 2]],
+    estimates: &[geostat_core::CcdfEstimate],
+    n_cutoffs: usize,
+) -> Result<()> {
+    let mut w = writer(path)?;
+    let fs: Vec<String> = (1..=n_cutoffs).map(|k| format!("F{k}")).collect();
+    writeln!(w, "x,y,{},e_type,cond_var", fs.join(","))?;
+    for (c, e) in coords.iter().zip(estimates) {
+        let fs: Vec<String> = e.ccdf.iter().map(|f| f.to_string()).collect();
+        writeln!(
+            w,
+            "{},{},{},{},{}",
+            c[0],
+            c[1],
+            fs.join(","),
+            e.e_type,
+            e.cond_var
+        )?;
+    }
+    Ok(())
+}
+
 /// Target coordinates plus their covariate rows.
 pub type Targets = (Vec<[f64; 2]>, Vec<Vec<f64>>);
 

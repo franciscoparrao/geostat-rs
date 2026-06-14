@@ -14,19 +14,24 @@ prediction out of the box.
 | `geostat-python` | Python module `geostat_rs` (PyO3, abi3 ≥ 3.9). Build with maturin. |
 | `geostat-wasm` | WebAssembly bindings (wasm-bindgen); demo in `examples/wasm-demo/`. |
 
-## Features (v0.3)
+## Features (v0.4)
 
+- **2-D and 3-D** — the engine is generic over dimension (`PointSet<2>` /
+  `PointSet<3>`); variography, kriging, CV and SGS all run in 3-D through
+  the same validated code paths.
 - **Experimental variograms** — omnidirectional, directional (azimuth +
-  angular tolerance, gstat/GSLIB convention) and cross-variograms.
+  dip cone in 3-D, gstat/GSLIB convention) and cross-variograms.
 - **Theoretical models** — spherical, exponential, Gaussian, Matérn
-  (ν = 3/2, 5/2), nested structures plus nugget, with optional geometric
-  anisotropy per structure (major-axis azimuth + ratio).
+  (ν = 3/2, 5/2), nested structures plus nugget, with geometric
+  anisotropy per structure (azimuth + horizontal ratio + vertical ratio).
 - **Model fitting** — weighted least squares (`N_j / h_j²` weights,
   gstat's default) via Nelder–Mead; automatic best-family selection;
   2-variable LMC fitting with PSD projection.
 - **Kriging** — simple, ordinary, universal (polynomial drift) and
-  **external drift** (KED); **ordinary co-kriging** under a linear model
-  of coregionalization; **block kriging** with explicit discretization;
+  **external drift** (KED); **ordinary co-kriging** (collocated or
+  **heterotopic**) under a linear model of coregionalization; **block
+  kriging** with explicit discretization; standalone **indicator
+  kriging** (local ccdf, E-type estimate, conditional variance);
   kd-tree moving neighborhoods; parallel over targets; variance maps.
 - **Validation** — leave-one-out cross-validation (ME, MAE, RMSE, MSDR),
   with or without external drift.
@@ -37,7 +42,8 @@ prediction out of the box.
   bucket-grid neighbor search: same seed, same realizations, anywhere.
 - **Benchmarks** — criterion suite (`cargo bench -p geostat-core`).
 - **Bindings** — Python (`import geostat_rs`: variography, kriging, CV,
-  SGS, SIS) and WebAssembly (browser demo in `examples/wasm-demo/`).
+  SGS, SIS, IK, all with 3-D variants) and WebAssembly (browser demo in
+  `examples/wasm-demo/`).
 
 ## Build
 
@@ -77,10 +83,24 @@ geostat cokrige -i meuse.csv --value-col lzinc --secondary-col llead \
 # 7. Sequential indicator simulation at the quartiles
 geostat sis -i meuse.csv --value-col zinc --quantiles 0.25,0.5,0.75 \
     --nx 100 --ny 100 -n 50 --seed 42 -o sis.csv
+
+# 8. Indicator kriging: local ccdf, E-type estimate, conditional variance
+geostat ik -i meuse.csv --value-col zinc --quantiles 0.25,0.5,0.75 \
+    --nx 100 --ny 100 -o ik.csv
+
+# 9. 3-D ordinary kriging (z column + explicit targets CSV with x,y,z)
+geostat krige -i drillholes.csv --z-col z --value-col grade -m model3d.json \
+    --targets blocks.csv -o kriged3d.csv
+
+# 10. Heterotopic co-kriging (secondary at its own locations; needs --lmc)
+geostat cokrige -i primary.csv --value-col lzinc --secondary-col llead \
+    --secondary-input secondary.csv --lmc lmc.json \
+    --nx 100 --ny 100 -o cokriged.csv
 ```
 
-Other useful flags: `--azimuth/--tolerance` (directional variograms),
-`--method simple|ordinary|universal --degree 2` (kriging flavor),
+Other useful flags: `--azimuth/--dip/--tolerance` (directional variograms,
+dip for 3-D), `--method simple|ordinary|universal --degree 2` (kriging
+flavor), `--block w,h --block-discr nx,ny` (block kriging),
 `--bbox xmin,ymin,xmax,ymax --res <cell>` (grid control).
 
 A fitted model is plain JSON and can be edited by hand:
@@ -112,18 +132,18 @@ println!("prediction {} ± {}", est.value, est.variance.sqrt());
 
 ## Validation against gstat
 
-The numerical cross-check against **gstat** (R) on the Meuse and Walker
-Lake datasets is part of the v0.1 roadmap. To export Meuse from R:
-
-```r
-library(sp); data(meuse)
-write.csv(meuse[, c("x", "y", "zinc")], "meuse.csv", row.names = FALSE)
-```
+Every deterministic method is cross-checked against **gstat** (R) at
+machine precision on the Meuse and Walker Lake datasets; SGS is validated
+distributionally. The full harness and result tables live in
+[`validation/`](validation/README.md) — variography, OK/UK/SK/KED/co-kriging
+(collocated and heterotopic), block kriging, 3-D kriging/CV and indicator
+kriging, plus the SGS ensemble check.
 
 Conventions intentionally match gstat where it matters: semivariance
-estimator, `N_j/h_j²` fit weights, azimuth measured clockwise from north.
-Note the Matérn parameterization is Rasmussen & Williams (`√(2ν)h/ρ`
-scaling), so ranges are comparable across families.
+estimator, `N_j/h_j²` fit weights, azimuth measured clockwise from north,
+right-closed lag bins, nugget-free within-block covariance. The Matérn
+parameterization is Rasmussen & Williams (`√(2ν)h/ρ` scaling), so ranges
+are comparable across families.
 
 ## Roadmap
 
@@ -135,8 +155,11 @@ scaling), so ranges are comparable across families.
 - v0.3: ✅ Python bindings (PyO3, bit-identical with the CLI), WASM
   bindings + browser demo, block kriging (validated vs gstat at machine
   precision, including the nugget-free C̄(B,B) convention).
-- Next (v0.4): 3-D support, heterotopic co-kriging, paper draft
-  (Mathematical Geosciences).
+- v0.4: ✅ 3-D support (const-generic core), heterotopic co-kriging,
+  standalone indicator kriging — all validated against gstat at machine
+  precision; 3-D and IK exposed in the Python bindings.
+- Next: paper draft (Mathematical Geosciences); possible block co-kriging
+  and trans-Gaussian kriging.
 
 ## Python quickstart
 
@@ -148,11 +171,20 @@ maturin develop -m crates/geostat-python/Cargo.toml --release
 ```python
 import geostat_rs as gs
 
-model = gs.fit_variogram(x, y, z, n_lags=15, max_dist=1500.0)
-pred, var = gs.krige_grid(x, y, z, model, bbox=(0, 0, 100, 100), nx=50, ny=50,
-                          max_neighbors=32)
-sims = gs.sgs(x, y, z, model_ns, bbox=(0, 0, 100, 100), nx=50, ny=50,
+# 2-D
+model = gs.fit_variogram(x, y, vals, n_lags=15, max_dist=1500.0)
+pred, var = gs.krige_grid(x, y, vals, model, bbox=(0, 0, 100, 100),
+                          nx=50, ny=50, max_neighbors=32)
+sims = gs.sgs(x, y, vals, model_ns, bbox=(0, 0, 100, 100), nx=50, ny=50,
               n_realizations=100, seed=42)
+
+# 3-D (drillhole-style data)
+m3 = gs.fit_variogram_3d(x, y, z, grade, n_lags=12, max_dist=200.0)
+pred, var = gs.krige_3d(x, y, z, grade, m3, bx, by, bz, max_neighbors=24)
+
+# Indicator kriging → local ccdf + E-type estimate
+ik = gs.indicator_kriging(x, y, vals, cutoffs, tx, ty)
+ik["ccdf"], ik["e_type"], ik["cond_var"]
 ```
 
 ## License

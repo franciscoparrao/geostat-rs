@@ -1,11 +1,12 @@
 # geostat-rs — Motor de geoestadística en Rust ("GSLIB moderno")
 
-> **Estado:** v0.3 completa y **validada contra gstat** (2026-06-11).
+> **Estado:** v0.4 completa y **validada contra gstat** (2026-06-13).
 > v0.1 (variografía/OK/UK/SK/CV/SGS) + v0.2 (co-kriging LMC, KED, SIS,
-> anisotropía, kd-tree, benches) + v0.3 (bindings PyO3 bit-idénticos al CLI,
-> WASM + demo browser, block kriging) — paridad a precisión de máquina en
-> todo lo determinista (Meuse + Walker Lake); SGS validado distribucionalmente.
-> Ver `validation/README.md`. Pendiente v0.4: 3-D, co-kriging heterotópico, paper.
+> anisotropía, kd-tree, benches) + v0.3 (PyO3 bit-idéntico al CLI, WASM +
+> demo, block kriging) + v0.4 (core genérico 2-D/3-D, co-kriging heterotópico,
+> indicator kriging standalone) — paridad a precisión de máquina en todo lo
+> determinista (Meuse + Walker Lake + sintético 3-D); SGS validado
+> distribucionalmente. Ver `validation/README.md`. Pendiente: draft del paper.
 > Familia de motores Rust del autor: SurtGIS, Hydroflux, Smelt, Anvil, Cantus, Criterium.
 > Doc madre: `~/proyectos/ideas-motores-rust.md` (idea A1).
 
@@ -33,8 +34,13 @@ bindings modernos). No hay un motor geoestadístico Rust con WASM/Python.
       (wasm-bindgen + demo en `examples/wasm-demo/`), kriging por bloques
       (validado vs gstat; C̄(B,B) sin nugget en puntos coincidentes),
       feature `parallel` para compilar sin rayon en wasm32.
-- [ ] (v0.4) Soporte 3-D, co-kriging heterotópico, kriging de indicadores
-      standalone; luego draft del paper.
+- [x] (v0.4) Core genérico sobre la dimensión (`PointSet<const D>`, kd-tree
+      y bucket grid D-dim, anisotropía con `ratio_z`, dirección con dip/cono
+      en 3-D, drift polinomial 3-D, `Grid3D`); co-kriging heterotópico (datos
+      no colocalizados); indicator kriging standalone (ccdf local + E-type +
+      varianza condicional). 3-D e IK expuestos en PyO3. Validado vs gstat a
+      precisión de máquina (3-D OK/CV, hetero co-kriging, IK).
+- [ ] (futuro) Draft paper; opcional block co-kriging, trans-Gaussian kriging.
 
 ## Arquitectura tentativa
 - `geostat-core`: variograma, sistemas de kriging, RNG determinista.
@@ -67,6 +73,11 @@ Computers & Geosciences.
    SIS con tests internos (sills de indicador ≈ p(1-p)).
 6. ~~Bindings PyO3 y demo WASM~~ → **hecho** (2026-06-11) + block kriging
    validado a 1e-14. Python: paridad bit a bit con el CLI.
-7. v0.4: 3-D (la mayor brecha restante vs GSLIB), co-kriging heterotópico.
-8. Draft para Mathematical Geosciences (paridad 7 métodos × 2 datasets,
-   benchmark 7× vs gstat, reproducibilidad determinista cross-platform).
+7. ~~v0.4: 3-D, co-kriging heterotópico, indicator kriging~~ → **hecho**
+   (2026-06-13). Core genérico sobre la dimensión sin tocar el camino 2-D;
+   3-D OK/CV + hetero co-kriging a 1e-14, IK a 7e-10 (clamp de probabilidad
+   correcto donde gstat sale de [0,1]). `validation/compare_v04.py`.
+8. Draft para Mathematical Geosciences. Material listo: paridad ~10 métodos
+   × (Meuse + Walker Lake + sintético 3-D), benchmark 7× vs gstat en SGS,
+   reproducibilidad determinista cross-platform, bindings Python/WASM, 2-D y
+   3-D desde un solo motor const-genérico.

@@ -33,13 +33,15 @@ pub enum KrigingMethod {
 }
 
 impl KrigingMethod {
-    /// Number of drift basis functions (0 for simple kriging).
-    fn n_drift(self) -> usize {
+    /// Number of drift basis functions in `dim` dimensions (0 for simple
+    /// kriging). Degree-1 drift: `1 + dim` terms; degree-2: quadratic
+    /// monomials added.
+    fn n_drift(self, dim: usize) -> usize {
         match self {
             KrigingMethod::Simple { .. } => 0,
             KrigingMethod::Ordinary => 1,
-            KrigingMethod::Universal { degree: 1 } => 3,
-            KrigingMethod::Universal { degree: 2 } => 6,
+            KrigingMethod::Universal { degree: 1 } => 1 + dim,
+            KrigingMethod::Universal { degree: 2 } => 1 + dim + dim * (dim + 1) / 2,
             KrigingMethod::Universal { .. } => 0,
             KrigingMethod::ExternalDrift { n_vars } => 1 + n_vars,
         }
@@ -85,16 +87,16 @@ const NAN_ESTIMATE: KrigingEstimate = KrigingEstimate {
     variance: f64::NAN,
 };
 
-/// Kriging predictor bound to a dataset and variogram model.
+/// Kriging predictor bound to a dataset and variogram model (2-D by
+/// default; `Kriging<'_, 3>` for 3-D data).
 #[derive(Debug)]
-pub struct Kriging<'a> {
-    data: &'a PointSet,
+pub struct Kriging<'a, const D: usize = 2> {
+    data: &'a PointSet<D>,
     model: &'a VariogramModel,
     config: KrigingConfig,
-    tree: Option<KdTree>,
+    tree: Option<KdTree<D>>,
     // Coordinate normalization for numerically stable polynomial drift.
-    cx: f64,
-    cy: f64,
+    center: [f64; D],
     scale: f64,
     // External drift values per data point, plus per-variable normalization.
     drift_data: Vec<Vec<f64>>,
@@ -102,10 +104,10 @@ pub struct Kriging<'a> {
     drift_scale: Vec<f64>,
 }
 
-impl<'a> Kriging<'a> {
+impl<'a, const D: usize> Kriging<'a, D> {
     /// Builds a predictor for simple/ordinary/universal kriging.
     pub fn new(
-        data: &'a PointSet,
+        data: &'a PointSet<D>,
         model: &'a VariogramModel,
         config: KrigingConfig,
     ) -> Result<Self> {
@@ -121,7 +123,7 @@ impl<'a> Kriging<'a> {
     /// covariate values at data point `i` and must have `n_vars` entries
     /// matching `KrigingMethod::ExternalDrift`.
     pub fn with_external_drift(
-        data: &'a PointSet,
+        data: &'a PointSet<D>,
         model: &'a VariogramModel,
         config: KrigingConfig,
         drift_data: Vec<Vec<f64>>,
@@ -160,7 +162,7 @@ impl<'a> Kriging<'a> {
     }
 
     fn build(
-        data: &'a PointSet,
+        data: &'a PointSet<D>,
         model: &'a VariogramModel,
         config: KrigingConfig,
         drift_data: Vec<Vec<f64>>,
@@ -185,9 +187,13 @@ impl<'a> Kriging<'a> {
             ));
         }
         let (min, max) = data.bbox();
-        let cx = 0.5 * (min[0] + max[0]);
-        let cy = 0.5 * (min[1] + max[1]);
-        let scale = 0.5 * ((max[0] - min[0]).max(max[1] - min[1])).max(f64::MIN_POSITIVE);
+        let mut center = [0.0; D];
+        let mut spread = 0.0_f64;
+        for d in 0..D {
+            center[d] = 0.5 * (min[d] + max[d]);
+            spread = spread.max(max[d] - min[d]);
+        }
+        let scale = (0.5 * spread).max(f64::MIN_POSITIVE);
 
         // Per-covariate normalization for a well-conditioned drift block.
         let n_vars = drift_data.first().map_or(0, Vec::len);
@@ -215,8 +221,7 @@ impl<'a> Kriging<'a> {
             model,
             config,
             tree,
-            cx,
-            cy,
+            center,
             scale,
             drift_data,
             drift_mean,
@@ -224,20 +229,25 @@ impl<'a> Kriging<'a> {
         })
     }
 
-    fn fill_basis(&self, p: [f64; 2], drift: Option<&[f64]>, out: &mut [f64]) {
+    fn fill_basis(&self, p: [f64; D], drift: Option<&[f64]>, out: &mut [f64]) {
         match self.config.method {
             KrigingMethod::Simple { .. } => {}
             KrigingMethod::Ordinary => out[0] = 1.0,
             KrigingMethod::Universal { degree } => {
-                let x = (p[0] - self.cx) / self.scale;
-                let y = (p[1] - self.cy) / self.scale;
+                let mut xn = [0.0; D];
+                for d in 0..D {
+                    xn[d] = (p[d] - self.center[d]) / self.scale;
+                }
                 out[0] = 1.0;
-                out[1] = x;
-                out[2] = y;
+                out[1..=D].copy_from_slice(&xn);
                 if degree == 2 {
-                    out[3] = x * x;
-                    out[4] = x * y;
-                    out[5] = y * y;
+                    let mut idx = 1 + D;
+                    for a in 0..D {
+                        for b in a..D {
+                            out[idx] = xn[a] * xn[b];
+                            idx += 1;
+                        }
+                    }
                 }
             }
             KrigingMethod::ExternalDrift { n_vars } => {
@@ -250,7 +260,7 @@ impl<'a> Kriging<'a> {
         }
     }
 
-    fn neighbors(&self, target: [f64; 2]) -> Vec<usize> {
+    fn neighbors(&self, target: [f64; D]) -> Vec<usize> {
         match &self.tree {
             None => (0..self.data.len()).collect(),
             Some(tree) => tree.k_nearest(
@@ -263,7 +273,7 @@ impl<'a> Kriging<'a> {
 
     /// Kriging estimate at a single target location (simple/ordinary/
     /// universal kriging; external drift needs [`Kriging::predict_with_drift`]).
-    pub fn predict(&self, target: [f64; 2]) -> Result<KrigingEstimate> {
+    pub fn predict(&self, target: [f64; D]) -> Result<KrigingEstimate> {
         if matches!(self.config.method, KrigingMethod::ExternalDrift { .. }) {
             return Err(GeostatError::InvalidParameter(
                 "external drift kriging requires predict_with_drift".into(),
@@ -276,7 +286,7 @@ impl<'a> Kriging<'a> {
     /// values at the target location.
     pub fn predict_with_drift(
         &self,
-        target: [f64; 2],
+        target: [f64; D],
         target_drift: &[f64],
     ) -> Result<KrigingEstimate> {
         let KrigingMethod::ExternalDrift { n_vars } = self.config.method else {
@@ -295,14 +305,14 @@ impl<'a> Kriging<'a> {
 
     fn predict_inner(
         &self,
-        target: [f64; 2],
+        target: [f64; D],
         target_drift: Option<&[f64]>,
     ) -> Result<KrigingEstimate> {
         let nb = self.neighbors(target);
         if nb.is_empty() {
             return Err(GeostatError::NoNeighbors);
         }
-        let m = self.config.method.n_drift();
+        let m = self.config.method.n_drift(D);
         let n = nb.len();
         if n < m {
             return Err(GeostatError::InsufficientData(format!(
@@ -310,7 +320,7 @@ impl<'a> Kriging<'a> {
             )));
         }
         let dim = n + m;
-        let c0 = self.model.covariance_dh([0.0, 0.0]);
+        let c0 = self.model.covariance_dh([0.0; D]);
 
         let mut a = Array2::<f64>::zeros((dim, dim));
         let mut b = vec![0.0; dim];
@@ -320,7 +330,7 @@ impl<'a> Kriging<'a> {
             a[[ii, ii]] = c0;
             for (jj, &j) in nb.iter().enumerate().skip(ii + 1) {
                 let pj = self.data.coord(j);
-                let c = self.model.covariance_dh([pi[0] - pj[0], pi[1] - pj[1]]);
+                let c = self.model.covariance_dh(sep(pi, pj));
                 a[[ii, jj]] = c;
                 a[[jj, ii]] = c;
             }
@@ -329,9 +339,7 @@ impl<'a> Kriging<'a> {
                 a[[ii, n + k]] = fk;
                 a[[n + k, ii]] = fk;
             }
-            b[ii] = self
-                .model
-                .covariance_dh([pi[0] - target[0], pi[1] - target[1]]);
+            b[ii] = self.model.covariance_dh(sep(pi, target));
         }
         self.fill_basis(target, target_drift, &mut f);
         for (k, &fk) in f.iter().enumerate() {
@@ -367,7 +375,7 @@ impl<'a> Kriging<'a> {
 
     /// Kriging estimates at many targets, in parallel. Targets whose system
     /// fails (e.g. no neighbors) yield NaN estimates.
-    pub fn predict_many(&self, targets: &[[f64; 2]]) -> Vec<KrigingEstimate> {
+    pub fn predict_many(&self, targets: &[[f64; D]]) -> Vec<KrigingEstimate> {
         crate::parallel::par_map(targets.len(), |i| {
             self.predict(targets[i]).unwrap_or(NAN_ESTIMATE)
         })
@@ -377,7 +385,7 @@ impl<'a> Kriging<'a> {
     /// holds the covariates of `targets[i]`.
     pub fn predict_many_with_drift(
         &self,
-        targets: &[[f64; 2]],
+        targets: &[[f64; D]],
         drifts: &[Vec<f64>],
     ) -> Result<Vec<KrigingEstimate>> {
         if targets.len() != drifts.len() {
@@ -393,18 +401,11 @@ impl<'a> Kriging<'a> {
         }))
     }
 
-    /// Kriging over all cell centers of a grid. Returns `(values, variances)`
-    /// in grid storage order.
-    pub fn predict_grid(&self, grid: &Grid2D) -> (Vec<f64>, Vec<f64>) {
-        let ests = self.predict_many(&grid.centers());
-        ests.into_iter().map(|e| (e.value, e.variance)).unzip()
-    }
-
     /// Block kriging estimate: predicts the average of a block centered at
     /// `center`, discretized at `center + offsets[u]`. Supported for simple
     /// and ordinary kriging (polynomial or external drift would require
     /// averaging the drift over the block).
-    pub fn predict_block(&self, center: [f64; 2], offsets: &[[f64; 2]]) -> Result<KrigingEstimate> {
+    pub fn predict_block(&self, center: [f64; D], offsets: &[[f64; D]]) -> Result<KrigingEstimate> {
         match self.config.method {
             KrigingMethod::Simple { .. } | KrigingMethod::Ordinary => {}
             _ => {
@@ -422,10 +423,10 @@ impl<'a> Kriging<'a> {
         if nb.is_empty() {
             return Err(GeostatError::NoNeighbors);
         }
-        let m = self.config.method.n_drift();
+        let m = self.config.method.n_drift(D);
         let n = nb.len();
         let dim = n + m;
-        let c0 = self.model.covariance_dh([0.0, 0.0]);
+        let c0 = self.model.covariance_dh([0.0; D]);
         let nu = offsets.len() as f64;
 
         let mut a = Array2::<f64>::zeros((dim, dim));
@@ -467,7 +468,7 @@ impl<'a> Kriging<'a> {
                 cbb += if ui == vi {
                     c0_continuous
                 } else {
-                    self.model.covariance_dh([u[0] - v[0], u[1] - v[1]])
+                    self.model.covariance_dh(sep(*u, *v))
                 };
             }
         }
@@ -496,6 +497,15 @@ impl<'a> Kriging<'a> {
             variance: variance.max(0.0),
         })
     }
+}
+
+impl Kriging<'_, 2> {
+    /// Kriging over all cell centers of a grid. Returns `(values, variances)`
+    /// in grid storage order.
+    pub fn predict_grid(&self, grid: &Grid2D) -> (Vec<f64>, Vec<f64>) {
+        let ests = self.predict_many(&grid.centers());
+        ests.into_iter().map(|e| (e.value, e.variance)).unzip()
+    }
 
     /// Block kriging over all grid cells, with blocks of `block_size`
     /// discretized as a regular `discr[0]` x `discr[1]` point grid.
@@ -513,6 +523,15 @@ impl<'a> Kriging<'a> {
         });
         Ok(ests.into_iter().map(|e| (e.value, e.variance)).unzip())
     }
+}
+
+/// Separation vector between two points.
+fn sep<const D: usize>(a: [f64; D], b: [f64; D]) -> [f64; D] {
+    let mut dh = [0.0; D];
+    for d in 0..D {
+        dh[d] = a[d] - b[d];
+    }
+    dh
 }
 
 /// Regular block-discretization offsets: an `n[0]` x `n[1]` grid of cell
