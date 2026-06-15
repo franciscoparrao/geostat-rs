@@ -265,8 +265,27 @@ impl<'a, const D: usize> CoKriging<'a, D> {
 
     /// Co-kriging estimate of the primary variable at a target location.
     pub fn predict(&self, target: [f64; D]) -> Result<KrigingEstimate> {
+        self.predict_inner(target, None)
+    }
+
+    /// Block co-kriging: predicts the average of the primary variable over a
+    /// block centered at `center`, discretized at `center + offsets[u]`.
+    pub fn predict_block(&self, center: [f64; D], offsets: &[[f64; D]]) -> Result<KrigingEstimate> {
+        if offsets.is_empty() {
+            return Err(GeostatError::InvalidParameter(
+                "block discretization needs at least one point".into(),
+            ));
+        }
+        self.predict_inner(center, Some(offsets))
+    }
+
+    fn predict_inner(
+        &self,
+        center: [f64; D],
+        offsets: Option<&[[f64; D]]>,
+    ) -> Result<KrigingEstimate> {
         let n_vars = self.datasets.len();
-        let nbs: Vec<Vec<usize>> = (0..n_vars).map(|v| self.neighbors(v, target)).collect();
+        let nbs: Vec<Vec<usize>> = (0..n_vars).map(|v| self.neighbors(v, center)).collect();
         if nbs[0].is_empty() {
             return Err(GeostatError::NoNeighbors);
         }
@@ -278,6 +297,31 @@ impl<'a, const D: usize> CoKriging<'a, D> {
             offset[v] = offset[v - 1] + counts[v - 1];
         }
         let dim = n_total + n_vars;
+
+        // Point-to-(point or block) cross-covariance of variable `v` against
+        // the primary (variable 0) at `pi`.
+        let rhs_cov = |v: usize, pi: [f64; D]| -> f64 {
+            match offsets {
+                None => {
+                    let mut dh = [0.0; D];
+                    for dd in 0..D {
+                        dh[dd] = pi[dd] - center[dd];
+                    }
+                    self.lmc.covariance_dh(v, 0, dh)
+                }
+                Some(offs) => {
+                    let mut acc = 0.0;
+                    for off in offs {
+                        let mut dh = [0.0; D];
+                        for dd in 0..D {
+                            dh[dd] = pi[dd] - (center[dd] + off[dd]);
+                        }
+                        acc += self.lmc.covariance_dh(v, 0, dh);
+                    }
+                    acc / offs.len() as f64
+                }
+            }
+        };
 
         let mut a = Array2::<f64>::zeros((dim, dim));
         let mut b = vec![0.0; dim];
@@ -292,7 +336,11 @@ impl<'a, const D: usize> CoKriging<'a, D> {
                             continue;
                         }
                         let pj = self.datasets[w].coord(j);
-                        let c = self.lmc.covariance_dh(v, w, [pi[0] - pj[0], pi[1] - pj[1]]);
+                        let mut dh = [0.0; D];
+                        for dd in 0..D {
+                            dh[dd] = pi[dd] - pj[dd];
+                        }
+                        let c = self.lmc.covariance_dh(v, w, dh);
                         a[[row, col]] = c;
                         a[[col, row]] = c;
                     }
@@ -300,11 +348,7 @@ impl<'a, const D: usize> CoKriging<'a, D> {
                 // Unbiasedness: one Lagrange multiplier per variable.
                 a[[row, n_total + v]] = 1.0;
                 a[[n_total + v, row]] = 1.0;
-                let mut dht = [0.0; D];
-                for dd in 0..D {
-                    dht[dd] = pi[dd] - target[dd];
-                }
-                b[row] = self.lmc.covariance_dh(v, 0, dht);
+                b[row] = rhs_cov(v, pi);
             }
         }
         // Primary weights sum to 1, secondary weights to 0.
@@ -320,8 +364,37 @@ impl<'a, const D: usize> CoKriging<'a, D> {
             }
         }
         let reduction: f64 = (0..dim).map(|i| w[i] * b0[i]).sum();
-        let variance = (self.lmc.total_sill(0, 0) - reduction).max(0.0);
-        Ok(KrigingEstimate { value, variance })
+        // Target variance: C(0) of the primary at a point, or the within-block
+        // average covariance C̄(B,B) (nugget excluded for coincident points,
+        // matching block kriging / gstat).
+        let c_target = match offsets {
+            None => self.lmc.total_sill(0, 0),
+            Some(offs) => {
+                let c0_cont = self.lmc.total_sill(0, 0) - self.lmc.nugget[0][0];
+                let mut cbb = 0.0;
+                for (ui, u) in offs.iter().enumerate() {
+                    for (vi, vv) in offs.iter().enumerate() {
+                        cbb += if ui == vi {
+                            c0_cont
+                        } else {
+                            let mut dh = [0.0; D];
+                            for dd in 0..D {
+                                dh[dd] = u[dd] - vv[dd];
+                            }
+                            self.lmc.covariance_dh(0, 0, dh)
+                        };
+                    }
+                }
+                cbb / (offs.len() * offs.len()) as f64
+            }
+        };
+        let variance = (c_target - reduction).max(0.0);
+        // w[n_total] is the multiplier on the primary unbiasedness constraint.
+        Ok(KrigingEstimate {
+            value,
+            variance,
+            lagrange: Some(w[n_total]),
+        })
     }
 
     /// Estimates at many targets, in parallel (NaN on failed systems).
@@ -330,6 +403,7 @@ impl<'a, const D: usize> CoKriging<'a, D> {
             self.predict(targets[i]).unwrap_or(KrigingEstimate {
                 value: f64::NAN,
                 variance: f64::NAN,
+                lagrange: None,
             })
         })
     }
@@ -340,6 +414,27 @@ impl CoKriging<'_, 2> {
     pub fn predict_grid(&self, grid: &Grid2D) -> (Vec<f64>, Vec<f64>) {
         let ests = self.predict_many(&grid.centers());
         ests.into_iter().map(|e| (e.value, e.variance)).unzip()
+    }
+
+    /// Block co-kriging over all grid cells, with blocks of `block_size`
+    /// discretized as a regular `discr[0]` x `discr[1]` point grid.
+    pub fn predict_block_grid(
+        &self,
+        grid: &Grid2D,
+        block_size: [f64; 2],
+        discr: [usize; 2],
+    ) -> Result<(Vec<f64>, Vec<f64>)> {
+        let offsets = crate::kriging::block_offsets(block_size, discr)?;
+        let centers = grid.centers();
+        let ests = crate::parallel::par_map(centers.len(), |i| {
+            self.predict_block(centers[i], &offsets)
+                .unwrap_or(KrigingEstimate {
+                    value: f64::NAN,
+                    variance: f64::NAN,
+                    lagrange: None,
+                })
+        });
+        Ok(ests.into_iter().map(|e| (e.value, e.variance)).unzip())
     }
 }
 
@@ -550,6 +645,41 @@ mod tests {
             );
             assert!(est.variance < 1e-7);
         }
+    }
+
+    #[test]
+    fn block_cokriging_averages_point_cokriging() {
+        // With a global neighborhood, the block co-kriging estimate equals
+        // the average of point co-kriging estimates over the discretization
+        // (linearity), and the block variance is below the central point.
+        let p = primary();
+        let s = secondary();
+        let m = lmc(0.8);
+        let ck = CoKriging::new(vec![&p, &s], &m, CoKrigingConfig::default()).unwrap();
+        let center = [5.0, 5.0];
+        let offsets = crate::kriging::block_offsets([4.0, 4.0], [3, 3]).unwrap();
+        let block = ck.predict_block(center, &offsets).unwrap();
+        let mean_pts = offsets
+            .iter()
+            .map(|o| {
+                ck.predict([center[0] + o[0], center[1] + o[1]])
+                    .unwrap()
+                    .value
+            })
+            .sum::<f64>()
+            / offsets.len() as f64;
+        assert!(
+            (block.value - mean_pts).abs() < 1e-9,
+            "block {} vs mean of points {mean_pts}",
+            block.value
+        );
+        let point_var = ck.predict(center).unwrap().variance;
+        assert!(
+            block.variance < point_var,
+            "block var {} vs point var {point_var}",
+            block.variance
+        );
+        assert!(ck.predict_block(center, &[]).is_err());
     }
 
     #[test]

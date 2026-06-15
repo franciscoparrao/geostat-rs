@@ -80,11 +80,16 @@ pub struct KrigingEstimate {
     pub value: f64,
     /// Kriging (estimation) variance, clamped at zero.
     pub variance: f64,
+    /// Lagrange multiplier on the unbiasedness (constant) constraint, when
+    /// present (ordinary/universal/external-drift kriging); `None` for
+    /// simple kriging. Needed by the ordinary lognormal back-transform.
+    pub lagrange: Option<f64>,
 }
 
 const NAN_ESTIMATE: KrigingEstimate = KrigingEstimate {
     value: f64::NAN,
     variance: f64::NAN,
+    lagrange: None,
 };
 
 /// Kriging predictor bound to a dataset and variogram model (2-D by
@@ -349,7 +354,7 @@ impl<'a, const D: usize> Kriging<'a, D> {
         let b0 = b.clone();
         let w = solve(a, b)?;
 
-        let (value, variance) = match self.config.method {
+        let (value, variance, lagrange) = match self.config.method {
             KrigingMethod::Simple { mean } => {
                 let mut v = mean;
                 let mut reduction = 0.0;
@@ -357,19 +362,22 @@ impl<'a, const D: usize> Kriging<'a, D> {
                     v += w[ii] * (self.data.value(nb[ii]) - mean);
                     reduction += w[ii] * b0[ii];
                 }
-                (v, c0 - reduction)
+                (v, c0 - reduction, None)
             }
             _ => {
                 let v: f64 = (0..n).map(|ii| w[ii] * self.data.value(nb[ii])).sum();
                 // Includes the Lagrange-multiplier terms via b0[n..].
                 let reduction: f64 = (0..dim).map(|i| w[i] * b0[i]).sum();
-                (v, c0 - reduction)
+                // w[n] is the multiplier on the constant basis function (the
+                // first drift term), i.e. the OK unbiasedness constraint.
+                (v, c0 - reduction, Some(w[n]))
             }
         };
 
         Ok(KrigingEstimate {
             value,
             variance: variance.max(0.0),
+            lagrange,
         })
     }
 
@@ -476,7 +484,7 @@ impl<'a, const D: usize> Kriging<'a, D> {
 
         let b0 = b.clone();
         let w = solve(a, b)?;
-        let (value, variance) = match self.config.method {
+        let (value, variance, lagrange) = match self.config.method {
             KrigingMethod::Simple { mean } => {
                 let mut v = mean;
                 let mut reduction = 0.0;
@@ -484,17 +492,18 @@ impl<'a, const D: usize> Kriging<'a, D> {
                     v += w[ii] * (self.data.value(nb[ii]) - mean);
                     reduction += w[ii] * b0[ii];
                 }
-                (v, cbb - reduction)
+                (v, cbb - reduction, None)
             }
             _ => {
                 let v: f64 = (0..n).map(|ii| w[ii] * self.data.value(nb[ii])).sum();
                 let reduction: f64 = (0..dim).map(|i| w[i] * b0[i]).sum();
-                (v, cbb - reduction)
+                (v, cbb - reduction, Some(w[n]))
             }
         };
         Ok(KrigingEstimate {
             value,
             variance: variance.max(0.0),
+            lagrange,
         })
     }
 }

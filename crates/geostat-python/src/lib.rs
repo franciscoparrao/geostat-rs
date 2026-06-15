@@ -202,6 +202,61 @@ fn krige(
     Ok(ests.into_iter().map(|e| (e.value, e.variance)).unzip())
 }
 
+/// Ordinary/simple lognormal kriging. `values` are the original (positive)
+/// data; `log_model` is the variogram of `ln(value)`. Returns
+/// `(predictions, log_variances)` — predictions are back-transformed to
+/// original units. For simple kriging pass `method="simple"` and `mean` in
+/// log units.
+#[pyfunction]
+#[pyo3(signature = (x, y, values, log_model, target_x, target_y,
+    method = "ordinary", mean = None, max_neighbors = None, radius = None))]
+#[allow(clippy::too_many_arguments)]
+fn lognormal_kriging(
+    x: Vec<f64>,
+    y: Vec<f64>,
+    values: Vec<f64>,
+    log_model: &VariogramModel,
+    target_x: Vec<f64>,
+    target_y: Vec<f64>,
+    method: &str,
+    mean: Option<f64>,
+    max_neighbors: Option<usize>,
+    radius: Option<f64>,
+) -> PyResult<(Vec<f64>, Vec<f64>)> {
+    if target_x.len() != target_y.len() {
+        return Err(PyValueError::new_err("target_x and target_y differ in length"));
+    }
+    let data = point_set(x, y, values)?;
+    let kmethod = match method {
+        "ordinary" => KrigingMethod::Ordinary,
+        "simple" => KrigingMethod::Simple {
+            mean: mean.ok_or_else(|| {
+                PyValueError::new_err("simple lognormal kriging needs `mean` (in log units)")
+            })?,
+        },
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "lognormal kriging supports ordinary or simple, got '{other}'"
+            )));
+        }
+    };
+    let config = KrigingConfig {
+        method: kmethod,
+        max_neighbors,
+        search_radius: radius,
+    };
+    let targets: Vec<[f64; 2]> = target_x
+        .into_iter()
+        .zip(target_y)
+        .map(|(tx, ty)| [tx, ty])
+        .collect();
+    let ests = core::lognormal_kriging(&data, &targets, &log_model.inner, &config).map_err(err)?;
+    Ok(ests
+        .into_iter()
+        .map(|e| (e.value, e.log_variance))
+        .unzip())
+}
+
 /// Kriging over a regular grid (`bbox = (xmin, ymin, xmax, ymax)`), row-major
 /// cell centers with y increasing. Returns `(predictions, variances)`.
 #[pyfunction]
@@ -543,6 +598,7 @@ fn geostat_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fit_variogram_3d, m)?)?;
     m.add_function(wrap_pyfunction!(krige_3d, m)?)?;
     m.add_function(wrap_pyfunction!(indicator_kriging, m)?)?;
+    m.add_function(wrap_pyfunction!(lognormal_kriging, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

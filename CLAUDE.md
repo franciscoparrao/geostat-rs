@@ -1,12 +1,13 @@
 # geostat-rs — Motor de geoestadística en Rust ("GSLIB moderno")
 
-> **Estado:** v0.4 completa y **validada contra gstat** (2026-06-13).
+> **Estado:** v0.5 completa y **validada contra gstat** (2026-06-14).
 > v0.1 (variografía/OK/UK/SK/CV/SGS) + v0.2 (co-kriging LMC, KED, SIS,
 > anisotropía, kd-tree, benches) + v0.3 (PyO3 bit-idéntico al CLI, WASM +
 > demo, block kriging) + v0.4 (core genérico 2-D/3-D, co-kriging heterotópico,
-> indicator kriging standalone) — paridad a precisión de máquina en todo lo
-> determinista (Meuse + Walker Lake + sintético 3-D); SGS validado
-> distribucionalmente. Ver `validation/README.md`. Pendiente: draft del paper.
+> indicator kriging) + v0.5 (kriging lognormal/trans-gaussiano, block
+> co-kriging) — paridad a precisión de máquina en todo lo determinista
+> (Meuse + Walker Lake + sintético 3-D); SGS validado distribucionalmente.
+> Ver `validation/README.md`. Pendiente: draft del paper.
 > Familia de motores Rust del autor: SurtGIS, Hydroflux, Smelt, Anvil, Cantus, Criterium.
 > Doc madre: `~/proyectos/ideas-motores-rust.md` (idea A1).
 
@@ -40,7 +41,11 @@ bindings modernos). No hay un motor geoestadístico Rust con WASM/Python.
       no colocalizados); indicator kriging standalone (ccdf local + E-type +
       varianza condicional). 3-D e IK expuestos en PyO3. Validado vs gstat a
       precisión de máquina (3-D OK/CV, hetero co-kriging, IK).
-- [ ] (futuro) Draft paper; opcional block co-kriging, trans-Gaussian kriging.
+- [x] (v0.5) Kriging lognormal/trans-gaussiano (back-transform J&H, multiplicador
+      de Lagrange expuesto en `KrigingEstimate`); block co-kriging. Block
+      co-kriging valida a 1e-14; lognormal SK a 1e-9 vs gstat (krigeTg usa un
+      estimador GLS distinto — ver notas). Lognormal expuesto en PyO3.
+- [ ] (futuro) Draft paper; opcional GeoPackage/raster I/O para integrar SurtGIS.
 
 ## Arquitectura tentativa
 - `geostat-core`: variograma, sistemas de kriging, RNG determinista.

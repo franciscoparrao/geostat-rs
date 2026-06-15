@@ -14,7 +14,7 @@ prediction out of the box.
 | `geostat-python` | Python module `geostat_rs` (PyO3, abi3 ≥ 3.9). Build with maturin. |
 | `geostat-wasm` | WebAssembly bindings (wasm-bindgen); demo in `examples/wasm-demo/`. |
 
-## Features (v0.4)
+## Features (v0.5)
 
 - **2-D and 3-D** — the engine is generic over dimension (`PointSet<2>` /
   `PointSet<3>`); variography, kriging, CV and SGS all run in 3-D through
@@ -30,9 +30,10 @@ prediction out of the box.
 - **Kriging** — simple, ordinary, universal (polynomial drift) and
   **external drift** (KED); **ordinary co-kriging** (collocated or
   **heterotopic**) under a linear model of coregionalization; **block
-  kriging** with explicit discretization; standalone **indicator
-  kriging** (local ccdf, E-type estimate, conditional variance);
-  kd-tree moving neighborhoods; parallel over targets; variance maps.
+  kriging** and **block co-kriging** with explicit discretization;
+  **lognormal kriging** (unbiased back-transform); standalone **indicator
+  kriging** (local ccdf, E-type estimate, conditional variance); kd-tree
+  moving neighborhoods; parallel over targets; variance maps.
 - **Validation** — leave-one-out cross-validation (ME, MAE, RMSE, MSDR),
   with or without external drift.
 - **Simulation** — conditional sequential **Gaussian** simulation
@@ -158,8 +159,12 @@ are comparable across families.
 - v0.4: ✅ 3-D support (const-generic core), heterotopic co-kriging,
   standalone indicator kriging — all validated against gstat at machine
   precision; 3-D and IK exposed in the Python bindings.
-- Next: paper draft (Mathematical Geosciences); possible block co-kriging
-  and trans-Gaussian kriging.
+- v0.5: ✅ lognormal (trans-Gaussian) kriging and block co-kriging.
+  Block co-kriging matches gstat to machine precision; simple lognormal
+  kriging matches gstat's SK back-transform to ~1e-9 (ordinary follows the
+  Journel & Huijbregts formula).
+- Next: paper draft (Mathematical Geosciences); possible GeoPackage/raster
+  I/O for SurtGIS integration.
 
 ## Python quickstart
 

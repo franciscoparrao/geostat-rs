@@ -138,6 +138,25 @@ mismatches), and everywhere gstat stayed in range the two engines agree to
 7.4e-10. The clamp is the correct behavior — a ccdf value must be a
 probability.
 
+## v0.5 results (lognormal kriging, block co-kriging)
+
+| Check | Predictions | Variances |
+|---|---|---|
+| Simple lognormal kriging vs gstat SK + analytic back-transform | 1.2e-9 | 7.3e-13 (log space) |
+| Block co-kriging vs gstat `predict(block=)`, shared LMC (3103 cells) | 2.8e-14 | 1.4e-15 |
+
+**Lognormal-kriging note caught by this exercise:** `gstat::krigeTg(lambda=0)`
+does *not* implement the textbook ordinary lognormal back-transform. It
+estimates the trend by GLS and adds a bias correction whose extra term is
+~15× the ordinary-kriging Lagrange multiplier — a different (GLS-based)
+trans-Gaussian estimator. So the clean oracle is **simple** lognormal
+kriging, where the back-transform `exp(y + sigma2/2)` has no Lagrange term:
+geostat-rs matches gstat's SK there to 1.2e-9. For ordinary lognormal
+kriging geostat-rs uses the Journel & Huijbregts (1978) formula
+`exp(y + sigma2/2 - mu)` (mu in covariance form); its log-space kriging is
+gstat-validated to machine precision, but the OK back-transform is not
+bit-compared to krigeTg.
+
 ## Reproduce
 
 ```sh
@@ -206,6 +225,25 @@ $BIN ik -i validation/out/meuse_ik.csv --value-col lzinc \
     -o validation/out/rust_ik.csv
 
 python3 validation/compare_v04.py
+```
+
+v0.5 (lognormal kriging, block co-kriging):
+
+```sh
+Rscript validation/v05_gstat.R
+
+BETA=$(cat validation/out/logzinc_beta.txt)
+$BIN krige -i validation/out/meuse_zinc.csv --value-col zinc \
+    -m validation/out/logzinc_model.json --lognormal --method simple --mean "$BETA" \
+    --bbox 178440,329600,181560,333760 --nx 78 --ny 104 \
+    -o validation/out/rust_lognormal.csv
+$BIN cokrige -i validation/out/meuse_multi2.csv --value-col lzinc \
+    --secondary-col llead --lmc validation/out/lmc_block.json \
+    --block 40,40 --block-discr 4,4 \
+    --bbox 178440,329600,181560,333760 --nx 78 --ny 104 \
+    -o validation/out/rust_block_cokrige.csv
+
+python3 validation/compare_v05.py
 ```
 
 `validation/out/` is regenerated on each run and not tracked by git.

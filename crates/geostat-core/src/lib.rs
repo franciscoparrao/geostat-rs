@@ -55,6 +55,7 @@ pub mod rng;
 mod search;
 pub mod simulation;
 pub mod sis;
+pub mod trans;
 pub mod transform;
 pub mod validation;
 pub mod variogram;
@@ -70,6 +71,7 @@ pub use simulation::{
     SgsConfig, SgsResult, sequential_gaussian_simulation, sequential_gaussian_simulation_3d, sgs_at,
 };
 pub use sis::{SisConfig, sequential_indicator_simulation, sis_at};
+pub use trans::{LognormalEstimate, lognormal_kriging};
 pub use transform::NormalScore;
 pub use validation::{CvResult, leave_one_out, leave_one_out_with_drift};
 pub use variogram::{

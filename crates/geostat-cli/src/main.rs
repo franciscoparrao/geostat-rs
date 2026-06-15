@@ -241,6 +241,10 @@ struct KrigeCmd {
     /// Block discretization points per axis "nx,ny"
     #[arg(long, default_value = "4,4")]
     block_discr: String,
+    /// Lognormal kriging: data values are positive, model is of ln(value);
+    /// predictions are back-transformed to original units
+    #[arg(long)]
+    lognormal: bool,
     #[command(flatten)]
     grid: GridOpts,
     #[command(flatten)]
@@ -270,6 +274,12 @@ struct CokrigeCmd {
     lmc_out: Option<PathBuf>,
     #[command(flatten)]
     vario: VariogramOpts,
+    /// Block co-kriging: block size "width,height" centered on each cell
+    #[arg(long)]
+    block: Option<String>,
+    /// Block discretization points per axis "nx,ny"
+    #[arg(long, default_value = "4,4")]
+    block_discr: String,
     #[command(flatten)]
     grid: GridOpts,
     #[command(flatten)]
@@ -547,6 +557,24 @@ fn run_krige(cmd: KrigeCmd) -> Result<()> {
         max_neighbors: cmd.neighbors.max_neighbors,
         search_radius: cmd.neighbors.radius,
     };
+
+    if cmd.lognormal {
+        if cmd.block.is_some() || cmd.drift_cols.is_some() {
+            bail!("--lognormal cannot be combined with --block or --drift-cols");
+        }
+        let centers = grid.centers();
+        let ests = geostat_core::lognormal_kriging(&data, &centers, &model, &config)?;
+        let values: Vec<f64> = ests.iter().map(|e| e.value).collect();
+        let variances: Vec<f64> = ests.iter().map(|e| e.log_variance).collect();
+        println!(
+            "Lognormal kriging on {} cells (variance column is in log space)",
+            grid.n_cells()
+        );
+        io_utils::write_grid_csv(&cmd.output, &grid, &values, &variances)?;
+        println!("Output written to {}", cmd.output.display());
+        return Ok(());
+    }
+
     let kriging = Kriging::new(&data, &model, config)?;
     let (values, variances) = match &cmd.block {
         Some(spec) => {
@@ -667,7 +695,25 @@ fn run_cokrige(cmd: CokrigeCmd) -> Result<()> {
         search_radius: cmd.neighbors.radius,
     };
     let ck = CoKriging::new(vec![&primary, &secondary], &lmc, config)?;
-    let (values, variances) = ck.predict_grid(&grid);
+    let (values, variances) = match &cmd.block {
+        Some(spec) => {
+            let size = parse_floats(spec)?;
+            let discr = parse_floats(&cmd.block_discr)?;
+            if size.len() != 2 || discr.len() != 2 {
+                bail!("--block and --block-discr take two comma-separated values");
+            }
+            println!(
+                "Block co-kriging: {} x {} blocks, {} x {} discretization",
+                size[0], size[1], discr[0], discr[1]
+            );
+            ck.predict_block_grid(
+                &grid,
+                [size[0], size[1]],
+                [discr[0] as usize, discr[1] as usize],
+            )?
+        }
+        None => ck.predict_grid(&grid),
+    };
     let n_nan = values.iter().filter(|v| v.is_nan()).count();
     println!(
         "Co-kriged {} cells ({} x {}); {} empty",
