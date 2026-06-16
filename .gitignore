@@ -3,3 +3,6 @@
 /validation/out/
 !tests/data/*.csv
 .vscode/
+
+# Generated example outputs
+examples/*.csv
