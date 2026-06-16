@@ -79,20 +79,43 @@ class _LCG:
         return self.s
 
 
-def metrics(name, true, pred, lo, hi):
+# Standard-normal quantiles for the probabilities we evaluate.
+ZQ = {
+    0.05: -1.644854, 0.10: -1.281552, 0.15: -1.036433, 0.25: -0.674490,
+    0.75: 0.674490, 0.85: 1.036433, 0.90: 1.281552, 0.95: 1.644854,
+}
+# Central predictive intervals to score, by nominal coverage.
+LEVELS = {0.50: (0.25, 0.75), 0.70: (0.15, 0.85), 0.80: (0.10, 0.90), 0.90: (0.05, 0.95)}
+
+
+def report(name, true, pred, quant):
+    """quant: dict prob -> list of per-target quantile values."""
     n = len(true)
     rmse = math.sqrt(sum((p - t) ** 2 for p, t in zip(pred, true)) / n)
-    rmse_log = math.sqrt(
-        sum((math.log(max(p, 1e-6)) - math.log(t)) ** 2 for p, t in zip(pred, true)) / n
-    )
-    coverage = sum(1 for t, a, b in zip(true, lo, hi) if a <= t <= b) / n
-    width = st.median(b - a for a, b in zip(lo, hi))
-    neg = sum(1 for a in lo if a < 0) / n
-    print(
-        f"  {name:<22} RMSE={rmse:7.1f}  RMSE(log)={rmse_log:5.3f}  "
-        f"80%cover={coverage:4.0%}  width={width:7.1f}  neg.lower={neg:4.0%}"
-    )
-    return rmse, coverage
+    cov, cal_err = {}, 0.0
+    for level, (lp, hp) in LEVELS.items():
+        lo, hi = quant[lp], quant[hp]
+        c = sum(1 for t, a, b in zip(true, lo, hi) if a <= t <= b) / n
+        cov[level] = c
+        cal_err += abs(c - level)
+    cal_err /= len(LEVELS)
+    neg = sum(1 for a in quant[0.10] if a < 0) / n  # lower bound of the 80% PI
+    covs = "  ".join(f"{int(L*100)}%:{cov[L]:.0%}" for L in LEVELS)
+    print(f"  {name:<20} RMSE={rmse:6.1f}  cover[{covs}]  cal.err={cal_err:.3f}  neg={neg:3.0%}")
+
+
+def gaussian_quantiles(pred, var):
+    """Quantile dict for a Gaussian predictive N(pred, var)."""
+    std = [math.sqrt(max(s, 0)) for s in var]
+    return {p: [m + ZQ[p] * s for m, s in zip(pred, std)] for p in ZQ}
+
+
+def warp_quantiles(w):
+    """Quantile dict from a warped_kriging result (probs aligned to PROBS)."""
+    return {p: [q[i] for q in w["quantiles"]] for i, p in enumerate(PROBS)}
+
+
+PROBS = [0.05, 0.10, 0.15, 0.25, 0.75, 0.85, 0.90, 0.95]
 
 
 def main():
@@ -108,30 +131,29 @@ def main():
     ex, ey, ev = test.x.tolist(), test.y.tolist(), test.v.tolist()
     print(f"  train={len(tx)}  test={len(ex)}  (max_neighbors=24)\n")
 
-    # 1. Plain ordinary kriging on raw La. 80% Gaussian interval.
+    # 1. Plain ordinary kriging on raw La (Gaussian predictive).
     model = gs.fit_variogram(tx, ty, tv, n_lags=12)
     pred, var = gs.krige(tx, ty, tv, model, ex, ey, method="ordinary", max_neighbors=24)
-    z = 1.2815515  # 0.9 normal quantile
-    ok_lo = [p - z * math.sqrt(max(s, 0)) for p, s in zip(pred, var)]
-    ok_hi = [p + z * math.sqrt(max(s, 0)) for p, s in zip(pred, var)]
 
-    # 2. Warped (Box-Cox) kriging. P10/P90 = 80% predictive interval.
-    w = gs.warped_kriging(
-        tx, ty, tv, ex, ey,
-        warp="box-cox", quantiles=[0.1, 0.9],
-        n_lags=12, max_neighbors=24, n_samples=4000, seed=1,
-    )
-    w_mean = w["mean"]
-    w_lo = [q[0] for q in w["quantiles"]]
-    w_hi = [q[1] for q in w["quantiles"]]
+    # 2/3. Warped kriging, Box-Cox vs sinh-arcsinh marginals.
+    def warp(kind):
+        return gs.warped_kriging(
+            tx, ty, tv, ex, ey,
+            warp=kind, quantiles=PROBS,
+            n_lags=12, max_neighbors=24, n_samples=8000, seed=1,
+        )
 
-    print("Hold-out performance (80% predictive interval):")
-    metrics("ordinary kriging", ev, pred, ok_lo, ok_hi)
-    metrics("warped (Box-Cox)", ev, w_mean, w_lo, w_hi)
+    wb = warp("box-cox")
+    ws = warp("sinh-arcsinh")
+
+    print("Hold-out calibration (empirical coverage vs nominal; cal.err lower = better):")
+    report("ordinary kriging", ev, pred, gaussian_quantiles(pred, var))
+    report("warped Box-Cox", ev, wb["mean"], warp_quantiles(wb))
+    report("warped sinh-arcsinh", ev, ws["mean"], warp_quantiles(ws))
     print()
-    print("Reading: coverage closer to 80% is better-calibrated; 'neg.lower'")
-    print("is the fraction of lower bounds below 0 (impossible for a")
-    print("concentration) — the warp keeps every interval physically valid.")
+    print("cal.err = mean |empirical - nominal| over the four levels.")
+    print("neg = fraction of 80%-interval lower bounds below 0 (invalid for a")
+    print("concentration). The warps keep every interval positive.")
 
 
 if __name__ == "__main__":
