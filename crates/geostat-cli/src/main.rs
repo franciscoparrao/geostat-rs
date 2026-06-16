@@ -41,6 +41,8 @@ enum Command {
     Sis(SisCmd),
     /// Indicator kriging: local ccdf, E-type estimate and conditional variance
     Ik(IkCmd),
+    /// Transport (warped) kriging: learnable marginal warp + latent kriging
+    Tgp(TgpCmd),
 }
 
 #[derive(Args)]
@@ -414,6 +416,40 @@ struct IkCmd {
     output: PathBuf,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum WarpArg {
+    /// Box–Cox power transform (auto-fitted; positive or shiftable data)
+    BoxCox,
+    /// Yeo–Johnson power transform (auto-fitted; any-sign data)
+    YeoJohnson,
+    /// sinh–arcsinh transform (auto-fitted skew + tails)
+    SinhArcsinh,
+}
+
+#[derive(Args)]
+struct TgpCmd {
+    #[command(flatten)]
+    input: InputOpts,
+    /// Marginal transport family to fit
+    #[arg(long, value_enum, default_value_t = WarpArg::BoxCox)]
+    warp: WarpArg,
+    #[command(flatten)]
+    vario: VariogramOpts,
+    #[command(flatten)]
+    grid: GridOpts,
+    #[command(flatten)]
+    neighbors: NeighborOpts,
+    /// Monte Carlo samples per cell for the back-transform
+    #[arg(long, default_value_t = 2000)]
+    samples: usize,
+    /// Random seed
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+    /// Output CSV file (x,y,mean,std)
+    #[arg(short, long)]
+    output: PathBuf,
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Variogram(cmd) => run_variogram(cmd),
@@ -423,6 +459,81 @@ fn main() -> Result<()> {
         Command::Sgs(cmd) => run_sgs(cmd),
         Command::Sis(cmd) => run_sis(cmd),
         Command::Ik(cmd) => run_ik(cmd),
+        Command::Tgp(cmd) => run_tgp(cmd),
+    }
+}
+
+fn run_tgp(cmd: TgpCmd) -> Result<()> {
+    use geostat_core::{
+        FittedMarginal, MarginalTransport, TransportKriging, fit_box_cox, fit_sinh_arcsinh,
+        fit_yeo_johnson,
+    };
+
+    let data = cmd.input.read()?;
+    println!(
+        "Loaded {} points from {}",
+        data.len(),
+        cmd.input.input.display()
+    );
+
+    // Generic driver: fit the chosen marginal, fit the latent variogram on
+    // the warped data, then warped-krige the grid.
+    fn run<T: MarginalTransport + Sync>(
+        data: &PointSet,
+        marginal: FittedMarginal<T>,
+        cmd: &TgpCmd,
+    ) -> Result<()> {
+        let latent_vals: Vec<f64> = data
+            .values()
+            .iter()
+            .map(|&z| marginal.to_latent(z))
+            .collect();
+        let latent = PointSet::new(data.coords().to_vec(), latent_vals)?;
+        let cfg = cmd.vario.config(&latent);
+        let ev = experimental_variogram(&latent, &cfg)?;
+        let fit = fit_best(&ev, &ModelKind::ALL)?;
+        println!("Latent variogram: {}", fit.model);
+
+        let grid = cmd.grid.build(data)?;
+        let config = KrigingConfig {
+            method: KrigingMethod::Ordinary,
+            max_neighbors: cmd.neighbors.max_neighbors,
+            search_radius: cmd.neighbors.radius,
+        };
+        let tk = TransportKriging::new(data, marginal, &fit.model, config)?;
+        let (means, stds) = tk.predict_grid(&grid, cmd.samples, cmd.seed)?;
+        println!(
+            "Warped kriging on {} cells ({} x {}), {} MC samples/cell",
+            grid.n_cells(),
+            grid.nx,
+            grid.ny,
+            cmd.samples
+        );
+        io_utils::write_grid_csv(&cmd.output, &grid, &means, &stds)?;
+        println!("Output written to {}", cmd.output.display());
+        Ok(())
+    }
+
+    match cmd.warp {
+        WarpArg::BoxCox => {
+            let m = fit_box_cox(data.values())?;
+            println!("Fitted Box–Cox: lambda = {:.4}", m.transform().lambda);
+            run(&data, m, &cmd)
+        }
+        WarpArg::YeoJohnson => {
+            let m = fit_yeo_johnson(data.values())?;
+            println!("Fitted Yeo–Johnson: lambda = {:.4}", m.transform().lambda);
+            run(&data, m, &cmd)
+        }
+        WarpArg::SinhArcsinh => {
+            let m = fit_sinh_arcsinh(data.values())?;
+            println!(
+                "Fitted sinh–arcsinh: epsilon = {:.4}, delta = {:.4}",
+                m.transform().epsilon,
+                m.transform().delta
+            );
+            run(&data, m, &cmd)
+        }
     }
 }
 

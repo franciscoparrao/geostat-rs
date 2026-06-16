@@ -14,7 +14,7 @@ prediction out of the box.
 | `geostat-python` | Python module `geostat_rs` (PyO3, abi3 ≥ 3.9). Build with maturin. |
 | `geostat-wasm` | WebAssembly bindings (wasm-bindgen); demo in `examples/wasm-demo/`. |
 
-## Features (v0.5)
+## Features (v0.6)
 
 - **2-D and 3-D** — the engine is generic over dimension (`PointSet<2>` /
   `PointSet<3>`); variography, kriging, CV and SGS all run in 3-D through
@@ -36,6 +36,12 @@ prediction out of the box.
   moving neighborhoods; parallel over targets; variance maps.
 - **Validation** — leave-one-out cross-validation (ME, MAE, RMSE, MSDR),
   with or without external drift.
+- **Transport (warped) kriging** — Transport-GP-style kriging with a
+  learnable marginal transport map (Box–Cox, Yeo–Johnson, sinh–arcsinh,
+  fitted by maximum likelihood); latent-space kriging plus a Monte Carlo
+  back-transform yielding an unbiased E-type estimate, posterior std and
+  predictive quantiles. Generalizes the normal-score and lognormal
+  warpings; built for small, skewed samples (e.g. geochemistry).
 - **Simulation** — conditional sequential **Gaussian** simulation
   (normal-score transform) and sequential **indicator** simulation
   (GSLIB-style ccdf with order-relation corrections), both with a
@@ -163,8 +169,13 @@ are comparable across families.
   Block co-kriging matches gstat to machine precision; simple lognormal
   kriging matches gstat's SK back-transform to ~1e-9 (ordinary follows the
   Journel & Huijbregts formula).
+- v0.6: ✅ Transport (warped) kriging — learnable marginal transport maps
+  (the marginal core of Transport Gaussian Processes) on top of the kriging
+  engine. The Monte Carlo E-type estimate is anchored to the analytic
+  (gstat-validated) lognormal back-transform; exposed in the CLI (`tgp`)
+  and Python (`warped_kriging`).
 - Next: paper draft (Mathematical Geosciences); possible GeoPackage/raster
-  I/O for SurtGIS integration.
+  I/O for SurtGIS integration; richer transport maps (compositions, SVGD).
 
 ## Python quickstart
 

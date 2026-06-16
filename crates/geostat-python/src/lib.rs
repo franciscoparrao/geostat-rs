@@ -224,7 +224,9 @@ fn lognormal_kriging(
     radius: Option<f64>,
 ) -> PyResult<(Vec<f64>, Vec<f64>)> {
     if target_x.len() != target_y.len() {
-        return Err(PyValueError::new_err("target_x and target_y differ in length"));
+        return Err(PyValueError::new_err(
+            "target_x and target_y differ in length",
+        ));
     }
     let data = point_set(x, y, values)?;
     let kmethod = match method {
@@ -251,10 +253,7 @@ fn lognormal_kriging(
         .map(|(tx, ty)| [tx, ty])
         .collect();
     let ests = core::lognormal_kriging(&data, &targets, &log_model.inner, &config).map_err(err)?;
-    Ok(ests
-        .into_iter()
-        .map(|e| (e.value, e.log_variance))
-        .unzip())
+    Ok(ests.into_iter().map(|e| (e.value, e.log_variance)).unzip())
 }
 
 /// Kriging over a regular grid (`bbox = (xmin, ymin, xmax, ymax)`), row-major
@@ -584,6 +583,143 @@ fn indicator_kriging(
     Ok(out.into())
 }
 
+/// Transport (warped) kriging. Fits a learnable marginal warp to the data,
+/// kriges in the Gaussian latent space, and back-transforms by Monte Carlo.
+/// `warp` is "box-cox", "yeo-johnson" or "sinh-arcsinh". Returns a dict with
+/// `mean`, `std` (E-type estimate and posterior std per target) and, per
+/// target, `quantiles` (a list aligned with the `quantiles` argument).
+#[pyfunction]
+#[pyo3(signature = (x, y, values, target_x, target_y, warp = "box-cox",
+    quantiles = vec![0.1, 0.5, 0.9], n_lags = 15, max_dist = None,
+    max_neighbors = None, radius = None, n_samples = 2000, seed = 42))]
+#[allow(clippy::too_many_arguments)]
+fn warped_kriging(
+    py: Python<'_>,
+    x: Vec<f64>,
+    y: Vec<f64>,
+    values: Vec<f64>,
+    target_x: Vec<f64>,
+    target_y: Vec<f64>,
+    warp: &str,
+    quantiles: Vec<f64>,
+    n_lags: usize,
+    max_dist: Option<f64>,
+    max_neighbors: Option<usize>,
+    radius: Option<f64>,
+    n_samples: usize,
+    seed: u64,
+) -> PyResult<Py<PyDict>> {
+    use core::{
+        FittedMarginal, MarginalTransport, TransportKriging, fit_box_cox, fit_sinh_arcsinh,
+        fit_yeo_johnson,
+    };
+
+    if target_x.len() != target_y.len() {
+        return Err(PyValueError::new_err(
+            "target_x and target_y differ in length",
+        ));
+    }
+    let data = point_set(x, y, values)?;
+    let targets: Vec<[f64; 2]> = target_x
+        .iter()
+        .zip(&target_y)
+        .map(|(&tx, &ty)| [tx, ty])
+        .collect();
+
+    fn run<T: MarginalTransport + Sync>(
+        py: Python<'_>,
+        data: &PointSet,
+        marginal: FittedMarginal<T>,
+        targets: &[[f64; 2]],
+        quantiles: &[f64],
+        n_lags: usize,
+        max_dist: Option<f64>,
+        max_neighbors: Option<usize>,
+        radius: Option<f64>,
+        n_samples: usize,
+        seed: u64,
+    ) -> PyResult<Py<PyDict>> {
+        let latent_vals: Vec<f64> = data
+            .values()
+            .iter()
+            .map(|&z| marginal.to_latent(z))
+            .collect();
+        let latent = PointSet::new(data.coords().to_vec(), latent_vals).map_err(err)?;
+        let cfg = vario_config(&latent, n_lags, max_dist, None, 0.0, 22.5);
+        let ev = core::experimental_variogram(&latent, &cfg).map_err(err)?;
+        let model = core::fit_best(&ev, &core::ModelKind::ALL)
+            .map_err(err)?
+            .model;
+        let config = KrigingConfig {
+            method: KrigingMethod::Ordinary,
+            max_neighbors,
+            search_radius: radius,
+        };
+        let tk = TransportKriging::new(data, marginal, &model, config).map_err(err)?;
+        let mut means = Vec::with_capacity(targets.len());
+        let mut stds = Vec::with_capacity(targets.len());
+        let mut quants = Vec::with_capacity(targets.len());
+        for (i, &t) in targets.iter().enumerate() {
+            let e = tk
+                .predict(t, quantiles, n_samples, seed ^ (i as u64))
+                .map_err(err)?;
+            means.push(e.mean);
+            stds.push(e.std);
+            quants.push(e.quantiles);
+        }
+        let out = PyDict::new(py);
+        out.set_item("mean", means)?;
+        out.set_item("std", stds)?;
+        out.set_item("quantiles", quants)?;
+        Ok(out.into())
+    }
+
+    match warp {
+        "box-cox" => run(
+            py,
+            &data,
+            fit_box_cox(data.values()).map_err(err)?,
+            &targets,
+            &quantiles,
+            n_lags,
+            max_dist,
+            max_neighbors,
+            radius,
+            n_samples,
+            seed,
+        ),
+        "yeo-johnson" => run(
+            py,
+            &data,
+            fit_yeo_johnson(data.values()).map_err(err)?,
+            &targets,
+            &quantiles,
+            n_lags,
+            max_dist,
+            max_neighbors,
+            radius,
+            n_samples,
+            seed,
+        ),
+        "sinh-arcsinh" => run(
+            py,
+            &data,
+            fit_sinh_arcsinh(data.values()).map_err(err)?,
+            &targets,
+            &quantiles,
+            n_lags,
+            max_dist,
+            max_neighbors,
+            radius,
+            n_samples,
+            seed,
+        ),
+        other => Err(PyValueError::new_err(format!(
+            "unknown warp '{other}' (box-cox, yeo-johnson or sinh-arcsinh)"
+        ))),
+    }
+}
+
 #[pymodule]
 fn geostat_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<VariogramModel>()?;
@@ -599,6 +735,7 @@ fn geostat_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(krige_3d, m)?)?;
     m.add_function(wrap_pyfunction!(indicator_kriging, m)?)?;
     m.add_function(wrap_pyfunction!(lognormal_kriging, m)?)?;
+    m.add_function(wrap_pyfunction!(warped_kriging, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

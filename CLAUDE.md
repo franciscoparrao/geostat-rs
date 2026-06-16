@@ -1,6 +1,6 @@
 # geostat-rs — Motor de geoestadística en Rust ("GSLIB moderno")
 
-> **Estado:** v0.5 completa y **validada contra gstat** (2026-06-14).
+> **Estado:** v0.6 completa (2026-06-15). v0.5 y anteriores validadas contra gstat.
 > v0.1 (variografía/OK/UK/SK/CV/SGS) + v0.2 (co-kriging LMC, KED, SIS,
 > anisotropía, kd-tree, benches) + v0.3 (PyO3 bit-idéntico al CLI, WASM +
 > demo, block kriging) + v0.4 (core genérico 2-D/3-D, co-kriging heterotópico,
@@ -45,7 +45,14 @@ bindings modernos). No hay un motor geoestadístico Rust con WASM/Python.
       de Lagrange expuesto en `KrigingEstimate`); block co-kriging. Block
       co-kriging valida a 1e-14; lognormal SK a 1e-9 vs gstat (krigeTg usa un
       estimador GLS distinto — ver notas). Lognormal expuesto en PyO3.
-- [ ] (futuro) Draft paper; opcional GeoPackage/raster I/O para integrar SurtGIS.
+- [x] (v0.6) **Puente con TGPY**: kriging con transporte (warped kriging) — núcleo
+      marginal de Transport Gaussian Processes (Rios & Tobar). Transportes
+      marginales aprendibles (Box-Cox, Yeo-Johnson, sinh-arcsinh) ajustados por ML
+      (módulo `tgp`); kriging latente + back-transform Monte Carlo → E-type + std +
+      cuantiles. Anclado al lognormal analítico (gstat-validado) a <1%. CLI `tgp`,
+      Python `warped_kriging`. Nelder-Mead extraído a `optim`.
+- [ ] (futuro) Draft paper; transportes compuestos/SVGD; GeoPackage I/O para SurtGIS;
+      aplicar warped kriging a los datos de relaves de TGPY (Dulcinea, El Mauro).
 
 ## Arquitectura tentativa
 - `geostat-core`: variograma, sistemas de kriging, RNG determinista.
