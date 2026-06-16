@@ -26,13 +26,13 @@ import pandas as pd
 import geostat_rs as gs
 
 TGPY = Path.home() / "proyectos" / "TGPY" / "Python"
-ELEMENT = "La(g/t)"
+ELEMENTS = ["La(g/t)", "Ce(g/t)", "Nd(g/t)", "Y(g/t)"]
 REGION = "COQUIMBO"
 TEST_FRACTION = 0.25
 SEED = 20260616
 
 
-def load():
+def load(element):
     d = pd.read_pickle(TGPY / "tierras_raras.pkl")
 
     def clean(col):
@@ -42,7 +42,7 @@ def load():
 
     df = pd.DataFrame(
         {"x": clean("Coord. E"), "y": clean("Coord. N"),
-         "v": clean(ELEMENT), "region": d["Region"]}
+         "v": clean(element), "region": d["Region"]}
     )
     df = df[(df.x > 0) & (df.y > 0) & (df.v > 0)].dropna()
     df = df[df.region == REGION]
@@ -118,24 +118,22 @@ def warp_quantiles(w):
 PROBS = [0.05, 0.10, 0.15, 0.25, 0.75, 0.85, 0.90, 0.95]
 
 
-def main():
-    df = load()
-    print(f"geostat_rs {gs.__version__}")
-    print(f"{ELEMENT} in {REGION}: {len(df)} samples")
+def run_element(element):
+    df = load(element)
     v = sorted(df.v)
     sk = (sum((a - st.mean(v)) ** 3 for a in v) / len(v)) / st.pstdev(v) ** 3
-    print(f"  min={v[0]:.1f}  median={v[len(v)//2]:.1f}  max={v[-1]:.1f}  skew={sk:.1f}")
-
     train, test = split(df)
     tx, ty, tv = train.x.tolist(), train.y.tolist(), train.v.tolist()
     ex, ey, ev = test.x.tolist(), test.y.tolist(), test.v.tolist()
-    print(f"  train={len(tx)}  test={len(ex)}  (max_neighbors=24)\n")
+    print(
+        f"{element} in {REGION}: {len(df)} deposits  "
+        f"(median={v[len(v)//2]:.1f}, max={v[-1]:.0f}, skew={sk:.1f}; "
+        f"train={len(tx)}, test={len(ex)})"
+    )
 
-    # 1. Plain ordinary kriging on raw La (Gaussian predictive).
     model = gs.fit_variogram(tx, ty, tv, n_lags=12)
     pred, var = gs.krige(tx, ty, tv, model, ex, ey, method="ordinary", max_neighbors=24)
 
-    # 2/3. Warped kriging, Box-Cox vs sinh-arcsinh marginals.
     def warp(kind):
         return gs.warped_kriging(
             tx, ty, tv, ex, ey,
@@ -145,15 +143,20 @@ def main():
 
     wb = warp("box-cox")
     ws = warp("sinh-arcsinh")
-
-    print("Hold-out calibration (empirical coverage vs nominal; cal.err lower = better):")
     report("ordinary kriging", ev, pred, gaussian_quantiles(pred, var))
     report("warped Box-Cox", ev, wb["mean"], warp_quantiles(wb))
     report("warped sinh-arcsinh", ev, ws["mean"], warp_quantiles(ws))
     print()
+
+
+def main():
+    print(f"geostat_rs {gs.__version__}")
+    print("Hold-out interval calibration vs nominal coverage; cal.err lower = better.\n")
+    for element in ELEMENTS:
+        run_element(element)
     print("cal.err = mean |empirical - nominal| over the four levels.")
     print("neg = fraction of 80%-interval lower bounds below 0 (invalid for a")
-    print("concentration). The warps keep every interval positive.")
+    print("concentration); the warps keep every interval positive.")
 
 
 if __name__ == "__main__":
