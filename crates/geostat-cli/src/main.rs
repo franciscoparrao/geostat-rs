@@ -45,6 +45,8 @@ enum Command {
     Tgp(TgpCmd),
     /// Regression kriging: OLS trend on covariates + kriging of residuals
     Rk(RkCmd),
+    /// Compare interpolation methods by leave-one-out VEcv (OK, IDW, k-NN, NN)
+    Compare(CompareCmd),
 }
 
 #[derive(Args)]
@@ -471,7 +473,84 @@ fn main() -> Result<()> {
         Command::Ik(cmd) => run_ik(cmd),
         Command::Tgp(cmd) => run_tgp(cmd),
         Command::Rk(cmd) => run_rk(cmd),
+        Command::Compare(cmd) => run_compare(cmd),
     }
+}
+
+#[derive(Args)]
+struct CompareCmd {
+    #[command(flatten)]
+    input: InputOpts,
+    #[command(flatten)]
+    vario: VariogramOpts,
+    #[command(flatten)]
+    neighbors: NeighborOpts,
+    /// IDW power
+    #[arg(long, default_value_t = 2.0)]
+    idw_power: f64,
+    /// k for k-nearest-neighbor averaging
+    #[arg(long, default_value_t = 8)]
+    knn_k: usize,
+}
+
+fn run_compare(cmd: CompareCmd) -> Result<()> {
+    use geostat_core::{idw_cross_validate, knn_cross_validate};
+
+    let data = cmd.input.read()?;
+    println!(
+        "Loaded {} points; comparing methods by leave-one-out",
+        data.len()
+    );
+
+    // Ordinary kriging with an automatically fitted variogram.
+    let cfg = cmd.vario.config(&data);
+    let ev = experimental_variogram(&data, &cfg)?;
+    let model = fit_best(&ev, &ModelKind::ALL)?.model;
+    println!("  fitted variogram (for OK): {model}");
+    let ok_config = KrigingConfig {
+        method: KrigingMethod::Ordinary,
+        max_neighbors: cmd.neighbors.max_neighbors,
+        search_radius: cmd.neighbors.radius,
+    };
+
+    let mn = cmd.neighbors.max_neighbors;
+    let rad = cmd.neighbors.radius;
+    let mut results = vec![
+        (
+            "ordinary kriging".to_string(),
+            leave_one_out(&data, &model, &ok_config)?,
+        ),
+        (
+            format!("IDW (power {})", cmd.idw_power),
+            idw_cross_validate(&data, cmd.idw_power, mn, rad)?,
+        ),
+        (
+            format!("k-NN (k={})", cmd.knn_k),
+            knn_cross_validate(&data, cmd.knn_k, rad)?,
+        ),
+        (
+            "nearest neighbor".to_string(),
+            knn_cross_validate(&data, 1, rad)?,
+        ),
+    ];
+    // Rank by VEcv (higher is better).
+    results.sort_by(|a, b| b.1.vecv().total_cmp(&a.1.vecv()));
+
+    println!(
+        "\n  {:<22}{:>8}{:>8}{:>10}{:>9}",
+        "method (ranked)", "RMSE", "MAE", "VEcv %", "E1 %"
+    );
+    for (name, cv) in &results {
+        println!(
+            "  {name:<22}{:>8.4}{:>8.4}{:>10.2}{:>9.2}",
+            cv.rmse(),
+            cv.mae(),
+            cv.vecv(),
+            cv.e1()
+        );
+    }
+    println!("\nVEcv = variance explained by cross-validation (Li 2016); higher is better.");
+    Ok(())
 }
 
 #[derive(Args)]

@@ -421,6 +421,127 @@ fn regression_kriging(
     Ok(out.into())
 }
 
+/// Inverse-distance weighting at the targets. `power` controls locality
+/// (2 is typical); exact at the data. Returns a list of predictions.
+#[pyfunction]
+#[pyo3(signature = (x, y, values, target_x, target_y, power = 2.0,
+    max_neighbors = None, radius = None))]
+#[allow(clippy::too_many_arguments)]
+fn idw(
+    x: Vec<f64>,
+    y: Vec<f64>,
+    values: Vec<f64>,
+    target_x: Vec<f64>,
+    target_y: Vec<f64>,
+    power: f64,
+    max_neighbors: Option<usize>,
+    radius: Option<f64>,
+) -> PyResult<Vec<f64>> {
+    if target_x.len() != target_y.len() {
+        return Err(PyValueError::new_err(
+            "target_x and target_y differ in length",
+        ));
+    }
+    let data = point_set(x, y, values)?;
+    let targets: Vec<[f64; 2]> = target_x
+        .iter()
+        .zip(&target_y)
+        .map(|(&a, &b)| [a, b])
+        .collect();
+    let pred = core::Idw::new(&data, power, max_neighbors, radius).map_err(err)?;
+    Ok(pred.predict_many(&targets))
+}
+
+/// k-nearest-neighbor averaging at the targets (`k = 1` is nearest-neighbor).
+/// Returns a list of predictions.
+#[pyfunction]
+#[pyo3(signature = (x, y, values, target_x, target_y, k = 8, radius = None))]
+fn knn(
+    x: Vec<f64>,
+    y: Vec<f64>,
+    values: Vec<f64>,
+    target_x: Vec<f64>,
+    target_y: Vec<f64>,
+    k: usize,
+    radius: Option<f64>,
+) -> PyResult<Vec<f64>> {
+    if target_x.len() != target_y.len() {
+        return Err(PyValueError::new_err(
+            "target_x and target_y differ in length",
+        ));
+    }
+    let data = point_set(x, y, values)?;
+    let targets: Vec<[f64; 2]> = target_x
+        .iter()
+        .zip(&target_y)
+        .map(|(&a, &b)| [a, b])
+        .collect();
+    let pred = core::Knn::new(&data, k, radius).map_err(err)?;
+    Ok(pred.predict_many(&targets))
+}
+
+/// Compares interpolation methods by leave-one-out cross-validation, ranked by
+/// VEcv. Fits the variogram automatically for ordinary kriging. Returns a dict
+/// `method -> {rmse, mae, vecv, e1}` for ordinary kriging, IDW, k-NN and NN.
+#[pyfunction]
+#[pyo3(signature = (x, y, values, n_lags = 15, max_dist = None,
+    max_neighbors = None, radius = None, idw_power = 2.0, knn_k = 8))]
+#[allow(clippy::too_many_arguments)]
+fn compare_methods(
+    py: Python<'_>,
+    x: Vec<f64>,
+    y: Vec<f64>,
+    values: Vec<f64>,
+    n_lags: usize,
+    max_dist: Option<f64>,
+    max_neighbors: Option<usize>,
+    radius: Option<f64>,
+    idw_power: f64,
+    knn_k: usize,
+) -> PyResult<Py<PyDict>> {
+    let data = point_set(x, y, values)?;
+    let cfg = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
+    let ev = core::experimental_variogram(&data, &cfg).map_err(err)?;
+    let model = core::fit_best(&ev, &core::ModelKind::ALL)
+        .map_err(err)?
+        .model;
+    let ok_config = KrigingConfig {
+        method: KrigingMethod::Ordinary,
+        max_neighbors,
+        search_radius: radius,
+    };
+
+    let entries = [
+        (
+            "ordinary_kriging".to_string(),
+            core::leave_one_out(&data, &model, &ok_config).map_err(err)?,
+        ),
+        (
+            "idw".to_string(),
+            core::idw_cross_validate(&data, idw_power, max_neighbors, radius).map_err(err)?,
+        ),
+        (
+            "knn".to_string(),
+            core::knn_cross_validate(&data, knn_k, radius).map_err(err)?,
+        ),
+        (
+            "nearest_neighbor".to_string(),
+            core::knn_cross_validate(&data, 1, radius).map_err(err)?,
+        ),
+    ];
+
+    let out = PyDict::new(py);
+    for (name, cv) in &entries {
+        let m = PyDict::new(py);
+        m.set_item("rmse", cv.rmse())?;
+        m.set_item("mae", cv.mae())?;
+        m.set_item("vecv", cv.vecv())?;
+        m.set_item("e1", cv.e1())?;
+        out.set_item(name, m)?;
+    }
+    Ok(out.into())
+}
+
 /// Conditional sequential Gaussian simulation. `model_ns` is a model fitted
 /// to the normal scores (fit one with `fit_variogram` on transformed data,
 /// or let the CLI auto-fit). Returns one list per realization, in grid
@@ -880,6 +1001,9 @@ fn geostat_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(krige_grid, m)?)?;
     m.add_function(wrap_pyfunction!(loo_cv, m)?)?;
     m.add_function(wrap_pyfunction!(regression_kriging, m)?)?;
+    m.add_function(wrap_pyfunction!(idw, m)?)?;
+    m.add_function(wrap_pyfunction!(knn, m)?)?;
+    m.add_function(wrap_pyfunction!(compare_methods, m)?)?;
     m.add_function(wrap_pyfunction!(sgs, m)?)?;
     m.add_function(wrap_pyfunction!(sis, m)?)?;
     m.add_function(wrap_pyfunction!(experimental_variogram_3d, m)?)?;

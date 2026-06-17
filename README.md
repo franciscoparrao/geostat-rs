@@ -36,6 +36,13 @@ prediction out of the box.
   **regression kriging** (a trend fitted separately — built-in OLS or any
   external/ML model — plus kriging of its residuals); kd-tree moving
   neighborhoods; parallel over targets; variance maps.
+- **Mathematical interpolators** — inverse-distance weighting and
+  k-nearest-neighbor averaging (k = 1 is nearest-neighbor / Voronoi), as
+  assumption-light baselines for fair method comparison.
+- **Method comparison** — a leave-one-out harness that ranks ordinary
+  kriging, IDW, k-NN and NN by VEcv on the same data (`geostat compare` /
+  `compare_methods`), in the spirit of Li (2021): no method dominates, so
+  compare by predictive accuracy.
 - **Validation** — leave-one-out cross-validation with error measures
   (ME, MAE, MSE, RMSE, MSDR), scale-free relative measures (RME, RMAE,
   RRMSE) and predictive-accuracy measures **VEcv** (variance explained by
@@ -117,6 +124,9 @@ geostat cokrige -i primary.csv --value-col lzinc --secondary-col llead \
 #     (residual variogram fitted automatically; targets carry the covariates)
 geostat rk -i meuse.csv --value-col lzinc --covar-cols sdist \
     --targets grid_with_sdist.csv -o rk.csv
+
+# 12. Compare methods (OK / IDW / k-NN / NN) by leave-one-out VEcv
+geostat compare -i meuse.csv --value-col zinc --max-neighbors 32 --knn-k 8
 ```
 
 Other useful flags: `--azimuth/--dip/--tolerance` (directional variograms,
@@ -231,6 +241,11 @@ ik["ccdf"], ik["e_type"], ik["cond_var"]
 # (Or pass trend_at_data / trend_at_targets from any external/ML model.)
 rk = gs.regression_kriging(x, y, vals, covars, tx, ty, target_covars)
 rk["prediction"], rk["variance"], rk["trend_coef"]
+
+# Baselines + method comparison by leave-one-out VEcv.
+idw_pred = gs.idw(x, y, vals, tx, ty, power=2.0, max_neighbors=16)
+ranking = gs.compare_methods(x, y, vals, max_neighbors=32, knn_k=8)
+# {"ordinary_kriging": {"rmse":..., "vecv":...}, "idw": {...}, ...}
 ```
 
 ## License
