@@ -32,8 +32,10 @@ prediction out of the box.
   **heterotopic**) under a linear model of coregionalization; **block
   kriging** and **block co-kriging** with explicit discretization;
   **lognormal kriging** (unbiased back-transform); standalone **indicator
-  kriging** (local ccdf, E-type estimate, conditional variance); kd-tree
-  moving neighborhoods; parallel over targets; variance maps.
+  kriging** (local ccdf, E-type estimate, conditional variance);
+  **regression kriging** (a trend fitted separately — built-in OLS or any
+  external/ML model — plus kriging of its residuals); kd-tree moving
+  neighborhoods; parallel over targets; variance maps.
 - **Validation** — leave-one-out cross-validation with error measures
   (ME, MAE, MSE, RMSE, MSDR), scale-free relative measures (RME, RMAE,
   RRMSE) and predictive-accuracy measures **VEcv** (variance explained by
@@ -110,6 +112,11 @@ geostat krige -i drillholes.csv --z-col z --value-col grade -m model3d.json \
 geostat cokrige -i primary.csv --value-col lzinc --secondary-col llead \
     --secondary-input secondary.csv --lmc lmc.json \
     --nx 100 --ny 100 -o cokriged.csv
+
+# 11. Regression kriging: OLS trend on covariates + kriging of residuals
+#     (residual variogram fitted automatically; targets carry the covariates)
+geostat rk -i meuse.csv --value-col lzinc --covar-cols sdist \
+    --targets grid_with_sdist.csv -o rk.csv
 ```
 
 Other useful flags: `--azimuth/--dip/--tolerance` (directional variograms,
@@ -183,8 +190,14 @@ are comparable across families.
   and Python (`warped_kriging`). Automatic transport-family selection by
   AIC (with an identity baseline) and an optional non-negativity floor for
   bounded quantities.
-- Next: paper draft (Mathematical Geosciences); possible GeoPackage/raster
-  I/O for SurtGIS integration; richer transport maps (compositions, SVGD).
+- Post-v0.6: ✅ automatic transport-family selection (AIC) + non-negativity
+  floor; ✅ VEcv/E₁ and relative error measures in cross-validation
+  (parity with Li's spm::pred.acc); ✅ regression kriging (separate trend
+  + residual kriging), the bridge to an ML trend engine.
+- Next: paper draft (Mathematical Geosciences); ML+geostatistics hybrids
+  (ML trend via Smelt + residual/transport kriging here); possible
+  GeoPackage/raster I/O for SurtGIS integration; richer transport maps
+  (compositions, SVGD).
 
 ## Python quickstart
 
@@ -210,6 +223,11 @@ pred, var = gs.krige_3d(x, y, z, grade, m3, bx, by, bz, max_neighbors=24)
 # Indicator kriging → local ccdf + E-type estimate
 ik = gs.indicator_kriging(x, y, vals, cutoffs, tx, ty)
 ik["ccdf"], ik["e_type"], ik["cond_var"]
+
+# Regression kriging: OLS trend on covariates + residual kriging.
+# (Or pass trend_at_data / trend_at_targets from any external/ML model.)
+rk = gs.regression_kriging(x, y, vals, covars, tx, ty, target_covars)
+rk["prediction"], rk["variance"], rk["trend_coef"]
 ```
 
 ## License

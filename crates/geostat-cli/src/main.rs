@@ -43,6 +43,8 @@ enum Command {
     Ik(IkCmd),
     /// Transport (warped) kriging: learnable marginal warp + latent kriging
     Tgp(TgpCmd),
+    /// Regression kriging: OLS trend on covariates + kriging of residuals
+    Rk(RkCmd),
 }
 
 #[derive(Args)]
@@ -468,7 +470,84 @@ fn main() -> Result<()> {
         Command::Sis(cmd) => run_sis(cmd),
         Command::Ik(cmd) => run_ik(cmd),
         Command::Tgp(cmd) => run_tgp(cmd),
+        Command::Rk(cmd) => run_rk(cmd),
     }
+}
+
+#[derive(Args)]
+struct RkCmd {
+    #[command(flatten)]
+    input: InputOpts,
+    /// Covariate columns for the OLS trend (comma-separated)
+    #[arg(long)]
+    covar_cols: String,
+    /// Targets CSV with x, y and the same covariate columns
+    #[arg(long)]
+    targets: PathBuf,
+    #[command(flatten)]
+    vario: VariogramOpts,
+    #[command(flatten)]
+    neighbors: NeighborOpts,
+    /// Output CSV file (x, y, prediction, variance)
+    #[arg(short, long)]
+    output: PathBuf,
+}
+
+fn run_rk(cmd: RkCmd) -> Result<()> {
+    use geostat_core::{OlsTrend, RegressionKriging};
+
+    let covar_cols: Vec<String> = cmd
+        .covar_cols
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .collect();
+
+    // 1. Fit the OLS trend on the data covariates.
+    let (data, covars) = cmd.input.read_with_extras(&covar_cols)?;
+    let trend = OlsTrend::fit(&covars, data.values())?;
+    let trend_at_data: Vec<f64> = covars.iter().map(|c| trend.predict(c)).collect();
+    println!(
+        "Loaded {} points; OLS trend on [{}]",
+        data.len(),
+        covar_cols.join(", ")
+    );
+    let coefs = trend.coefficients();
+    print!("  trend = {:.4}", coefs[0]);
+    for (name, b) in covar_cols.iter().zip(&coefs[1..]) {
+        print!(" + {b:.4}*{name}");
+    }
+    println!();
+
+    // 2. Fit the residual variogram on z - m.
+    let rk = RegressionKriging::new(&data, &trend_at_data)?;
+    let cfg = cmd.vario.config(rk.residuals());
+    let ev = experimental_variogram(rk.residuals(), &cfg)?;
+    let resid_model = fit_best(&ev, &ModelKind::ALL)?.model;
+    println!("  residual variogram: {resid_model}");
+
+    // 3. Regression-krige the targets (trend + kriged residual).
+    let (coords, target_covars) = io_utils::read_targets(
+        &cmd.targets,
+        &cmd.input.x_col,
+        &cmd.input.y_col,
+        &covar_cols,
+    )?;
+    let trend_at_targets: Vec<f64> = target_covars.iter().map(|c| trend.predict(c)).collect();
+    let config = KrigingConfig {
+        method: KrigingMethod::Ordinary,
+        max_neighbors: cmd.neighbors.max_neighbors,
+        search_radius: cmd.neighbors.radius,
+    };
+    let ests = rk.predict(&coords, &trend_at_targets, &resid_model, &config)?;
+    let n_nan = ests.iter().filter(|e| e.value.is_nan()).count();
+    println!(
+        "Regression-kriged {} targets; {} failed",
+        coords.len(),
+        n_nan
+    );
+    io_utils::write_estimates_csv(&cmd.output, &coords, &ests)?;
+    println!("Output written to {}", cmd.output.display());
+    Ok(())
 }
 
 fn run_tgp(cmd: TgpCmd) -> Result<()> {

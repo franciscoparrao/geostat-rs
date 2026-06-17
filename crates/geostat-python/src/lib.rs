@@ -335,6 +335,92 @@ fn loo_cv(
     Ok(out.into())
 }
 
+/// Regression kriging: fits an OLS trend on `covariates` (a list of rows, one
+/// per data point), fits the residual variogram automatically, and kriges the
+/// residuals at the targets, adding the trend back. `target_covariates` is a
+/// list of rows, one per target, with the same columns as `covariates`.
+///
+/// To use a trend from an external model (e.g. a machine-learning regressor),
+/// supply `trend_at_data` and `trend_at_targets` directly; then `covariates`
+/// and `target_covariates` are ignored for the trend (the residual variogram
+/// is still fitted internally).
+///
+/// Returns a dict with `prediction`, `variance` (residual kriging variance),
+/// and, when the built-in OLS trend is used, `trend_coef` (intercept first).
+#[pyfunction]
+#[pyo3(signature = (x, y, values, covariates, target_x, target_y, target_covariates,
+    trend_at_data = None, trend_at_targets = None,
+    n_lags = 15, max_dist = None, max_neighbors = None, radius = None))]
+#[allow(clippy::too_many_arguments)]
+fn regression_kriging(
+    py: Python<'_>,
+    x: Vec<f64>,
+    y: Vec<f64>,
+    values: Vec<f64>,
+    covariates: Vec<Vec<f64>>,
+    target_x: Vec<f64>,
+    target_y: Vec<f64>,
+    target_covariates: Vec<Vec<f64>>,
+    trend_at_data: Option<Vec<f64>>,
+    trend_at_targets: Option<Vec<f64>>,
+    n_lags: usize,
+    max_dist: Option<f64>,
+    max_neighbors: Option<usize>,
+    radius: Option<f64>,
+) -> PyResult<Py<PyDict>> {
+    use core::{OlsTrend, RegressionKriging};
+
+    if target_x.len() != target_y.len() {
+        return Err(PyValueError::new_err(
+            "target_x and target_y differ in length",
+        ));
+    }
+    let data = point_set(x, y, values)?;
+    let targets: Vec<[f64; 2]> = target_x
+        .iter()
+        .zip(&target_y)
+        .map(|(&tx, &ty)| [tx, ty])
+        .collect();
+
+    // Trend: either supplied externally or fitted by built-in OLS.
+    let out = PyDict::new(py);
+    let (trend_data, trend_targets) = match (trend_at_data, trend_at_targets) {
+        (Some(td), Some(tt)) => (td, tt),
+        (None, None) => {
+            let trend = OlsTrend::fit(&covariates, data.values()).map_err(err)?;
+            let td: Vec<f64> = covariates.iter().map(|c| trend.predict(c)).collect();
+            let tt: Vec<f64> = target_covariates.iter().map(|c| trend.predict(c)).collect();
+            out.set_item("trend_coef", trend.coefficients())?;
+            (td, tt)
+        }
+        _ => {
+            return Err(PyValueError::new_err(
+                "supply both trend_at_data and trend_at_targets, or neither",
+            ));
+        }
+    };
+
+    let rk = RegressionKriging::new(&data, &trend_data).map_err(err)?;
+    let cfg = vario_config(rk.residuals(), n_lags, max_dist, None, 0.0, 22.5);
+    let ev = core::experimental_variogram(rk.residuals(), &cfg).map_err(err)?;
+    let resid_model = core::fit_best(&ev, &core::ModelKind::ALL)
+        .map_err(err)?
+        .model;
+    let config = KrigingConfig {
+        method: KrigingMethod::Ordinary,
+        max_neighbors,
+        search_radius: radius,
+    };
+    let ests = rk
+        .predict(&targets, &trend_targets, &resid_model, &config)
+        .map_err(err)?;
+    let prediction: Vec<f64> = ests.iter().map(|e| e.value).collect();
+    let variance: Vec<f64> = ests.iter().map(|e| e.variance).collect();
+    out.set_item("prediction", prediction)?;
+    out.set_item("variance", variance)?;
+    Ok(out.into())
+}
+
 /// Conditional sequential Gaussian simulation. `model_ns` is a model fitted
 /// to the normal scores (fit one with `fit_variogram` on transformed data,
 /// or let the CLI auto-fit). Returns one list per realization, in grid
@@ -793,6 +879,7 @@ fn geostat_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(krige, m)?)?;
     m.add_function(wrap_pyfunction!(krige_grid, m)?)?;
     m.add_function(wrap_pyfunction!(loo_cv, m)?)?;
+    m.add_function(wrap_pyfunction!(regression_kriging, m)?)?;
     m.add_function(wrap_pyfunction!(sgs, m)?)?;
     m.add_function(wrap_pyfunction!(sis, m)?)?;
     m.add_function(wrap_pyfunction!(experimental_variogram_3d, m)?)?;

@@ -52,6 +52,7 @@ pub mod kriging;
 pub mod linalg;
 mod optim;
 mod parallel;
+pub mod regression;
 pub mod rng;
 mod search;
 pub mod simulation;
@@ -68,6 +69,7 @@ pub use error::{GeostatError, Result};
 pub use grid::{Grid2D, Grid3D};
 pub use ik::{CcdfEstimate, IkConfig, indicator_kriging};
 pub use kriging::{Kriging, KrigingConfig, KrigingEstimate, KrigingMethod, block_offsets};
+pub use regression::{OlsTrend, RegressionKriging};
 pub use rng::Rng;
 pub use simulation::{
     SgsConfig, SgsResult, sequential_gaussian_simulation, sequential_gaussian_simulation_3d, sgs_at,
