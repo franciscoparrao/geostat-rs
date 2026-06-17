@@ -322,8 +322,14 @@ fn loo_cv(
     let out = PyDict::new(py);
     out.set_item("me", cv.mean_error())?;
     out.set_item("mae", cv.mae())?;
+    out.set_item("mse", cv.mse())?;
     out.set_item("rmse", cv.rmse())?;
     out.set_item("msdr", cv.msdr())?;
+    out.set_item("rme", cv.rme())?;
+    out.set_item("rmae", cv.rmae())?;
+    out.set_item("rrmse", cv.rrmse())?;
+    out.set_item("vecv", cv.vecv())?;
+    out.set_item("e1", cv.e1())?;
     out.set_item("predicted", &cv.predicted)?;
     out.set_item("variance", &cv.variance)?;
     Ok(out.into())

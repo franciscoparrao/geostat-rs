@@ -867,6 +867,22 @@ fn run_cokrige(cmd: CokrigeCmd) -> Result<()> {
     Ok(())
 }
 
+/// Prints the leave-one-out cross-validation report: error measures plus the
+/// scale-free relative measures and the predictive-accuracy measures VEcv and
+/// E₁ (Li 2016, 2017).
+fn print_cv_report(cv: &geostat_core::CvResult, n: usize) {
+    println!("\nLeave-one-out cross-validation ({n} points):");
+    println!("  Mean error (bias): {:>12.6}", cv.mean_error());
+    println!("  MAE:               {:>12.6}", cv.mae());
+    println!("  RMSE:              {:>12.6}", cv.rmse());
+    println!("  MSDR (ideal ~1):   {:>12.6}", cv.msdr());
+    println!("  RME  (%):          {:>12.4}", cv.rme());
+    println!("  RMAE (%):          {:>12.4}", cv.rmae());
+    println!("  RRMSE (%):         {:>12.4}", cv.rrmse());
+    println!("  VEcv (%, ideal 100): {:>10.4}", cv.vecv());
+    println!("  E1   (%, ideal 100): {:>10.4}", cv.e1());
+}
+
 fn run_cv(cmd: CvCmd) -> Result<()> {
     let model = io_utils::read_model(&cmd.model)?;
 
@@ -882,11 +898,7 @@ fn run_cv(cmd: CvCmd) -> Result<()> {
             search_radius: cmd.neighbors.radius,
         };
         let cv = leave_one_out(&data, &model, &config)?;
-        println!("\nLeave-one-out cross-validation ({} points):", data.len());
-        println!("  Mean error (bias): {:>12.6}", cv.mean_error());
-        println!("  MAE:               {:>12.6}", cv.mae());
-        println!("  RMSE:              {:>12.6}", cv.rmse());
-        println!("  MSDR (ideal ~1):   {:>12.6}", cv.msdr());
+        print_cv_report(&cv, data.len());
         if cmd.output.is_some() {
             bail!("--output is not supported in 3-D mode yet");
         }
@@ -925,11 +937,7 @@ fn run_cv(cmd: CvCmd) -> Result<()> {
         (data, cv)
     };
 
-    println!("\nLeave-one-out cross-validation ({} points):", data.len());
-    println!("  Mean error (bias): {:>12.6}", cv.mean_error());
-    println!("  MAE:               {:>12.6}", cv.mae());
-    println!("  RMSE:              {:>12.6}", cv.rmse());
-    println!("  MSDR (ideal ~1):   {:>12.6}", cv.msdr());
+    print_cv_report(&cv, data.len());
 
     if let Some(path) = &cmd.output {
         io_utils::write_cv_csv(path, &data, &cv)?;

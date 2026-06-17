@@ -29,9 +29,78 @@ impl CvResult {
         self.residuals().map(f64::abs).sum::<f64>() / self.observed.len() as f64
     }
 
+    /// Mean squared error.
+    pub fn mse(&self) -> f64 {
+        self.residuals().map(|e| e * e).sum::<f64>() / self.observed.len() as f64
+    }
+
     /// Root mean squared error.
     pub fn rmse(&self) -> f64 {
-        (self.residuals().map(|e| e * e).sum::<f64>() / self.observed.len() as f64).sqrt()
+        self.mse().sqrt()
+    }
+
+    /// Mean of the observed values (denominator of the relative measures).
+    fn obs_mean(&self) -> f64 {
+        self.observed.iter().sum::<f64>() / self.observed.len() as f64
+    }
+
+    /// Relative mean error `mean(o - p) / mean(o) * 100` (%). Scale-free bias.
+    /// Returns NaN if the observed mean is ~0 (relative measures are undefined
+    /// there — Li 2017).
+    pub fn rme(&self) -> f64 {
+        let m = self.obs_mean();
+        if m.abs() < f64::EPSILON {
+            return f64::NAN;
+        }
+        (-self.mean_error()) / m * 100.0
+    }
+
+    /// Relative mean absolute error `MAE / mean(o) * 100` (%).
+    pub fn rmae(&self) -> f64 {
+        let m = self.obs_mean();
+        if m.abs() < f64::EPSILON {
+            return f64::NAN;
+        }
+        self.mae() / m * 100.0
+    }
+
+    /// Relative RMSE `RMSE / mean(o) * 100` (%).
+    pub fn rrmse(&self) -> f64 {
+        let m = self.obs_mean();
+        if m.abs() < f64::EPSILON {
+            return f64::NAN;
+        }
+        self.rmse() / m * 100.0
+    }
+
+    /// Variance explained by cross-validation (Li 2016), in percent:
+    /// `VEcv = (1 - sum((o - p)^2) / sum((o - mean(o))^2)) * 100`.
+    ///
+    /// A cross-validated, scale- and variance-independent R²: 100 = perfect,
+    /// 0 = no better than predicting the mean, negative = worse than the mean.
+    /// This is the predictive-accuracy measure recommended over r/r², which
+    /// must not be used for predictive accuracy (Li 2017).
+    pub fn vecv(&self) -> f64 {
+        let m = self.obs_mean();
+        let sse = self.residuals().map(|e| e * e).sum::<f64>();
+        let sst = self.observed.iter().map(|&o| (o - m).powi(2)).sum::<f64>();
+        if sst <= 0.0 {
+            return f64::NAN;
+        }
+        (1.0 - sse / sst) * 100.0
+    }
+
+    /// Legates and McCabe's efficiency (E₁), in percent:
+    /// `E1 = (1 - sum(|o - p|) / sum(|o - mean(o)|)) * 100`. Like VEcv but on
+    /// absolute (rather than squared) deviations, so less tail-sensitive.
+    pub fn e1(&self) -> f64 {
+        let m = self.obs_mean();
+        let sae = self.residuals().map(f64::abs).sum::<f64>();
+        let sad = self.observed.iter().map(|&o| (o - m).abs()).sum::<f64>();
+        if sad <= 0.0 {
+            return f64::NAN;
+        }
+        (1.0 - sae / sad) * 100.0
     }
 
     /// Mean squared deviation ratio `mean(e^2 / sigma^2)`; ideally ~1.
@@ -163,6 +232,50 @@ mod tests {
         assert!(cv.mean_error().abs() < 0.1);
         assert!(cv.mae() <= cv.rmse());
         assert!(cv.msdr().is_finite());
+    }
+
+    #[test]
+    fn vecv_and_e1_anchor_points() {
+        let observed = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let mean = 3.0;
+
+        // Perfect predictor: VEcv = E1 = 100, relative errors = 0.
+        let perfect = CvResult {
+            observed: observed.clone(),
+            predicted: observed.clone(),
+            variance: vec![1.0; observed.len()],
+        };
+        assert!((perfect.vecv() - 100.0).abs() < 1e-12);
+        assert!((perfect.e1() - 100.0).abs() < 1e-12);
+        assert!(perfect.rrmse().abs() < 1e-12);
+
+        // Mean predictor: no skill over the mean, so VEcv = E1 = 0.
+        let mean_pred = CvResult {
+            observed: observed.clone(),
+            predicted: vec![mean; observed.len()],
+            variance: vec![1.0; observed.len()],
+        };
+        assert!(mean_pred.vecv().abs() < 1e-9, "vecv {}", mean_pred.vecv());
+        assert!(mean_pred.e1().abs() < 1e-9, "e1 {}", mean_pred.e1());
+
+        // Worse-than-mean predictor: VEcv negative.
+        let bad = CvResult {
+            observed: observed.clone(),
+            predicted: vec![10.0, 10.0, 10.0, 10.0, 10.0],
+            variance: vec![1.0; observed.len()],
+        };
+        assert!(bad.vecv() < 0.0);
+
+        // Relative measures scale-free and consistent: RRMSE = RMSE/mean*100.
+        let cv = CvResult {
+            observed: observed.clone(),
+            predicted: vec![1.5, 2.5, 2.5, 4.5, 4.5],
+            variance: vec![1.0; observed.len()],
+        };
+        assert!((cv.rrmse() - cv.rmse() / mean * 100.0).abs() < 1e-12);
+        assert!((cv.rmae() - cv.mae() / mean * 100.0).abs() < 1e-12);
+        // VEcv in (0, 100) for a decent-but-imperfect predictor.
+        assert!(cv.vecv() > 0.0 && cv.vecv() < 100.0);
     }
 
     #[test]

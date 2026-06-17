@@ -34,8 +34,11 @@ prediction out of the box.
   **lognormal kriging** (unbiased back-transform); standalone **indicator
   kriging** (local ccdf, E-type estimate, conditional variance); kd-tree
   moving neighborhoods; parallel over targets; variance maps.
-- **Validation** — leave-one-out cross-validation (ME, MAE, RMSE, MSDR),
-  with or without external drift.
+- **Validation** — leave-one-out cross-validation with error measures
+  (ME, MAE, MSE, RMSE, MSDR), scale-free relative measures (RME, RMAE,
+  RRMSE) and predictive-accuracy measures **VEcv** (variance explained by
+  cross-validation, Li 2016) and **E₁** (Legates–McCabe), with or without
+  external drift.
 - **Transport (warped) kriging** — Transport-GP-style kriging with a
   learnable marginal transport map (Box–Cox, Yeo–Johnson, sinh–arcsinh,
   fitted by maximum likelihood); latent-space kriging plus a Monte Carlo
