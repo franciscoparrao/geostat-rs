@@ -194,10 +194,13 @@ are comparable across families.
   floor; ✅ VEcv/E₁ and relative error measures in cross-validation
   (parity with Li's spm::pred.acc); ✅ regression kriging (separate trend
   + residual kriging), the bridge to an ML trend engine.
-- Next: paper draft (Mathematical Geosciences); ML+geostatistics hybrids
-  (ML trend via Smelt + residual/transport kriging here); possible
-  GeoPackage/raster I/O for SurtGIS integration; richer transport maps
-  (compositions, SVGD).
+- ML+geostatistics hybrids: regression kriging accepts an external trend, so
+  an ML model supplies the mean and geostat-rs kriges the residuals. See
+  `examples/hybrid_smelt_rk.py` for an RFOK-style hybrid built entirely from
+  the author's Rust engines — a Smelt random-forest trend + residual kriging
+  here — scored by VEcv.
+- Next: paper draft (Mathematical Geosciences); possible GeoPackage/raster
+  I/O for SurtGIS integration; richer transport maps (compositions, SVGD).
 
 ## Python quickstart
 
