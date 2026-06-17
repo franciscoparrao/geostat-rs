@@ -18,8 +18,8 @@
 mod marginal;
 
 pub use marginal::{
-    BoxCox, FittedMarginal, Identity, MarginalTransport, SinhArcsinh, YeoJohnson, fit_box_cox,
-    fit_sinh_arcsinh, fit_yeo_johnson,
+    AnyMarginal, BoxCox, FittedMarginal, Identity, MarginalSelection, MarginalTransport,
+    SinhArcsinh, YeoJohnson, fit_best_marginal, fit_box_cox, fit_sinh_arcsinh, fit_yeo_johnson,
 };
 
 use crate::data::PointSet;

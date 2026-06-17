@@ -134,18 +134,23 @@ def run_element(element):
     model = gs.fit_variogram(tx, ty, tv, n_lags=12)
     pred, var = gs.krige(tx, ty, tv, model, ex, ey, method="ordinary", max_neighbors=24)
 
-    def warp(kind):
+    def warp(kind, **kw):
         return gs.warped_kriging(
             tx, ty, tv, ex, ey,
             warp=kind, quantiles=PROBS,
-            n_lags=12, max_neighbors=24, n_samples=8000, seed=1,
+            n_lags=12, max_neighbors=24, n_samples=8000, seed=1, **kw,
         )
 
     wb = warp("box-cox")
     ws = warp("sinh-arcsinh")
+    # Auto: pick the marginal by AIC, clamped to non-negative concentrations.
+    wa = warp("auto", floor=0.0)
+    aic = "  ".join(f"{n}:{a:.0f}" for n, a in wa["aic_table"])
     report("ordinary kriging", ev, pred, gaussian_quantiles(pred, var))
     report("warped Box-Cox", ev, wb["mean"], warp_quantiles(wb))
     report("warped sinh-arcsinh", ev, ws["mean"], warp_quantiles(ws))
+    report(f"warped auto[{wa['family']}]", ev, wa["mean"], warp_quantiles(wa))
+    print(f"  AIC: {aic}")
     print()
 
 

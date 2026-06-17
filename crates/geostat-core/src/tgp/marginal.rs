@@ -163,6 +163,11 @@ pub struct FittedMarginal<T: MarginalTransport> {
     transform: T,
     latent_mean: f64,
     latent_std: f64,
+    /// Optional lower bound applied to back-transformed values. Useful for
+    /// strictly-positive data (concentrations) under a transform that maps
+    /// to the whole real line, e.g. sinh–arcsinh, where the inverse can
+    /// otherwise return a physically-invalid negative draw.
+    floor: Option<f64>,
 }
 
 impl<T: MarginalTransport> FittedMarginal<T> {
@@ -181,7 +186,22 @@ impl<T: MarginalTransport> FittedMarginal<T> {
             transform,
             latent_mean,
             latent_std,
+            floor: None,
         })
+    }
+
+    /// Returns a copy that clamps every back-transformed value to be at least
+    /// `floor`. Use `with_floor(0.0)` to keep predictions of a strictly
+    /// non-negative quantity (e.g. a concentration) physically valid under a
+    /// real-line transform such as sinh–arcsinh.
+    pub fn with_floor(mut self, floor: f64) -> Self {
+        self.floor = Some(floor);
+        self
+    }
+
+    /// The lower bound applied to back-transformed values, if any.
+    pub fn floor(&self) -> Option<f64> {
+        self.floor
     }
 
     /// Standardized latent value `(T(z) - mean) / std` (a standard Gaussian
@@ -189,10 +209,16 @@ impl<T: MarginalTransport> FittedMarginal<T> {
     pub fn to_latent(&self, z: f64) -> f64 {
         (self.transform.forward(z) - self.latent_mean) / self.latent_std
     }
-    /// Back-transform a standardized latent value to data units.
+    /// Back-transform a standardized latent value to data units (clamped to
+    /// the configured floor, if any).
     pub fn to_data(&self, y: f64) -> f64 {
-        self.transform
-            .inverse(y * self.latent_std + self.latent_mean)
+        let v = self
+            .transform
+            .inverse(y * self.latent_std + self.latent_mean);
+        match self.floor {
+            Some(f) => v.max(f),
+            None => v,
+        }
     }
     /// The underlying transform.
     pub fn transform(&self) -> &T {
@@ -274,6 +300,7 @@ pub fn fit_box_cox(data: &[f64]) -> Result<FittedMarginal<BoxCox>> {
         transform,
         latent_mean: m,
         latent_std: s,
+        floor: None,
     })
 }
 
@@ -293,6 +320,7 @@ pub fn fit_yeo_johnson(data: &[f64]) -> Result<FittedMarginal<YeoJohnson>> {
         transform,
         latent_mean: m,
         latent_std: s,
+        floor: None,
     })
 }
 
@@ -333,6 +361,136 @@ pub fn fit_sinh_arcsinh(data: &[f64]) -> Result<FittedMarginal<SinhArcsinh>> {
         transform,
         latent_mean: m,
         latent_std: s,
+        floor: None,
+    })
+}
+
+/// Number of free *shape* parameters of a family (the latent mean/std are
+/// profiled out and common to every candidate, so they do not enter the AIC
+/// comparison). Identity warps nothing (0), Box–Cox and Yeo–Johnson have one
+/// power, sinh–arcsinh has skew + tail weight (2).
+const fn n_shape_params(family: &str) -> f64 {
+    match family.as_bytes() {
+        b"identity" => 0.0,
+        b"sinh-arcsinh" => 2.0,
+        _ => 1.0, // box-cox, yeo-johnson
+    }
+}
+
+/// A fitted marginal of any supported family, dispatched at runtime. Lets the
+/// automatic selector return one concrete type regardless of which family won.
+#[derive(Debug, Clone, Copy)]
+pub enum AnyMarginal {
+    /// No warp (plain-Gaussian baseline).
+    Identity(Identity),
+    /// Box–Cox power transform.
+    BoxCox(BoxCox),
+    /// Yeo–Johnson transform.
+    YeoJohnson(YeoJohnson),
+    /// Sinh–arcsinh transform.
+    SinhArcsinh(SinhArcsinh),
+}
+
+impl MarginalTransport for AnyMarginal {
+    fn forward(&self, z: f64) -> f64 {
+        match self {
+            AnyMarginal::Identity(t) => t.forward(z),
+            AnyMarginal::BoxCox(t) => t.forward(z),
+            AnyMarginal::YeoJohnson(t) => t.forward(z),
+            AnyMarginal::SinhArcsinh(t) => t.forward(z),
+        }
+    }
+    fn inverse(&self, y: f64) -> f64 {
+        match self {
+            AnyMarginal::Identity(t) => t.inverse(y),
+            AnyMarginal::BoxCox(t) => t.inverse(y),
+            AnyMarginal::YeoJohnson(t) => t.inverse(y),
+            AnyMarginal::SinhArcsinh(t) => t.inverse(y),
+        }
+    }
+    fn log_grad(&self, z: f64) -> f64 {
+        match self {
+            AnyMarginal::Identity(t) => t.log_grad(z),
+            AnyMarginal::BoxCox(t) => t.log_grad(z),
+            AnyMarginal::YeoJohnson(t) => t.log_grad(z),
+            AnyMarginal::SinhArcsinh(t) => t.log_grad(z),
+        }
+    }
+}
+
+/// Outcome of [`fit_best_marginal`]: the winning fitted marginal plus the AIC
+/// of every candidate that fit successfully (for reporting/diagnostics).
+#[derive(Debug, Clone)]
+pub struct MarginalSelection {
+    /// The selected (lowest-AIC) fitted marginal.
+    pub marginal: FittedMarginal<AnyMarginal>,
+    /// Name of the winning family (`"identity"`, `"box-cox"`,
+    /// `"yeo-johnson"`, `"sinh-arcsinh"`).
+    pub family: &'static str,
+    /// AIC of the winning family.
+    pub aic: f64,
+    /// `(family, AIC)` for every candidate that produced a finite likelihood,
+    /// sorted best (lowest) first.
+    pub candidates: Vec<(&'static str, f64)>,
+}
+
+/// Automatically selects the marginal transport family that best fits `data`
+/// by Akaike Information Criterion: `AIC = 2 k + 2 · NLL`, where `k` is the
+/// number of shape parameters and `NLL` is the negative log-likelihood of the
+/// warped data (Gaussian density plus the Jacobian term). The latent
+/// mean/std are profiled out and shared across families, so they cancel in
+/// the comparison; only the warp's shape is penalized.
+///
+/// Candidates: identity (no warp), Box–Cox, Yeo–Johnson and sinh–arcsinh. The
+/// identity baseline means near-Gaussian data is left untouched rather than
+/// over-warped — important for samples whose skew the data does not support.
+pub fn fit_best_marginal(data: &[f64]) -> Result<MarginalSelection> {
+    if data.len() < 4 {
+        return Err(GeostatError::InsufficientData(
+            "automatic marginal selection needs at least 4 values".into(),
+        ));
+    }
+
+    let mut cands: Vec<(&'static str, AnyMarginal, f64)> = Vec::new();
+    let mut consider = |name: &'static str, t: AnyMarginal| {
+        let nll = neg_log_likelihood(&t, data);
+        if nll.is_finite() {
+            cands.push((name, t, 2.0 * n_shape_params(name) + 2.0 * nll));
+        }
+    };
+
+    consider("identity", AnyMarginal::Identity(Identity));
+    if let Ok(f) = fit_box_cox(data) {
+        consider("box-cox", AnyMarginal::BoxCox(*f.transform()));
+    }
+    if let Ok(f) = fit_yeo_johnson(data) {
+        consider("yeo-johnson", AnyMarginal::YeoJohnson(*f.transform()));
+    }
+    if let Ok(f) = fit_sinh_arcsinh(data) {
+        consider("sinh-arcsinh", AnyMarginal::SinhArcsinh(*f.transform()));
+    }
+
+    if cands.is_empty() {
+        return Err(GeostatError::InvalidParameter(
+            "no marginal family produced a finite likelihood on this data".into(),
+        ));
+    }
+    cands.sort_by(|a, b| a.2.total_cmp(&b.2));
+
+    let (family, transform, aic) = cands[0];
+    let (m, s) = standardizer(&transform, data);
+    let marginal = FittedMarginal {
+        transform,
+        latent_mean: m,
+        latent_std: s,
+        floor: None,
+    };
+    let candidates = cands.iter().map(|&(n, _, a)| (n, a)).collect();
+    Ok(MarginalSelection {
+        marginal,
+        family,
+        aic,
+        candidates,
     })
 }
 
@@ -455,6 +613,56 @@ mod tests {
         for &z in data.iter().take(20) {
             let back = fit.to_data(fit.to_latent(z));
             assert!((back - z).abs() < 1e-6, "{z} -> {back}");
+        }
+    }
+
+    #[test]
+    fn auto_selects_warp_for_lognormal() {
+        // Strongly lognormal data: a warp (box-cox near lambda=0) must beat
+        // the identity baseline on AIC.
+        let mut rng = Rng::new(13);
+        let data: Vec<f64> = (0..400).map(|_| (0.8 * rng.normal()).exp()).collect();
+        let sel = fit_best_marginal(&data).unwrap();
+        assert_ne!(sel.family, "identity", "warp should beat identity here");
+        // The winner has the lowest AIC of all candidates.
+        let best = sel
+            .candidates
+            .iter()
+            .map(|&(_, a)| a)
+            .fold(f64::INFINITY, f64::min);
+        assert!((sel.aic - best).abs() < 1e-9);
+        // The selection round-trips like any fitted marginal.
+        for &z in data.iter().take(20) {
+            let back = sel.marginal.to_data(sel.marginal.to_latent(z));
+            assert!((back - z).abs() < 1e-5, "{z} -> {back}");
+        }
+    }
+
+    #[test]
+    fn auto_keeps_identity_for_gaussian() {
+        // Near-Gaussian data: warping buys nothing, so the AIC penalty should
+        // leave identity on top (the honest "no-warp" case).
+        let mut rng = Rng::new(21);
+        let data: Vec<f64> = (0..400).map(|_| 100.0 + 10.0 * rng.normal()).collect();
+        let sel = fit_best_marginal(&data).unwrap();
+        assert_eq!(sel.family, "identity", "AIC table: {:?}", sel.candidates);
+    }
+
+    #[test]
+    fn floor_clamps_back_transform() {
+        // A real-line transform whose inverse would go negative is clamped.
+        let mut rng = Rng::new(31);
+        let data: Vec<f64> = (0..300)
+            .map(|_| {
+                let g = rng.normal();
+                (g + 0.6 * g * g.abs()).max(0.0) + 0.1
+            })
+            .collect();
+        let fit = fit_sinh_arcsinh(&data).unwrap().with_floor(0.0);
+        assert_eq!(fit.floor(), Some(0.0));
+        // Draw far into the lower tail; the clamp keeps it non-negative.
+        for &y in &[-6.0, -4.0, -2.0] {
+            assert!(fit.to_data(y) >= 0.0, "y={y} -> {}", fit.to_data(y));
         }
     }
 }

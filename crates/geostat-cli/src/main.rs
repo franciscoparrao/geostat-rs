@@ -418,6 +418,10 @@ struct IkCmd {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum WarpArg {
+    /// Pick the family automatically by AIC (default)
+    Auto,
+    /// No warp (plain ordinary kriging with Monte Carlo quantiles)
+    Identity,
     /// Box–Cox power transform (auto-fitted; positive or shiftable data)
     BoxCox,
     /// Yeo–Johnson power transform (auto-fitted; any-sign data)
@@ -431,8 +435,12 @@ struct TgpCmd {
     #[command(flatten)]
     input: InputOpts,
     /// Marginal transport family to fit
-    #[arg(long, value_enum, default_value_t = WarpArg::BoxCox)]
+    #[arg(long, value_enum, default_value_t = WarpArg::Auto)]
     warp: WarpArg,
+    /// Clamp back-transformed predictions to be at least this value (e.g.
+    /// `--floor 0` for a non-negative quantity under a real-line warp)
+    #[arg(long)]
+    floor: Option<f64>,
     #[command(flatten)]
     vario: VariogramOpts,
     #[command(flatten)]
@@ -465,8 +473,8 @@ fn main() -> Result<()> {
 
 fn run_tgp(cmd: TgpCmd) -> Result<()> {
     use geostat_core::{
-        FittedMarginal, MarginalTransport, TransportKriging, fit_box_cox, fit_sinh_arcsinh,
-        fit_yeo_johnson,
+        FittedMarginal, Identity, MarginalTransport, TransportKriging, fit_best_marginal,
+        fit_box_cox, fit_sinh_arcsinh, fit_yeo_johnson,
     };
 
     let data = cmd.input.read()?;
@@ -483,6 +491,10 @@ fn run_tgp(cmd: TgpCmd) -> Result<()> {
         marginal: FittedMarginal<T>,
         cmd: &TgpCmd,
     ) -> Result<()> {
+        let marginal = match cmd.floor {
+            Some(f) => marginal.with_floor(f),
+            None => marginal,
+        };
         let latent_vals: Vec<f64> = data
             .values()
             .iter()
@@ -515,6 +527,23 @@ fn run_tgp(cmd: TgpCmd) -> Result<()> {
     }
 
     match cmd.warp {
+        WarpArg::Auto => {
+            let sel = fit_best_marginal(data.values())?;
+            println!("AIC selection (lower is better):");
+            for (name, aic) in &sel.candidates {
+                let mark = if *name == sel.family {
+                    " <- selected"
+                } else {
+                    ""
+                };
+                println!("  {name:<13} AIC = {aic:10.3}{mark}");
+            }
+            run(&data, sel.marginal, &cmd)
+        }
+        WarpArg::Identity => {
+            println!("No warp (identity): plain ordinary kriging with MC quantiles");
+            run(&data, FittedMarginal::new(Identity, 0.0, 1.0)?, &cmd)
+        }
         WarpArg::BoxCox => {
             let m = fit_box_cox(data.values())?;
             println!("Fitted Box–Cox: lambda = {:.4}", m.transform().lambda);

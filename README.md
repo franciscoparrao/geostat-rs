@@ -42,6 +42,10 @@ prediction out of the box.
   back-transform yielding an unbiased E-type estimate, posterior std and
   predictive quantiles. Generalizes the normal-score and lognormal
   warpings; built for small, skewed samples (e.g. geochemistry).
+  **Automatic family selection** by AIC (`warp="auto"`, including an
+  identity/no-warp baseline so near-Gaussian data is left untouched) plus
+  an optional non-negativity clamp (`floor=0.0`) keep predictions of a
+  bounded quantity physically valid under a real-line warp.
 - **Simulation** — conditional sequential **Gaussian** simulation
   (normal-score transform) and sequential **indicator** simulation
   (GSLIB-style ccdf with order-relation corrections), both with a
@@ -173,7 +177,9 @@ are comparable across families.
   (the marginal core of Transport Gaussian Processes) on top of the kriging
   engine. The Monte Carlo E-type estimate is anchored to the analytic
   (gstat-validated) lognormal back-transform; exposed in the CLI (`tgp`)
-  and Python (`warped_kriging`).
+  and Python (`warped_kriging`). Automatic transport-family selection by
+  AIC (with an identity baseline) and an optional non-negativity floor for
+  bounded quantities.
 - Next: paper draft (Mathematical Geosciences); possible GeoPackage/raster
   I/O for SurtGIS integration; richer transport maps (compositions, SVGD).
 

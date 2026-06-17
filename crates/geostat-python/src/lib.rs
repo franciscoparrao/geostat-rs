@@ -585,13 +585,22 @@ fn indicator_kriging(
 
 /// Transport (warped) kriging. Fits a learnable marginal warp to the data,
 /// kriges in the Gaussian latent space, and back-transforms by Monte Carlo.
-/// `warp` is "box-cox", "yeo-johnson" or "sinh-arcsinh". Returns a dict with
-/// `mean`, `std` (E-type estimate and posterior std per target) and, per
-/// target, `quantiles` (a list aligned with the `quantiles` argument).
+///
+/// `warp` is "auto" (default — pick the family by AIC), "box-cox",
+/// "yeo-johnson", "sinh-arcsinh" or "identity" (no warp). `floor`, if given,
+/// clamps every back-transformed prediction to be at least that value — pass
+/// `floor=0.0` for a strictly non-negative quantity (e.g. a concentration)
+/// when using a real-line warp such as sinh-arcsinh.
+///
+/// Returns a dict with `mean`, `std` (E-type estimate and posterior std per
+/// target), per-target `quantiles` (aligned with the `quantiles` argument),
+/// the selected `family`, and — for `warp="auto"` — `aic` (of the winner) and
+/// `aic_table` (a list of `(family, aic)` sorted best first).
 #[pyfunction]
-#[pyo3(signature = (x, y, values, target_x, target_y, warp = "box-cox",
+#[pyo3(signature = (x, y, values, target_x, target_y, warp = "auto",
     quantiles = vec![0.1, 0.5, 0.9], n_lags = 15, max_dist = None,
-    max_neighbors = None, radius = None, n_samples = 2000, seed = 42))]
+    max_neighbors = None, radius = None, n_samples = 2000, seed = 42,
+    floor = None))]
 #[allow(clippy::too_many_arguments)]
 fn warped_kriging(
     py: Python<'_>,
@@ -608,10 +617,11 @@ fn warped_kriging(
     radius: Option<f64>,
     n_samples: usize,
     seed: u64,
+    floor: Option<f64>,
 ) -> PyResult<Py<PyDict>> {
     use core::{
-        FittedMarginal, MarginalTransport, TransportKriging, fit_box_cox, fit_sinh_arcsinh,
-        fit_yeo_johnson,
+        FittedMarginal, MarginalTransport, TransportKriging, fit_best_marginal, fit_box_cox,
+        fit_sinh_arcsinh, fit_yeo_johnson,
     };
 
     if target_x.len() != target_y.len() {
@@ -638,7 +648,12 @@ fn warped_kriging(
         radius: Option<f64>,
         n_samples: usize,
         seed: u64,
+        floor: Option<f64>,
     ) -> PyResult<Py<PyDict>> {
+        let marginal = match floor {
+            Some(f) => marginal.with_floor(f),
+            None => marginal,
+        };
         let latent_vals: Vec<f64> = data
             .values()
             .iter()
@@ -674,7 +689,30 @@ fn warped_kriging(
         Ok(out.into())
     }
 
-    match warp {
+    if warp == "auto" {
+        let sel = fit_best_marginal(data.values()).map_err(err)?;
+        let out = run(
+            py,
+            &data,
+            sel.marginal,
+            &targets,
+            &quantiles,
+            n_lags,
+            max_dist,
+            max_neighbors,
+            radius,
+            n_samples,
+            seed,
+            floor,
+        )?;
+        let bound = out.bind(py);
+        bound.set_item("family", sel.family)?;
+        bound.set_item("aic", sel.aic)?;
+        bound.set_item("aic_table", sel.candidates)?;
+        return Ok(out);
+    }
+
+    let out = match warp {
         "box-cox" => run(
             py,
             &data,
@@ -687,7 +725,8 @@ fn warped_kriging(
             radius,
             n_samples,
             seed,
-        ),
+            floor,
+        )?,
         "yeo-johnson" => run(
             py,
             &data,
@@ -700,7 +739,8 @@ fn warped_kriging(
             radius,
             n_samples,
             seed,
-        ),
+            floor,
+        )?,
         "sinh-arcsinh" => run(
             py,
             &data,
@@ -713,11 +753,30 @@ fn warped_kriging(
             radius,
             n_samples,
             seed,
-        ),
-        other => Err(PyValueError::new_err(format!(
-            "unknown warp '{other}' (box-cox, yeo-johnson or sinh-arcsinh)"
-        ))),
-    }
+            floor,
+        )?,
+        "identity" => run(
+            py,
+            &data,
+            FittedMarginal::new(core::Identity, 0.0, 1.0).map_err(err)?,
+            &targets,
+            &quantiles,
+            n_lags,
+            max_dist,
+            max_neighbors,
+            radius,
+            n_samples,
+            seed,
+            floor,
+        )?,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown warp '{other}' (auto, box-cox, yeo-johnson, sinh-arcsinh or identity)"
+            )));
+        }
+    };
+    out.bind(py).set_item("family", warp)?;
+    Ok(out)
 }
 
 #[pymodule]
