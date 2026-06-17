@@ -266,9 +266,13 @@ struct KrigeCmd {
     grid: GridOpts,
     #[command(flatten)]
     neighbors: NeighborOpts,
-    /// Output CSV file (x,y,prediction,variance)
+    /// Output file (x,y,prediction,variance). A .gpkg extension writes a
+    /// GeoPackage point layer instead of CSV
     #[arg(short, long)]
     output: PathBuf,
+    /// CRS (EPSG/srs_id) recorded when writing a GeoPackage output
+    #[arg(long, default_value_t = 0)]
+    srs: i32,
 }
 
 #[derive(Args)]
@@ -494,6 +498,51 @@ fn main() -> Result<()> {
 fn is_gpkg(path: &std::path::Path) -> bool {
     path.extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("gpkg"))
+}
+
+/// Writes a kriged grid as CSV, or — when the path is a `.gpkg` — as a
+/// GeoPackage point layer (cell centers) with prediction and variance columns.
+fn write_grid_result(
+    path: &std::path::Path,
+    grid: &Grid2D,
+    values: &[f64],
+    variances: &[f64],
+    srs: i32,
+) -> Result<()> {
+    if is_gpkg(path) {
+        gpkg::write_points(
+            path,
+            "kriging",
+            srs,
+            &grid.centers(),
+            &[("prediction", values), ("variance", variances)],
+        )
+    } else {
+        io_utils::write_grid_csv(path, grid, values, variances)
+    }
+}
+
+/// Writes kriging estimates at explicit targets as CSV, or — for a `.gpkg`
+/// path — as a GeoPackage point layer with prediction and variance columns.
+fn write_estimates_result(
+    path: &std::path::Path,
+    coords: &[[f64; 2]],
+    ests: &[geostat_core::KrigingEstimate],
+    srs: i32,
+) -> Result<()> {
+    if is_gpkg(path) {
+        let values: Vec<f64> = ests.iter().map(|e| e.value).collect();
+        let variances: Vec<f64> = ests.iter().map(|e| e.variance).collect();
+        gpkg::write_points(
+            path,
+            "kriging",
+            srs,
+            coords,
+            &[("prediction", &values), ("variance", &variances)],
+        )
+    } else {
+        io_utils::write_estimates_csv(path, coords, ests)
+    }
 }
 
 #[derive(Args)]
@@ -983,7 +1032,7 @@ fn run_krige(cmd: KrigeCmd) -> Result<()> {
             coords.len(),
             n_nan
         );
-        io_utils::write_estimates_csv(&cmd.output, &coords, &ests)?;
+        write_estimates_result(&cmd.output, &coords, &ests, cmd.srs)?;
         println!("Output written to {}", cmd.output.display());
         return Ok(());
     }
@@ -1010,7 +1059,7 @@ fn run_krige(cmd: KrigeCmd) -> Result<()> {
             "Lognormal kriging on {} cells (variance column is in log space)",
             grid.n_cells()
         );
-        io_utils::write_grid_csv(&cmd.output, &grid, &values, &variances)?;
+        write_grid_result(&cmd.output, &grid, &values, &variances, cmd.srs)?;
         println!("Output written to {}", cmd.output.display());
         return Ok(());
     }
@@ -1051,7 +1100,7 @@ fn run_krige(cmd: KrigeCmd) -> Result<()> {
         println!("Prediction range: [{min:.4}, {max:.4}]");
     }
 
-    io_utils::write_grid_csv(&cmd.output, &grid, &values, &variances)?;
+    write_grid_result(&cmd.output, &grid, &values, &variances, cmd.srs)?;
     println!("Output written to {}", cmd.output.display());
     Ok(())
 }

@@ -144,6 +144,156 @@ fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
+/// Encodes a 2-D point as a StandardGeoPackageBinary blob: a `GP` header
+/// (little-endian, no envelope) followed by little-endian WKB.
+fn encode_point(x: f64, y: f64, srs_id: i32) -> Vec<u8> {
+    let mut b = Vec::with_capacity(8 + 21);
+    b.extend_from_slice(b"GP"); // magic
+    b.push(0x00); // version
+    b.push(0x01); // flags: little-endian header, no envelope
+    b.extend_from_slice(&srs_id.to_le_bytes());
+    b.push(0x01); // WKB byte order: little-endian
+    b.extend_from_slice(&1u32.to_le_bytes()); // WKB type: Point
+    b.extend_from_slice(&x.to_le_bytes());
+    b.extend_from_slice(&y.to_le_bytes());
+    b
+}
+
+/// Writes 2-D points to a new GeoPackage as a point feature layer, with one
+/// REAL attribute column per `(name, values)` pair. The file is created (or
+/// replaced); `srs_id` is recorded as the layer's CRS.
+///
+/// Scope: a pure-Rust point-vector writer (the inverse of [`read_points`]).
+/// Raster/tile output is not handled. If `srs_id` is not one of the mandatory
+/// GeoPackage entries (-1, 0, 4326), a placeholder `gpkg_spatial_ref_sys` row
+/// is inserted so the file stays valid; supply a known EPSG id for a fully
+/// defined CRS.
+pub fn write_points(
+    path: &Path,
+    layer: &str,
+    srs_id: i32,
+    coords: &[[f64; 2]],
+    columns: &[(&str, &[f64])],
+) -> Result<()> {
+    for (name, values) in columns {
+        if values.len() != coords.len() {
+            bail!(
+                "column '{name}' has {} values but there are {} points",
+                values.len(),
+                coords.len()
+            );
+        }
+    }
+    if path.exists() {
+        std::fs::remove_file(path)
+            .with_context(|| format!("replacing existing {}", path.display()))?;
+    }
+    let mut conn = Connection::open(path)
+        .with_context(|| format!("creating GeoPackage {}", path.display()))?;
+
+    // GeoPackage magic: application_id "GPKG" and user_version 10300.
+    conn.pragma_update(None, "application_id", 0x4750_4B47_i64)?;
+    conn.pragma_update(None, "user_version", 10300_i64)?;
+
+    conn.execute_batch(
+        "CREATE TABLE gpkg_spatial_ref_sys (
+            srs_name TEXT NOT NULL, srs_id INTEGER PRIMARY KEY,
+            organization TEXT NOT NULL, organization_coordsys_id INTEGER NOT NULL,
+            definition TEXT NOT NULL, description TEXT);
+         CREATE TABLE gpkg_contents (
+            table_name TEXT NOT NULL PRIMARY KEY, data_type TEXT NOT NULL,
+            identifier TEXT UNIQUE, description TEXT DEFAULT '',
+            last_change TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            min_x DOUBLE, min_y DOUBLE, max_x DOUBLE, max_y DOUBLE, srs_id INTEGER);
+         CREATE TABLE gpkg_geometry_columns (
+            table_name TEXT NOT NULL, column_name TEXT NOT NULL,
+            geometry_type_name TEXT NOT NULL, srs_id INTEGER NOT NULL,
+            z TINYINT NOT NULL, m TINYINT NOT NULL,
+            CONSTRAINT pk_geom_cols PRIMARY KEY (table_name, column_name));",
+    )?;
+
+    // Mandatory SRS rows, plus the requested one if it is something else.
+    conn.execute_batch(
+        "INSERT INTO gpkg_spatial_ref_sys VALUES
+            ('Undefined cartesian SRS', -1, 'NONE', -1, 'undefined', NULL),
+            ('Undefined geographic SRS', 0, 'NONE', 0, 'undefined', NULL),
+            ('WGS 84 geodetic', 4326, 'EPSG', 4326,
+             'GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563]],PRIMEM[\"Greenwich\",0],UNIT[\"degree\",0.0174532925199433]]',
+             NULL);",
+    )?;
+    if !matches!(srs_id, -1 | 0 | 4326) {
+        conn.execute(
+            "INSERT INTO gpkg_spatial_ref_sys VALUES (?1, ?2, 'EPSG', ?2, 'undefined', NULL)",
+            rusqlite::params![format!("SRS {srs_id}"), srs_id],
+        )?;
+    }
+
+    // Feature table: integer pk + geometry + REAL attribute columns.
+    let attr_defs: String = columns
+        .iter()
+        .map(|(name, _)| format!(", {} REAL", quote_ident(name)))
+        .collect();
+    conn.execute(
+        &format!(
+            "CREATE TABLE {} (fid INTEGER PRIMARY KEY AUTOINCREMENT, geom BLOB{attr_defs})",
+            quote_ident(layer)
+        ),
+        [],
+    )?;
+
+    // Register the layer.
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for c in coords {
+        min_x = min_x.min(c[0]);
+        min_y = min_y.min(c[1]);
+        max_x = max_x.max(c[0]);
+        max_y = max_y.max(c[1]);
+    }
+    conn.execute(
+        "INSERT INTO gpkg_contents
+            (table_name, data_type, identifier, min_x, min_y, max_x, max_y, srs_id)
+         VALUES (?1, 'features', ?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![layer, min_x, min_y, max_x, max_y, srs_id],
+    )?;
+    conn.execute(
+        "INSERT INTO gpkg_geometry_columns VALUES (?1, 'geom', 'POINT', ?2, 0, 0)",
+        rusqlite::params![layer, srs_id],
+    )?;
+
+    // Bulk-insert the features in one transaction.
+    let col_names: String = columns
+        .iter()
+        .map(|(name, _)| format!(", {}", quote_ident(name)))
+        .collect();
+    let placeholders: String = (0..columns.len())
+        .map(|i| format!(", ?{}", i + 2))
+        .collect();
+    let insert_sql = format!(
+        "INSERT INTO {} (geom{col_names}) VALUES (?1{placeholders})",
+        quote_ident(layer)
+    );
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare(&insert_sql)?;
+        for (i, c) in coords.iter().enumerate() {
+            let blob = encode_point(c[0], c[1], srs_id);
+            let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(1 + columns.len());
+            params.push(blob.into());
+            for (_, values) in columns {
+                params.push(values[i].into());
+            }
+            stmt.execute(rusqlite::params_from_iter(params.iter()))?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn rd_u32(b: &[u8], le: bool) -> u32 {
     let a = [b[0], b[1], b[2], b[3]];
     if le {
@@ -244,5 +394,30 @@ mod tests {
     fn quotes_identifiers_safely() {
         assert_eq!(quote_ident("zinc"), "\"zinc\"");
         assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn write_then_read_round_trips() {
+        let path = std::env::temp_dir().join("geostat_rs_gpkg_roundtrip.gpkg");
+        let _ = std::fs::remove_file(&path);
+        let coords = [[10.0, 20.0], [30.5, 40.25], [-5.0, 0.0]];
+        let vals = [1.5, 2.5, 3.5];
+        write_points(&path, "kriging", 28992, &coords, &[("pred", &vals)]).unwrap();
+
+        // The writer's layer is discoverable and decodes back to the inputs.
+        let layers = list_feature_layers(&path).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].name, "kriging");
+        assert_eq!(layers[0].geometry_type, "POINT");
+        assert_eq!(layers[0].srs_id, 28992);
+        assert_eq!(layers[0].n_features, 3);
+
+        let ps = read_points(&path, None, "pred").unwrap();
+        assert_eq!(ps.len(), 3);
+        for (i, c) in coords.iter().enumerate() {
+            assert_eq!(ps.coord(i), *c);
+            assert_eq!(ps.value(i), vals[i]);
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }
