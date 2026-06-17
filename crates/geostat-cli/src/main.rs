@@ -1,5 +1,6 @@
 //! `geostat` — CLI for the geostat-rs geostatistics engine.
 
+mod gpkg;
 mod io_utils;
 
 use std::path::PathBuf;
@@ -49,6 +50,8 @@ enum Command {
     Compare(CompareCmd),
     /// Tune a method's hyperparameter by leave-one-out VEcv
     Tune(TuneCmd),
+    /// List the vector feature layers in a GeoPackage
+    GpkgInfo(GpkgInfoCmd),
 }
 
 #[derive(Args)]
@@ -69,6 +72,9 @@ struct InputOpts {
     /// Column name for the variable of interest
     #[arg(long, default_value = "z")]
     value_col: String,
+    /// GeoPackage layer name (when the input is a .gpkg with several layers)
+    #[arg(long)]
+    layer: Option<String>,
 }
 
 impl InputOpts {
@@ -84,6 +90,9 @@ impl InputOpts {
     }
 
     fn read(&self) -> Result<PointSet> {
+        if is_gpkg(&self.input) {
+            return gpkg::read_points(&self.input, self.layer.as_deref(), &self.value_col);
+        }
         io_utils::read_points(&self.input, &self.x_col, &self.y_col, &self.value_col)
     }
 
@@ -477,7 +486,41 @@ fn main() -> Result<()> {
         Command::Rk(cmd) => run_rk(cmd),
         Command::Compare(cmd) => run_compare(cmd),
         Command::Tune(cmd) => run_tune(cmd),
+        Command::GpkgInfo(cmd) => run_gpkg_info(cmd),
     }
+}
+
+/// True if the path looks like a GeoPackage (`.gpkg`, case-insensitive).
+fn is_gpkg(path: &std::path::Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("gpkg"))
+}
+
+#[derive(Args)]
+struct GpkgInfoCmd {
+    /// GeoPackage file to inspect
+    #[arg(short, long)]
+    input: PathBuf,
+}
+
+fn run_gpkg_info(cmd: GpkgInfoCmd) -> Result<()> {
+    let layers = gpkg::list_feature_layers(&cmd.input)?;
+    if layers.is_empty() {
+        println!("No vector feature layers in {}", cmd.input.display());
+        return Ok(());
+    }
+    println!("Feature layers in {}:", cmd.input.display());
+    println!(
+        "  {:<24}{:<12}{:<14}{:>10}{:>10}",
+        "layer", "geom_col", "type", "srs_id", "features"
+    );
+    for l in &layers {
+        println!(
+            "  {:<24}{:<12}{:<14}{:>10}{:>10}",
+            l.name, l.geometry_column, l.geometry_type, l.srs_id, l.n_features
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, ValueEnum)]

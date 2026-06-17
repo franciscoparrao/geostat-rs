@@ -17,3 +17,6 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 csv = { workspace = true }
 serde_json = { workspace = true }
+# Bundled SQLite: GeoPackage I/O without a system GDAL/SQLite dependency,
+# keeping the single-binary, no-heavy-deps ethos. Matches SurtGIS's version.
+rusqlite = { version = "0.39", features = ["bundled"] }

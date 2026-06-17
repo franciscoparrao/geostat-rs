@@ -47,6 +47,10 @@ prediction out of the box.
   or the kriging neighborhood size by maximizing leave-one-out VEcv
   (`geostat tune` / `tune_idw_power`, `tune_knn_k`, `tune_kriging_neighbors`),
   i.e. by predictive accuracy rather than by a model fit.
+- **GeoPackage input** — read point feature layers straight from an OGC
+  `.gpkg` (pure Rust via bundled SQLite — no GDAL): any CLI subcommand
+  accepts a `.gpkg` input, and `geostat gpkg-info` lists its layers. The
+  geometry's X/Y become the coordinates; an attribute column the value.
 - **Validation** — leave-one-out cross-validation with error measures
   (ME, MAE, MSE, RMSE, MSDR), scale-free relative measures (RME, RMAE,
   RRMSE) and predictive-accuracy measures **VEcv** (variance explained by
@@ -134,6 +138,10 @@ geostat compare -i meuse.csv --value-col zinc --max-neighbors 32 --knn-k 8
 
 # 13. Tune a hyperparameter by leave-one-out VEcv (idw | knn | ok)
 geostat tune -i meuse.csv --value-col zinc --method idw
+
+# 14. Read points straight from a GeoPackage (geometry x/y + an attribute)
+geostat gpkg-info -i meuse.gpkg                       # list layers
+geostat cv -i meuse.gpkg --value-col lzinc -m model.json   # any subcommand
 ```
 
 Other useful flags: `--azimuth/--dip/--tolerance` (directional variograms,
@@ -218,8 +226,9 @@ are comparable across families.
   `examples/hybrid_smelt_rk.py` for an RFOK-style hybrid built entirely from
   the author's Rust engines — a Smelt random-forest trend + residual kriging
   here — scored by VEcv.
-- Next: paper draft (Mathematical Geosciences); possible GeoPackage/raster
-  I/O for SurtGIS integration; richer transport maps (compositions, SVGD).
+- Next: paper draft (Mathematical Geosciences); GeoPackage I/O for SurtGIS
+  integration (✅ point reading; raster/grid writing pending); richer
+  transport maps (compositions, SVGD).
 
 ## Python quickstart
 
