@@ -47,6 +47,8 @@ enum Command {
     Rk(RkCmd),
     /// Compare interpolation methods by leave-one-out VEcv (OK, IDW, k-NN, NN)
     Compare(CompareCmd),
+    /// Tune a method's hyperparameter by leave-one-out VEcv
+    Tune(TuneCmd),
 }
 
 #[derive(Args)]
@@ -474,7 +476,104 @@ fn main() -> Result<()> {
         Command::Tgp(cmd) => run_tgp(cmd),
         Command::Rk(cmd) => run_rk(cmd),
         Command::Compare(cmd) => run_compare(cmd),
+        Command::Tune(cmd) => run_tune(cmd),
     }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum TuneMethod {
+    /// IDW power
+    Idw,
+    /// k-nearest-neighbor k
+    Knn,
+    /// Ordinary-kriging search-neighborhood size
+    Ok,
+}
+
+#[derive(Args)]
+struct TuneCmd {
+    #[command(flatten)]
+    input: InputOpts,
+    /// Which method's hyperparameter to tune
+    #[arg(long, value_enum)]
+    method: TuneMethod,
+    /// Candidate values to try (comma-separated; floats for idw, ints for
+    /// knn/ok). Defaults: idw 0.5,1,1.5,2,2.5,3,4,5; knn 1,2,3,4,6,8,12,16,24;
+    /// ok 4,8,12,16,24,32,48
+    #[arg(long)]
+    grid: Option<String>,
+    #[command(flatten)]
+    vario: VariogramOpts,
+    /// Search radius (optional)
+    #[arg(long)]
+    radius: Option<f64>,
+}
+
+fn run_tune(cmd: TuneCmd) -> Result<()> {
+    use geostat_core::{tune_idw_power, tune_knn_k, tune_kriging_neighbors};
+
+    let data = cmd.input.read()?;
+    println!("Loaded {} points; tuning by leave-one-out VEcv", data.len());
+
+    let ints = |default: &[usize]| -> Result<Vec<usize>> {
+        match &cmd.grid {
+            Some(s) => s
+                .split(',')
+                .map(|t| {
+                    t.trim()
+                        .parse::<usize>()
+                        .context("invalid integer in --grid")
+                })
+                .collect(),
+            None => Ok(default.to_vec()),
+        }
+    };
+
+    match cmd.method {
+        TuneMethod::Idw => {
+            let powers: Vec<f64> = match &cmd.grid {
+                Some(s) => parse_floats(s)?,
+                None => vec![0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0],
+            };
+            let res = tune_idw_power(&data, &powers, None, cmd.radius)?;
+            print_tune_trace("IDW power", &res.trace, res.best_vecv);
+            println!("Best IDW power = {} (VEcv {:.2}%)", res.best, res.best_vecv);
+        }
+        TuneMethod::Knn => {
+            let ks = ints(&[1, 2, 3, 4, 6, 8, 12, 16, 24])?;
+            let res = tune_knn_k(&data, &ks, cmd.radius)?;
+            print_tune_trace("k-NN k", &res.trace, res.best_vecv);
+            println!("Best k = {} (VEcv {:.2}%)", res.best, res.best_vecv);
+        }
+        TuneMethod::Ok => {
+            let cfg = cmd.vario.config(&data);
+            let ev = experimental_variogram(&data, &cfg)?;
+            let model = fit_best(&ev, &ModelKind::ALL)?.model;
+            println!("  fitted variogram: {model}");
+            let cands = ints(&[4, 8, 12, 16, 24, 32, 48])?;
+            let res =
+                tune_kriging_neighbors(&data, &model, KrigingMethod::Ordinary, &cands, cmd.radius)?;
+            print_tune_trace("OK neighbors", &res.trace, res.best_vecv);
+            println!(
+                "Best neighborhood size = {} (VEcv {:.2}%)",
+                res.best, res.best_vecv
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_tune_trace<P: std::fmt::Display>(label: &str, trace: &[(P, f64)], best_vecv: f64) {
+    println!("\n  {label:<14}{:>10}", "VEcv %");
+    for (p, v) in trace {
+        let mark = if (*v - best_vecv).abs() < 1e-12 {
+            " <-"
+        } else {
+            ""
+        };
+        println!("  {p:<14}{v:>10.2}{mark}");
+    }
+    println!();
 }
 
 #[derive(Args)]

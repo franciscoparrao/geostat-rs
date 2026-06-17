@@ -43,6 +43,10 @@ prediction out of the box.
   kriging, IDW, k-NN and NN by VEcv on the same data (`geostat compare` /
   `compare_methods`), in the spirit of Li (2021): no method dominates, so
   compare by predictive accuracy.
+- **Hyperparameter tuning by accuracy** — choose the IDW power, the k-NN `k`
+  or the kriging neighborhood size by maximizing leave-one-out VEcv
+  (`geostat tune` / `tune_idw_power`, `tune_knn_k`, `tune_kriging_neighbors`),
+  i.e. by predictive accuracy rather than by a model fit.
 - **Validation** — leave-one-out cross-validation with error measures
   (ME, MAE, MSE, RMSE, MSDR), scale-free relative measures (RME, RMAE,
   RRMSE) and predictive-accuracy measures **VEcv** (variance explained by
@@ -127,6 +131,9 @@ geostat rk -i meuse.csv --value-col lzinc --covar-cols sdist \
 
 # 12. Compare methods (OK / IDW / k-NN / NN) by leave-one-out VEcv
 geostat compare -i meuse.csv --value-col zinc --max-neighbors 32 --knn-k 8
+
+# 13. Tune a hyperparameter by leave-one-out VEcv (idw | knn | ok)
+geostat tune -i meuse.csv --value-col zinc --method idw
 ```
 
 Other useful flags: `--azimuth/--dip/--tolerance` (directional variograms,
@@ -203,7 +210,9 @@ are comparable across families.
 - Post-v0.6: ✅ automatic transport-family selection (AIC) + non-negativity
   floor; ✅ VEcv/E₁ and relative error measures in cross-validation
   (parity with Li's spm::pred.acc); ✅ regression kriging (separate trend
-  + residual kriging), the bridge to an ML trend engine.
+  + residual kriging), the bridge to an ML trend engine; ✅ IDW/k-NN/NN
+  baselines + a VEcv method-comparison harness; ✅ hyperparameter tuning by
+  predictive accuracy (IDW power, k-NN k, kriging neighborhood).
 - ML+geostatistics hybrids: regression kriging accepts an external trend, so
   an ML model supplies the mean and geostat-rs kriges the residuals. See
   `examples/hybrid_smelt_rk.py` for an RFOK-style hybrid built entirely from
@@ -246,6 +255,10 @@ rk["prediction"], rk["variance"], rk["trend_coef"]
 idw_pred = gs.idw(x, y, vals, tx, ty, power=2.0, max_neighbors=16)
 ranking = gs.compare_methods(x, y, vals, max_neighbors=32, knn_k=8)
 # {"ordinary_kriging": {"rmse":..., "vecv":...}, "idw": {...}, ...}
+
+# Tune a hyperparameter by predictive accuracy (VEcv).
+best = gs.tune_idw_power(x, y, vals)          # {"best":..., "best_vecv":..., "trace":[...]}
+gs.tune_knn_k(x, y, vals); gs.tune_kriging_neighbors(x, y, vals)
 ```
 
 ## License

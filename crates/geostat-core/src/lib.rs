@@ -61,6 +61,7 @@ pub mod sis;
 pub mod tgp;
 pub mod trans;
 pub mod transform;
+pub mod tuning;
 pub mod validation;
 pub mod variogram;
 
@@ -84,6 +85,7 @@ pub use tgp::{
 };
 pub use trans::{LognormalEstimate, lognormal_kriging};
 pub use transform::NormalScore;
+pub use tuning::{TuneResult, tune_idw_power, tune_knn_k, tune_kriging_neighbors};
 pub use validation::{CvResult, leave_one_out, leave_one_out_with_drift};
 pub use variogram::{
     Anisotropy, DirectionConfig, ExperimentalVariogram, FitResult, LagBin, ModelKind, Structure,

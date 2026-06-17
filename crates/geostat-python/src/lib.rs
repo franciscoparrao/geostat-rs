@@ -542,6 +542,83 @@ fn compare_methods(
     Ok(out.into())
 }
 
+/// Tunes the IDW `power` by leave-one-out VEcv. Returns a dict with `best`,
+/// `best_vecv` and `trace` (a list of `(power, vecv)`).
+#[pyfunction]
+#[pyo3(signature = (x, y, values, powers = vec![0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0],
+    max_neighbors = None, radius = None))]
+fn tune_idw_power(
+    py: Python<'_>,
+    x: Vec<f64>,
+    y: Vec<f64>,
+    values: Vec<f64>,
+    powers: Vec<f64>,
+    max_neighbors: Option<usize>,
+    radius: Option<f64>,
+) -> PyResult<Py<PyDict>> {
+    let data = point_set(x, y, values)?;
+    let res = core::tune_idw_power(&data, &powers, max_neighbors, radius).map_err(err)?;
+    let out = PyDict::new(py);
+    out.set_item("best", res.best)?;
+    out.set_item("best_vecv", res.best_vecv)?;
+    out.set_item("trace", res.trace)?;
+    Ok(out.into())
+}
+
+/// Tunes the k-NN `k` by leave-one-out VEcv. Returns a dict with `best`,
+/// `best_vecv` and `trace` (a list of `(k, vecv)`).
+#[pyfunction]
+#[pyo3(signature = (x, y, values, ks = vec![1, 2, 3, 4, 6, 8, 12, 16, 24], radius = None))]
+fn tune_knn_k(
+    py: Python<'_>,
+    x: Vec<f64>,
+    y: Vec<f64>,
+    values: Vec<f64>,
+    ks: Vec<usize>,
+    radius: Option<f64>,
+) -> PyResult<Py<PyDict>> {
+    let data = point_set(x, y, values)?;
+    let res = core::tune_knn_k(&data, &ks, radius).map_err(err)?;
+    let out = PyDict::new(py);
+    out.set_item("best", res.best)?;
+    out.set_item("best_vecv", res.best_vecv)?;
+    out.set_item("trace", res.trace)?;
+    Ok(out.into())
+}
+
+/// Tunes the ordinary-kriging search-neighborhood size by leave-one-out VEcv,
+/// fitting the variogram automatically. Returns a dict with `best`,
+/// `best_vecv` and `trace` (a list of `(n_neighbors, vecv)`).
+#[pyfunction]
+#[pyo3(signature = (x, y, values, candidates = vec![4, 8, 12, 16, 24, 32, 48],
+    n_lags = 15, max_dist = None, radius = None))]
+#[allow(clippy::too_many_arguments)]
+fn tune_kriging_neighbors(
+    py: Python<'_>,
+    x: Vec<f64>,
+    y: Vec<f64>,
+    values: Vec<f64>,
+    candidates: Vec<usize>,
+    n_lags: usize,
+    max_dist: Option<f64>,
+    radius: Option<f64>,
+) -> PyResult<Py<PyDict>> {
+    let data = point_set(x, y, values)?;
+    let cfg = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
+    let ev = core::experimental_variogram(&data, &cfg).map_err(err)?;
+    let model = core::fit_best(&ev, &core::ModelKind::ALL)
+        .map_err(err)?
+        .model;
+    let res =
+        core::tune_kriging_neighbors(&data, &model, KrigingMethod::Ordinary, &candidates, radius)
+            .map_err(err)?;
+    let out = PyDict::new(py);
+    out.set_item("best", res.best)?;
+    out.set_item("best_vecv", res.best_vecv)?;
+    out.set_item("trace", res.trace)?;
+    Ok(out.into())
+}
+
 /// Conditional sequential Gaussian simulation. `model_ns` is a model fitted
 /// to the normal scores (fit one with `fit_variogram` on transformed data,
 /// or let the CLI auto-fit). Returns one list per realization, in grid
@@ -1004,6 +1081,9 @@ fn geostat_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(idw, m)?)?;
     m.add_function(wrap_pyfunction!(knn, m)?)?;
     m.add_function(wrap_pyfunction!(compare_methods, m)?)?;
+    m.add_function(wrap_pyfunction!(tune_idw_power, m)?)?;
+    m.add_function(wrap_pyfunction!(tune_knn_k, m)?)?;
+    m.add_function(wrap_pyfunction!(tune_kriging_neighbors, m)?)?;
     m.add_function(wrap_pyfunction!(sgs, m)?)?;
     m.add_function(wrap_pyfunction!(sis, m)?)?;
     m.add_function(wrap_pyfunction!(experimental_variogram_3d, m)?)?;
