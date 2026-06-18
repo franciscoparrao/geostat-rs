@@ -156,6 +156,37 @@ impl MarginalTransport for SinhArcsinh {
     }
 }
 
+/// Composition of two monotone transforms, `T(z) = outer(inner(z))` — a
+/// two-layer normalizing flow on the data axis. Composing monotone maps stays
+/// monotone (hence invertible), and is strictly more expressive than either
+/// factor, so a Box–Cox warm-up followed by a sinh–arcsinh fine-tune can match
+/// marginals neither captures alone. `Composed` is itself a
+/// [`MarginalTransport`], so compositions nest arbitrarily.
+#[derive(Debug, Clone, Copy)]
+pub struct Composed<A: MarginalTransport, B: MarginalTransport> {
+    /// Applied first (`z -> u`).
+    pub inner: A,
+    /// Applied second (`u -> y`).
+    pub outer: B,
+}
+
+impl<A: MarginalTransport, B: MarginalTransport> MarginalTransport for Composed<A, B> {
+    fn forward(&self, z: f64) -> f64 {
+        self.outer.forward(self.inner.forward(z))
+    }
+    fn inverse(&self, y: f64) -> f64 {
+        self.inner.inverse(self.outer.inverse(y))
+    }
+    fn log_grad(&self, z: f64) -> f64 {
+        // Chain rule: ln|T'| = ln|outer'(inner(z))| + ln|inner'(z)|.
+        self.outer.log_grad(self.inner.forward(z)) + self.inner.log_grad(z)
+    }
+}
+
+/// A Box–Cox warm-up composed with a sinh–arcsinh fine-tune, the concrete
+/// composed family fitted by [`fit_box_cox_sinh_arcsinh`].
+pub type BoxCoxSinhArcsinh = Composed<BoxCox, SinhArcsinh>;
+
 /// A fitted marginal transform plus the latent mean/std used to standardize
 /// the warped data to a standard Gaussian.
 #[derive(Debug, Clone)]
@@ -365,6 +396,58 @@ pub fn fit_sinh_arcsinh(data: &[f64]) -> Result<FittedMarginal<SinhArcsinh>> {
     })
 }
 
+/// Fits a composed Box–Cox → sinh–arcsinh transform by maximum likelihood: a
+/// Box–Cox warm-up (`lambda`) handles positivity and gross right-skew, then a
+/// sinh–arcsinh (`epsilon`, `delta`) on the standardized intermediate fine-
+/// tunes residual skew and tail weight. The three shape parameters are fitted
+/// jointly; the sinh–arcsinh location/scale are profiled to the intermediate's
+/// mean/std at each step. More expressive than either factor — use it (or the
+/// AIC selector) when one map leaves structure behind.
+pub fn fit_box_cox_sinh_arcsinh(data: &[f64]) -> Result<FittedMarginal<BoxCoxSinhArcsinh>> {
+    if data.len() < 5 {
+        return Err(GeostatError::InsufficientData(
+            "composed fitting needs at least 5 values".into(),
+        ));
+    }
+    let min = data.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = data.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let range = (max - min).max(f64::MIN_POSITIVE);
+    let shift = if min > 0.0 { 0.0 } else { 1e-3 * range - min };
+
+    // Build the composed map for a parameter vector, profiling the sinh–arcsinh
+    // loc/scale to the Box–Cox intermediate's mean/std.
+    let build = |p: &[f64]| -> Composed<BoxCox, SinhArcsinh> {
+        let inner = BoxCox {
+            lambda: p[0],
+            shift,
+        };
+        let (loc, scale) = standardizer(&inner, data);
+        Composed {
+            inner,
+            outer: SinhArcsinh {
+                epsilon: p[1],
+                delta: p[2].abs().max(1e-3),
+                loc,
+                scale,
+            },
+        }
+    };
+    let obj = |p: &[f64]| neg_log_likelihood(&build(p), data);
+    // Start from the Box–Cox optimum with an identity-like sinh–arcsinh.
+    let lambda0 = fit_box_cox(data)
+        .map(|f| f.transform().lambda)
+        .unwrap_or(0.5);
+    let (best, _) = nelder_mead(obj, &[lambda0, 0.0, 1.0], 0.3, 1000);
+    let transform = build(&best);
+    let (m, s) = standardizer(&transform, data);
+    Ok(FittedMarginal {
+        transform,
+        latent_mean: m,
+        latent_std: s,
+        floor: None,
+    })
+}
+
 /// Number of free *shape* parameters of a family (the latent mean/std are
 /// profiled out and common to every candidate, so they do not enter the AIC
 /// comparison). Identity warps nothing (0), Box–Cox and Yeo–Johnson have one
@@ -373,7 +456,8 @@ const fn n_shape_params(family: &str) -> f64 {
     match family.as_bytes() {
         b"identity" => 0.0,
         b"sinh-arcsinh" => 2.0,
-        _ => 1.0, // box-cox, yeo-johnson
+        b"composed" => 3.0, // box-cox lambda + sinh-arcsinh epsilon, delta
+        _ => 1.0,           // box-cox, yeo-johnson
     }
 }
 
@@ -389,6 +473,8 @@ pub enum AnyMarginal {
     YeoJohnson(YeoJohnson),
     /// Sinh–arcsinh transform.
     SinhArcsinh(SinhArcsinh),
+    /// Composed Box–Cox → sinh–arcsinh transform.
+    Composed(BoxCoxSinhArcsinh),
 }
 
 impl MarginalTransport for AnyMarginal {
@@ -398,6 +484,7 @@ impl MarginalTransport for AnyMarginal {
             AnyMarginal::BoxCox(t) => t.forward(z),
             AnyMarginal::YeoJohnson(t) => t.forward(z),
             AnyMarginal::SinhArcsinh(t) => t.forward(z),
+            AnyMarginal::Composed(t) => t.forward(z),
         }
     }
     fn inverse(&self, y: f64) -> f64 {
@@ -406,6 +493,7 @@ impl MarginalTransport for AnyMarginal {
             AnyMarginal::BoxCox(t) => t.inverse(y),
             AnyMarginal::YeoJohnson(t) => t.inverse(y),
             AnyMarginal::SinhArcsinh(t) => t.inverse(y),
+            AnyMarginal::Composed(t) => t.inverse(y),
         }
     }
     fn log_grad(&self, z: f64) -> f64 {
@@ -414,6 +502,7 @@ impl MarginalTransport for AnyMarginal {
             AnyMarginal::BoxCox(t) => t.log_grad(z),
             AnyMarginal::YeoJohnson(t) => t.log_grad(z),
             AnyMarginal::SinhArcsinh(t) => t.log_grad(z),
+            AnyMarginal::Composed(t) => t.log_grad(z),
         }
     }
 }
@@ -468,6 +557,9 @@ pub fn fit_best_marginal(data: &[f64]) -> Result<MarginalSelection> {
     }
     if let Ok(f) = fit_sinh_arcsinh(data) {
         consider("sinh-arcsinh", AnyMarginal::SinhArcsinh(*f.transform()));
+    }
+    if let Ok(f) = fit_box_cox_sinh_arcsinh(data) {
+        consider("composed", AnyMarginal::Composed(*f.transform()));
     }
 
     if cands.is_empty() {
@@ -614,6 +706,69 @@ mod tests {
             let back = fit.to_data(fit.to_latent(z));
             assert!((back - z).abs() < 1e-6, "{z} -> {back}");
         }
+    }
+
+    #[test]
+    fn composed_round_trips_and_chains_log_grad() {
+        // A concrete composition round-trips, and its log-Jacobian equals the
+        // numerical derivative of the composed forward map (chain rule).
+        let t = Composed {
+            inner: BoxCox {
+                lambda: 0.3,
+                shift: 1.0,
+            },
+            outer: SinhArcsinh {
+                epsilon: 0.4,
+                delta: 1.2,
+                loc: 0.5,
+                scale: 1.5,
+            },
+        };
+        let h = 1e-6;
+        for &z in &[0.2, 1.0, 3.0, 8.0] {
+            let back = t.inverse(t.forward(z));
+            assert!((back - z).abs() < 1e-7, "{z} -> {back}");
+            let num = (t.forward(z + h) - t.forward(z - h)) / (2.0 * h);
+            assert!(
+                (t.log_grad(z).exp() - num).abs() < 1e-4 * (1.0 + num.abs()),
+                "log_grad mismatch at {z}"
+            );
+        }
+    }
+
+    #[test]
+    fn fit_composed_beats_single_maps_on_two_stage_skew() {
+        // Data with both a power-type right-skew and extra tail asymmetry: the
+        // composed map should reach a lower NLL than either factor alone.
+        let mut rng = Rng::new(17);
+        let data: Vec<f64> = (0..400)
+            .map(|_| {
+                let g = rng.normal();
+                let skewed = g + 0.5 * g * g.abs(); // sinh-arcsinh-like skew
+                (0.7 * skewed + 3.0).exp() // then a power/exp warp -> needs box-cox too
+            })
+            .collect();
+        let composed = fit_box_cox_sinh_arcsinh(&data).unwrap();
+        // Latent scores standardized and the map round-trips.
+        let scores: Vec<f64> = data.iter().map(|&z| composed.to_latent(z)).collect();
+        let m = scores.iter().sum::<f64>() / scores.len() as f64;
+        assert!(m.abs() < 1e-6);
+        for &z in data.iter().take(15) {
+            let back = composed.to_data(composed.to_latent(z));
+            assert!((back - z).abs() < 1e-4 * z.abs().max(1.0), "{z} -> {back}");
+        }
+        // Composed NLL <= each single-family NLL (more expressive).
+        let nll_composed = neg_log_likelihood(composed.transform(), &data);
+        let nll_bc = neg_log_likelihood(fit_box_cox(&data).unwrap().transform(), &data);
+        let nll_sas = neg_log_likelihood(fit_sinh_arcsinh(&data).unwrap().transform(), &data);
+        assert!(
+            nll_composed <= nll_bc + 1e-6,
+            "{nll_composed} vs bc {nll_bc}"
+        );
+        assert!(
+            nll_composed <= nll_sas + 1e-6,
+            "{nll_composed} vs sas {nll_sas}"
+        );
     }
 
     #[test]

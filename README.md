@@ -64,10 +64,13 @@ prediction out of the box.
   back-transform yielding an unbiased E-type estimate, posterior std and
   predictive quantiles. Generalizes the normal-score and lognormal
   warpings; built for small, skewed samples (e.g. geochemistry).
-  **Automatic family selection** by AIC (`warp="auto"`, including an
-  identity/no-warp baseline so near-Gaussian data is left untouched) plus
-  an optional non-negativity clamp (`floor=0.0`) keep predictions of a
-  bounded quantity physically valid under a real-line warp.
+  **Composed transports** chain monotone maps (Box–Cox → sinh–arcsinh, a
+  two-layer normalizing flow) for marginals neither captures alone.
+  **Automatic family selection** by AIC (`warp="auto"`, including the
+  composed map and an identity/no-warp baseline so near-Gaussian data is
+  left untouched; the AIC penalty stops the extra parameters from
+  overfitting) plus an optional non-negativity clamp (`floor=0.0`) keep
+  predictions of a bounded quantity physically valid under a real-line warp.
 - **Simulation** — conditional sequential **Gaussian** simulation
   (normal-score transform) and sequential **indicator** simulation
   (GSLIB-style ccdf with order-relation corrections), both with a
@@ -232,7 +235,8 @@ are comparable across families.
   here — scored by VEcv.
 - Next: paper draft (Mathematical Geosciences); GeoPackage I/O for SurtGIS
   integration (✅ point reading + point-layer writing; raster/tile output
-  pending); richer transport maps (compositions, SVGD).
+  pending); richer transport maps (✅ composed Box–Cox → sinh–arcsinh;
+  deeper flows / SVGD-fitted full transport pending).
 
 ## Python quickstart
 

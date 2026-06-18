@@ -79,9 +79,9 @@ pub use simulation::{
 };
 pub use sis::{SisConfig, sequential_indicator_simulation, sis_at};
 pub use tgp::{
-    AnyMarginal, BoxCox, FittedMarginal, Identity, MarginalSelection, MarginalTransport,
-    SinhArcsinh, TransportKriging, WarpedEstimate, YeoJohnson, fit_best_marginal, fit_box_cox,
-    fit_sinh_arcsinh, fit_yeo_johnson,
+    AnyMarginal, BoxCox, BoxCoxSinhArcsinh, Composed, FittedMarginal, Identity, MarginalSelection,
+    MarginalTransport, SinhArcsinh, TransportKriging, WarpedEstimate, YeoJohnson,
+    fit_best_marginal, fit_box_cox, fit_box_cox_sinh_arcsinh, fit_sinh_arcsinh, fit_yeo_johnson,
 };
 pub use trans::{LognormalEstimate, lognormal_kriging};
 pub use transform::NormalScore;

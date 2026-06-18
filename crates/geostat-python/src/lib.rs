@@ -877,7 +877,8 @@ fn indicator_kriging(
 /// kriges in the Gaussian latent space, and back-transforms by Monte Carlo.
 ///
 /// `warp` is "auto" (default — pick the family by AIC), "box-cox",
-/// "yeo-johnson", "sinh-arcsinh" or "identity" (no warp). `floor`, if given,
+/// "yeo-johnson", "sinh-arcsinh", "composed" (Box-Cox → sinh-arcsinh) or
+/// "identity" (no warp). `floor`, if given,
 /// clamps every back-transformed prediction to be at least that value — pass
 /// `floor=0.0` for a strictly non-negative quantity (e.g. a concentration)
 /// when using a real-line warp such as sinh-arcsinh.
@@ -911,7 +912,7 @@ fn warped_kriging(
 ) -> PyResult<Py<PyDict>> {
     use core::{
         FittedMarginal, MarginalTransport, TransportKriging, fit_best_marginal, fit_box_cox,
-        fit_sinh_arcsinh, fit_yeo_johnson,
+        fit_box_cox_sinh_arcsinh, fit_sinh_arcsinh, fit_yeo_johnson,
     };
 
     if target_x.len() != target_y.len() {
@@ -1045,6 +1046,20 @@ fn warped_kriging(
             seed,
             floor,
         )?,
+        "composed" => run(
+            py,
+            &data,
+            fit_box_cox_sinh_arcsinh(data.values()).map_err(err)?,
+            &targets,
+            &quantiles,
+            n_lags,
+            max_dist,
+            max_neighbors,
+            radius,
+            n_samples,
+            seed,
+            floor,
+        )?,
         "identity" => run(
             py,
             &data,
@@ -1061,7 +1076,7 @@ fn warped_kriging(
         )?,
         other => {
             return Err(PyValueError::new_err(format!(
-                "unknown warp '{other}' (auto, box-cox, yeo-johnson, sinh-arcsinh or identity)"
+                "unknown warp '{other}' (auto, box-cox, yeo-johnson, sinh-arcsinh, composed or identity)"
             )));
         }
     };

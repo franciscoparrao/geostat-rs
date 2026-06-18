@@ -447,6 +447,8 @@ enum WarpArg {
     YeoJohnson,
     /// sinh–arcsinh transform (auto-fitted skew + tails)
     SinhArcsinh,
+    /// Composed Box–Cox → sinh–arcsinh (auto-fitted; most expressive)
+    Composed,
 }
 
 #[derive(Args)]
@@ -823,7 +825,7 @@ fn run_rk(cmd: RkCmd) -> Result<()> {
 fn run_tgp(cmd: TgpCmd) -> Result<()> {
     use geostat_core::{
         FittedMarginal, Identity, MarginalTransport, TransportKriging, fit_best_marginal,
-        fit_box_cox, fit_sinh_arcsinh, fit_yeo_johnson,
+        fit_box_cox, fit_box_cox_sinh_arcsinh, fit_sinh_arcsinh, fit_yeo_johnson,
     };
 
     let data = cmd.input.read()?;
@@ -909,6 +911,15 @@ fn run_tgp(cmd: TgpCmd) -> Result<()> {
                 "Fitted sinh–arcsinh: epsilon = {:.4}, delta = {:.4}",
                 m.transform().epsilon,
                 m.transform().delta
+            );
+            run(&data, m, &cmd)
+        }
+        WarpArg::Composed => {
+            let m = fit_box_cox_sinh_arcsinh(data.values())?;
+            let t = m.transform();
+            println!(
+                "Fitted composed Box–Cox→sinh–arcsinh: lambda = {:.4}, epsilon = {:.4}, delta = {:.4}",
+                t.inner.lambda, t.outer.epsilon, t.outer.delta
             );
             run(&data, m, &cmd)
         }
