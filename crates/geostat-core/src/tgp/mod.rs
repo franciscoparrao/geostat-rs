@@ -108,11 +108,24 @@ impl<'a, T: MarginalTransport, const D: usize> TransportKriging<'a, T, D> {
         let est = kriging.predict(target)?;
         let sd = est.variance.max(0.0).sqrt();
 
-        // Monte Carlo through the inverse marginal.
+        // Monte Carlo through the inverse marginal. A heavy-tailed transform
+        // (e.g. a composed Box-Cox -> sinh-arcsinh) can overflow to a
+        // non-finite value far out in the tail; those draws are numerical
+        // overflow, not real values, so they are dropped before forming the
+        // E-type mean/std and quantiles (otherwise a single +inf draw would
+        // destroy the mean).
         let mut rng = Rng::new(seed);
         let mut draws: Vec<f64> = (0..n_samples)
             .map(|_| self.marginal.to_data(est.value + sd * rng.normal()))
+            .filter(|d| d.is_finite())
             .collect();
+        if draws.len() < 2 {
+            return Ok(WarpedEstimate {
+                mean: f64::NAN,
+                std: f64::NAN,
+                quantiles: quantiles.iter().map(|_| f64::NAN).collect(),
+            });
+        }
         let n = draws.len() as f64;
         let mean = draws.iter().sum::<f64>() / n;
         let var = draws.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / n;
