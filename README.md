@@ -51,8 +51,9 @@ prediction out of the box.
   `.gpkg` and write kriging results back to one (pure Rust via bundled
   SQLite — no GDAL): any CLI subcommand accepts a `.gpkg` input,
   `geostat gpkg-info` lists its layers, and `geostat krige -o out.gpkg`
-  writes a point layer (prediction + variance) with a recorded CRS, readable
-  by QGIS/GDAL. The geometry's X/Y are the coordinates; an attribute the value.
+  writes a point layer (prediction + variance) — or, with `--raster`, a
+  single-band **2D-gridded-coverage** raster (16-bit PNG tile, values
+  preserved via scale/offset) — with a recorded CRS, readable by QGIS/GDAL.
 - **Validation** — leave-one-out cross-validation with error measures
   (ME, MAE, MSE, RMSE, MSDR), scale-free relative measures (RME, RMAE,
   RRMSE) and predictive-accuracy measures **VEcv** (variance explained by
@@ -149,6 +150,8 @@ geostat gpkg-info -i meuse.gpkg                            # list layers
 geostat cv -i meuse.gpkg --value-col lzinc -m model.json   # any subcommand reads .gpkg
 geostat krige -i meuse.gpkg --value-col lzinc -m model.json \
     --nx 100 --ny 100 --srs 28992 -o kriged.gpkg           # write a .gpkg point layer
+geostat krige -i meuse.gpkg --value-col lzinc -m model.json \
+    --nx 200 --ny 200 --srs 28992 --raster -o kriged.gpkg  # write a single-band raster
 ```
 
 Other useful flags: `--azimuth/--dip/--tolerance` (directional variograms,
@@ -234,9 +237,9 @@ are comparable across families.
   the author's Rust engines — a Smelt random-forest trend + residual kriging
   here — scored by VEcv.
 - Next: paper draft (Mathematical Geosciences); GeoPackage I/O for SurtGIS
-  integration (✅ point reading + point-layer writing; raster/tile output
-  pending); richer transport maps (✅ composed Box–Cox → sinh–arcsinh;
-  deeper flows / SVGD-fitted full transport pending).
+  integration (✅ point reading + point-layer writing + single-band raster /
+  2D-gridded-coverage output); richer transport maps (✅ composed Box–Cox →
+  sinh–arcsinh; deeper flows / SVGD-fitted full transport pending).
 
 ## Python quickstart
 

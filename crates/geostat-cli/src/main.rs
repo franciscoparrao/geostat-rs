@@ -273,6 +273,10 @@ struct KrigeCmd {
     /// CRS (EPSG/srs_id) recorded when writing a GeoPackage output
     #[arg(long, default_value_t = 0)]
     srs: i32,
+    /// For a grid .gpkg output, write a single-band raster (2D gridded
+    /// coverage, prediction only) instead of a point layer
+    #[arg(long)]
+    raster: bool,
 }
 
 #[derive(Args)]
@@ -503,22 +507,34 @@ fn is_gpkg(path: &std::path::Path) -> bool {
 }
 
 /// Writes a kriged grid as CSV, or — when the path is a `.gpkg` — as a
-/// GeoPackage point layer (cell centers) with prediction and variance columns.
+/// GeoPackage point layer (cell centers, prediction + variance), or, with
+/// `raster`, as a single-band 2D-gridded-coverage raster (prediction only).
 fn write_grid_result(
     path: &std::path::Path,
     grid: &Grid2D,
     values: &[f64],
     variances: &[f64],
     srs: i32,
+    raster: bool,
 ) -> Result<()> {
     if is_gpkg(path) {
-        gpkg::write_points(
-            path,
-            "kriging",
-            srs,
-            &grid.centers(),
-            &[("prediction", values), ("variance", variances)],
-        )
+        if raster {
+            let bbox = [
+                grid.x0,
+                grid.y0,
+                grid.x0 + grid.nx as f64 * grid.dx,
+                grid.y0 + grid.ny as f64 * grid.dy,
+            ];
+            gpkg::write_raster(path, "kriging", srs, grid.nx, grid.ny, bbox, values)
+        } else {
+            gpkg::write_points(
+                path,
+                "kriging",
+                srs,
+                &grid.centers(),
+                &[("prediction", values), ("variance", variances)],
+            )
+        }
     } else {
         io_utils::write_grid_csv(path, grid, values, variances)
     }
@@ -1070,7 +1086,7 @@ fn run_krige(cmd: KrigeCmd) -> Result<()> {
             "Lognormal kriging on {} cells (variance column is in log space)",
             grid.n_cells()
         );
-        write_grid_result(&cmd.output, &grid, &values, &variances, cmd.srs)?;
+        write_grid_result(&cmd.output, &grid, &values, &variances, cmd.srs, cmd.raster)?;
         println!("Output written to {}", cmd.output.display());
         return Ok(());
     }
@@ -1111,7 +1127,7 @@ fn run_krige(cmd: KrigeCmd) -> Result<()> {
         println!("Prediction range: [{min:.4}, {max:.4}]");
     }
 
-    write_grid_result(&cmd.output, &grid, &values, &variances, cmd.srs)?;
+    write_grid_result(&cmd.output, &grid, &values, &variances, cmd.srs, cmd.raster)?;
     println!("Output written to {}", cmd.output.display());
     Ok(())
 }

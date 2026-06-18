@@ -294,6 +294,238 @@ pub fn write_points(
     Ok(())
 }
 
+/// Encodes a grid of `f64` values (row-major, `iy*nx+ix`, y increasing) as a
+/// 16-bit grayscale PNG plus the linear `value = pixel*scale + offset` mapping
+/// and the data statistics. Image rows run north→south (row 0 = max y), so the
+/// grid's top row (`iy = ny-1`) is written first. NaN cells map to pixel 0
+/// (the nodata value); finite values map to `1..=65535`.
+struct RasterEncoding {
+    png: Vec<u8>,
+    scale: f64,
+    offset: f64,
+    min: f64,
+    max: f64,
+    mean: f64,
+    std_dev: f64,
+}
+
+fn encode_raster(nx: usize, ny: usize, values: &[f64]) -> Result<RasterEncoding> {
+    let finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    if finite.is_empty() {
+        bail!("raster has no finite values");
+    }
+    let min = finite.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = finite.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let n = finite.len() as f64;
+    let mean = finite.iter().sum::<f64>() / n;
+    let std_dev = (finite.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n).sqrt();
+
+    // Linear map: pixel 1 -> min, pixel 65535 -> max; pixel 0 = nodata.
+    let span = (max - min).max(f64::MIN_POSITIVE);
+    let scale = span / 65534.0;
+    let offset = min - scale; // value = pixel*scale + offset
+    let to_pixel = |v: f64| -> u16 {
+        if !v.is_finite() {
+            0
+        } else {
+            (1.0 + (v - min) / span * 65534.0)
+                .round()
+                .clamp(1.0, 65535.0) as u16
+        }
+    };
+
+    // 16-bit samples, big-endian (PNG order), rows north→south.
+    let mut bytes = Vec::with_capacity(nx * ny * 2);
+    for r in 0..ny {
+        let iy = ny - 1 - r;
+        for ix in 0..nx {
+            let px = to_pixel(values[iy * nx + ix]);
+            bytes.extend_from_slice(&px.to_be_bytes());
+        }
+    }
+    let mut png = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut png, nx as u32, ny as u32);
+        enc.set_color(png::ColorType::Grayscale);
+        enc.set_depth(png::BitDepth::Sixteen);
+        let mut writer = enc
+            .write_header()
+            .map_err(|e| anyhow::anyhow!("PNG header: {e}"))?;
+        writer
+            .write_image_data(&bytes)
+            .map_err(|e| anyhow::anyhow!("PNG data: {e}"))?;
+    }
+    Ok(RasterEncoding {
+        png,
+        scale,
+        offset,
+        min,
+        max,
+        mean,
+        std_dev,
+    })
+}
+
+/// Writes a kriged grid to a new GeoPackage as a single-band raster, using the
+/// OGC **2D Gridded Coverage** extension (16-bit PNG tile with a linear
+/// scale/offset), so the actual prediction values — not just an image — are
+/// preserved and read back by GDAL/QGIS as a continuous raster.
+///
+/// `bbox` is `[min_x, min_y, max_x, max_y]` of the grid extent; `values` are in
+/// grid storage order (`iy*nx + ix`, y increasing). A single zoom level holds
+/// the whole grid as one tile.
+pub fn write_raster(
+    path: &Path,
+    layer: &str,
+    srs_id: i32,
+    nx: usize,
+    ny: usize,
+    bbox: [f64; 4],
+    values: &[f64],
+) -> Result<()> {
+    if values.len() != nx * ny {
+        bail!("{} values for an {nx}x{ny} grid", values.len());
+    }
+    let enc = encode_raster(nx, ny, values)?;
+    let [min_x, min_y, max_x, max_y] = bbox;
+    let pixel_x = (max_x - min_x) / nx as f64;
+    let pixel_y = (max_y - min_y) / ny as f64;
+
+    if path.exists() {
+        std::fs::remove_file(path)
+            .with_context(|| format!("replacing existing {}", path.display()))?;
+    }
+    let conn = Connection::open(path)
+        .with_context(|| format!("creating GeoPackage {}", path.display()))?;
+    conn.pragma_update(None, "application_id", 0x4750_4B47_i64)?;
+    conn.pragma_update(None, "user_version", 10300_i64)?;
+
+    // Core + tiles + gridded-coverage schema.
+    conn.execute_batch(
+        "CREATE TABLE gpkg_spatial_ref_sys (
+            srs_name TEXT NOT NULL, srs_id INTEGER PRIMARY KEY,
+            organization TEXT NOT NULL, organization_coordsys_id INTEGER NOT NULL,
+            definition TEXT NOT NULL, description TEXT);
+         CREATE TABLE gpkg_contents (
+            table_name TEXT NOT NULL PRIMARY KEY, data_type TEXT NOT NULL,
+            identifier TEXT UNIQUE, description TEXT DEFAULT '',
+            last_change TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            min_x DOUBLE, min_y DOUBLE, max_x DOUBLE, max_y DOUBLE, srs_id INTEGER);
+         CREATE TABLE gpkg_tile_matrix_set (
+            table_name TEXT NOT NULL PRIMARY KEY, srs_id INTEGER NOT NULL,
+            min_x DOUBLE NOT NULL, min_y DOUBLE NOT NULL,
+            max_x DOUBLE NOT NULL, max_y DOUBLE NOT NULL);
+         CREATE TABLE gpkg_tile_matrix (
+            table_name TEXT NOT NULL, zoom_level INTEGER NOT NULL,
+            matrix_width INTEGER NOT NULL, matrix_height INTEGER NOT NULL,
+            tile_width INTEGER NOT NULL, tile_height INTEGER NOT NULL,
+            pixel_x_size DOUBLE NOT NULL, pixel_y_size DOUBLE NOT NULL,
+            CONSTRAINT pk_ttm PRIMARY KEY (table_name, zoom_level));
+         CREATE TABLE gpkg_extensions (
+            table_name TEXT, column_name TEXT, extension_name TEXT NOT NULL,
+            definition TEXT NOT NULL, scope TEXT NOT NULL,
+            CONSTRAINT ge_tce UNIQUE (table_name, column_name, extension_name));
+         CREATE TABLE gpkg_2d_gridded_coverage_ancillary (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tile_matrix_set_name TEXT NOT NULL UNIQUE,
+            datatype TEXT NOT NULL DEFAULT 'integer',
+            scale REAL NOT NULL DEFAULT 1.0, offset REAL NOT NULL DEFAULT 0.0,
+            precision REAL DEFAULT 1.0, data_null REAL,
+            grid_cell_encoding TEXT DEFAULT 'grid-value-is-center',
+            uom TEXT, field_name TEXT DEFAULT 'Height',
+            quantity_definition TEXT DEFAULT 'Height');
+         CREATE TABLE gpkg_2d_gridded_tile_ancillary (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tpudt_name TEXT NOT NULL, tpudt_id INTEGER NOT NULL,
+            scale REAL NOT NULL DEFAULT 1.0, offset REAL NOT NULL DEFAULT 0.0,
+            min REAL, max REAL, mean REAL, std_dev REAL,
+            UNIQUE (tpudt_name, tpudt_id));",
+    )?;
+
+    conn.execute_batch(
+        "INSERT INTO gpkg_spatial_ref_sys VALUES
+            ('Undefined cartesian SRS', -1, 'NONE', -1, 'undefined', NULL),
+            ('Undefined geographic SRS', 0, 'NONE', 0, 'undefined', NULL),
+            ('WGS 84 geodetic', 4326, 'EPSG', 4326, 'undefined', NULL);",
+    )?;
+    if !matches!(srs_id, -1 | 0 | 4326) {
+        conn.execute(
+            "INSERT INTO gpkg_spatial_ref_sys VALUES (?1, ?2, 'EPSG', ?2, 'undefined', NULL)",
+            rusqlite::params![format!("SRS {srs_id}"), srs_id],
+        )?;
+    }
+
+    // Tile pyramid user-data table (one tile).
+    conn.execute(
+        &format!(
+            "CREATE TABLE {} (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                zoom_level INTEGER NOT NULL, tile_column INTEGER NOT NULL,
+                tile_row INTEGER NOT NULL, tile_data BLOB NOT NULL,
+                UNIQUE (zoom_level, tile_column, tile_row))",
+            quote_ident(layer)
+        ),
+        [],
+    )?;
+
+    conn.execute(
+        "INSERT INTO gpkg_contents
+            (table_name, data_type, identifier, min_x, min_y, max_x, max_y, srs_id)
+         VALUES (?1, '2d-gridded-coverage', ?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![layer, min_x, min_y, max_x, max_y, srs_id],
+    )?;
+    conn.execute(
+        "INSERT INTO gpkg_tile_matrix_set VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![layer, srs_id, min_x, min_y, max_x, max_y],
+    )?;
+    conn.execute(
+        "INSERT INTO gpkg_tile_matrix VALUES (?1, 0, 1, 1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![layer, nx as i64, ny as i64, pixel_x, pixel_y],
+    )?;
+
+    let def = "http://docs.opengeospatial.org/is/17-066r1/17-066r1.html";
+    conn.execute(
+        "INSERT INTO gpkg_extensions VALUES
+            ('gpkg_2d_gridded_coverage_ancillary', NULL, 'gpkg_2d_gridded_coverage', ?1, 'read-write')",
+        rusqlite::params![def],
+    )?;
+    conn.execute(
+        "INSERT INTO gpkg_extensions VALUES
+            ('gpkg_2d_gridded_tile_ancillary', NULL, 'gpkg_2d_gridded_coverage', ?1, 'read-write')",
+        rusqlite::params![def],
+    )?;
+    conn.execute(
+        "INSERT INTO gpkg_extensions VALUES (?1, 'tile_data', 'gpkg_2d_gridded_coverage', ?2, 'read-write')",
+        rusqlite::params![layer, def],
+    )?;
+    conn.execute(
+        "INSERT INTO gpkg_2d_gridded_coverage_ancillary
+            (tile_matrix_set_name, datatype, scale, offset, precision, data_null, field_name, quantity_definition)
+         VALUES (?1, 'integer', ?2, ?3, ?4, 0.0, 'prediction', 'prediction')",
+        rusqlite::params![layer, enc.scale, enc.offset, enc.scale],
+    )?;
+
+    // The single tile, plus its value statistics.
+    conn.execute(
+        &format!(
+            "INSERT INTO {} (zoom_level, tile_column, tile_row, tile_data) VALUES (0, 0, 0, ?1)",
+            quote_ident(layer)
+        ),
+        rusqlite::params![enc.png],
+    )?;
+    let tile_id: i64 = conn.query_row(
+        &format!("SELECT id FROM {} WHERE zoom_level=0", quote_ident(layer)),
+        [],
+        |r| r.get(0),
+    )?;
+    conn.execute(
+        "INSERT INTO gpkg_2d_gridded_tile_ancillary
+            (tpudt_name, tpudt_id, scale, offset, min, max, mean, std_dev)
+         VALUES (?1, ?2, 1.0, 0.0, ?3, ?4, ?5, ?6)",
+        rusqlite::params![layer, tile_id, enc.min, enc.max, enc.mean, enc.std_dev],
+    )?;
+    Ok(())
+}
+
 fn rd_u32(b: &[u8], le: bool) -> u32 {
     let a = [b[0], b[1], b[2], b[3]];
     if le {
@@ -394,6 +626,83 @@ mod tests {
     fn quotes_identifiers_safely() {
         assert_eq!(quote_ident("zinc"), "\"zinc\"");
         assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
+    }
+
+    #[test]
+    fn encode_raster_reconstructs_values() {
+        // 2x3 grid (nx=2, ny=3), storage order iy*nx+ix, y increasing.
+        let nx = 2;
+        let ny = 3;
+        let values = [1.0, 2.0, 3.0, 4.0, f64::NAN, 6.0];
+        let enc = encode_raster(nx, ny, &values).unwrap();
+        assert_eq!(enc.min, 1.0);
+        assert_eq!(enc.max, 6.0);
+
+        // Decode the PNG and check value = pixel*scale + offset, with the
+        // north-up row flip (image row 0 = grid top row iy = ny-1).
+        let dec = png::Decoder::new(std::io::Cursor::new(&enc.png));
+        let mut reader = dec.read_info().unwrap();
+        let mut buf = vec![0u8; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        assert_eq!((info.width, info.height), (nx as u32, ny as u32));
+        let pixel = |r: usize, c: usize| -> u16 {
+            let i = (r * nx + c) * 2;
+            u16::from_be_bytes([buf[i], buf[i + 1]])
+        };
+        for r in 0..ny {
+            let iy = ny - 1 - r; // image row r -> grid row iy
+            for c in 0..nx {
+                let v = values[iy * nx + c];
+                let px = pixel(r, c);
+                if v.is_finite() {
+                    let recon = px as f64 * enc.scale + enc.offset;
+                    assert!((recon - v).abs() <= enc.scale, "{v} -> {recon}");
+                } else {
+                    assert_eq!(px, 0, "NaN must map to nodata pixel 0");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn write_raster_builds_gridded_coverage() {
+        let path = std::env::temp_dir().join("geostat_rs_raster_test.gpkg");
+        let _ = std::fs::remove_file(&path);
+        let (nx, ny) = (4, 3);
+        let values: Vec<f64> = (0..nx * ny).map(|i| i as f64).collect();
+        write_raster(
+            &path,
+            "kriging",
+            4326,
+            nx,
+            ny,
+            [0.0, 0.0, 4.0, 3.0],
+            &values,
+        )
+        .unwrap();
+
+        let conn = open(&path).unwrap();
+        let dtype: String = conn
+            .query_row(
+                "SELECT data_type FROM gpkg_contents WHERE table_name='kriging'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dtype, "2d-gridded-coverage");
+        let n_tiles: i64 = conn
+            .query_row("SELECT COUNT(*) FROM \"kriging\"", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n_tiles, 1);
+        let dt: String = conn
+            .query_row(
+                "SELECT datatype FROM gpkg_2d_gridded_coverage_ancillary",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dt, "integer");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

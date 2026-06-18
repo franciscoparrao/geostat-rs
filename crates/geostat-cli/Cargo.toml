@@ -20,3 +20,5 @@ serde_json = { workspace = true }
 # Bundled SQLite: GeoPackage I/O without a system GDAL/SQLite dependency,
 # keeping the single-binary, no-heavy-deps ethos. Matches SurtGIS's version.
 rusqlite = { version = "0.39", features = ["bundled"] }
+# Pure-Rust PNG encoder for GeoPackage 2D-gridded-coverage raster tiles.
+png = "0.17"
