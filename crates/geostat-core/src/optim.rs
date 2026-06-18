@@ -1,9 +1,9 @@
 //! Small derivative-free optimizers shared across the crate (variogram
-//! fitting, marginal-transport fitting).
+//! fitting) and by downstream crates (e.g. marginal-transport fitting).
 
 /// Standard Nelder–Mead simplex minimization. Returns the best parameter
 /// vector found and its objective value.
-pub(crate) fn nelder_mead<F>(f: F, x0: &[f64], step: f64, max_iter: usize) -> (Vec<f64>, f64)
+pub fn nelder_mead<F>(f: F, x0: &[f64], step: f64, max_iter: usize) -> (Vec<f64>, f64)
 where
     F: Fn(&[f64]) -> f64,
 {

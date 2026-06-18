@@ -59,19 +59,6 @@ prediction out of the box.
   RRMSE) and predictive-accuracy measures **VEcv** (variance explained by
   cross-validation, Li 2016) and **E₁** (Legates–McCabe), with or without
   external drift.
-- **Transport (warped) kriging** — Transport-GP-style kriging with a
-  learnable marginal transport map (Box–Cox, Yeo–Johnson, sinh–arcsinh,
-  fitted by maximum likelihood); latent-space kriging plus a Monte Carlo
-  back-transform yielding an unbiased E-type estimate, posterior std and
-  predictive quantiles. Generalizes the normal-score and lognormal
-  warpings; built for small, skewed samples (e.g. geochemistry).
-  **Composed transports** chain monotone maps (Box–Cox → sinh–arcsinh, a
-  two-layer normalizing flow) for marginals neither captures alone.
-  **Automatic family selection** by AIC (`warp="auto"`, including the
-  composed map and an identity/no-warp baseline so near-Gaussian data is
-  left untouched; the AIC penalty stops the extra parameters from
-  overfitting) plus an optional non-negativity clamp (`floor=0.0`) keep
-  predictions of a bounded quantity physically valid under a real-line warp.
 - **Simulation** — conditional sequential **Gaussian** simulation
   (normal-score transform) and sequential **indicator** simulation
   (GSLIB-style ccdf with order-relation corrections), both with a
@@ -218,28 +205,19 @@ are comparable across families.
   Block co-kriging matches gstat to machine precision; simple lognormal
   kriging matches gstat's SK back-transform to ~1e-9 (ordinary follows the
   Journel & Huijbregts formula).
-- v0.6: ✅ Transport (warped) kriging — learnable marginal transport maps
-  (the marginal core of Transport Gaussian Processes) on top of the kriging
-  engine. The Monte Carlo E-type estimate is anchored to the analytic
-  (gstat-validated) lognormal back-transform; exposed in the CLI (`tgp`)
-  and Python (`warped_kriging`). Automatic transport-family selection by
-  AIC (with an identity baseline) and an optional non-negativity floor for
-  bounded quantities.
-- Post-v0.6: ✅ automatic transport-family selection (AIC) + non-negativity
-  floor; ✅ VEcv/E₁ and relative error measures in cross-validation
-  (parity with Li's spm::pred.acc); ✅ regression kriging (separate trend
-  + residual kriging), the bridge to an ML trend engine; ✅ IDW/k-NN/NN
-  baselines + a VEcv method-comparison harness; ✅ hyperparameter tuning by
-  predictive accuracy (IDW power, k-NN k, kriging neighborhood).
+- v0.6: ✅ VEcv/E₁ and relative error measures in cross-validation (parity
+  with Li's spm::pred.acc); ✅ regression kriging (separate trend + residual
+  kriging), the bridge to an ML trend engine; ✅ IDW/k-NN/NN baselines + a
+  VEcv method-comparison harness; ✅ hyperparameter tuning by predictive
+  accuracy (IDW power, k-NN k, kriging neighborhood).
 - ML+geostatistics hybrids: regression kriging accepts an external trend, so
   an ML model supplies the mean and geostat-rs kriges the residuals. See
   `examples/hybrid_smelt_rk.py` for an RFOK-style hybrid built entirely from
   the author's Rust engines — a Smelt random-forest trend + residual kriging
   here — scored by VEcv.
-- Next: paper draft (Mathematical Geosciences); GeoPackage I/O for SurtGIS
+- Next: paper draft (Computers & Geosciences); GeoPackage I/O for SurtGIS
   integration (✅ point reading + point-layer writing + single-band raster /
-  2D-gridded-coverage output); richer transport maps (✅ composed Box–Cox →
-  sinh–arcsinh; deeper flows / SVGD-fitted full transport pending).
+  2D-gridded-coverage output).
 
 ## Python quickstart
 

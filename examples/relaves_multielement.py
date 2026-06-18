@@ -11,10 +11,9 @@ given element actually tracks. This mirrors the real geochemistry: light REE
 partition into phosphates, heavy REE and Y into zircon / heavy minerals.
 
 Each element is scored on a hold-out by VEcv (variance explained by
-cross-validation, Li 2016) for five predictors, and the 80% predictive interval
-of the two location-only ones is checked for coverage and physical validity
-(a grade cannot be negative). The spread of skew across the series (Y ≈ 0.5 to
-La ≈ 10) shows where covariates and where the transport warp earn their place.
+cross-validation, Li 2016) for four predictors. The spread of skew across the
+series (Y ≈ 0.5 to La ≈ 10) shows where the covariates earn their place — and
+where ordinary kriging's symmetric intervals fail on skewed grades.
 
 Requires geostat_rs + smelt + numpy + pandas. Run from the repo root:
     python3 examples/relaves_multielement.py
@@ -89,9 +88,9 @@ def main():
     print(f"{REGION}: {len(df)} deposits  (train={len(tr)}, test={len(te)})")
     print(f"covariates (non-REE host proxies): {', '.join(COVARIATES)}\n")
     print("Predictive accuracy — VEcv % (higher is better):")
-    print(f"  {'element':<9}{'skew':>6}{'OK':>8}{'RK-OLS':>8}{'RF':>8}{'hybrid':>8}{'warp':>8}")
+    print(f"  {'element':<9}{'skew':>6}{'OK':>8}{'RK-OLS':>8}{'RF':>8}{'hybrid':>8}")
 
-    calib = []
+    neg_rows = []
     for tgt in TARGETS:
         trv = tr[tgt].tolist()
         tev = te[tgt].tolist()
@@ -107,39 +106,25 @@ def main():
         hyb = gs.regression_kriging(trx, tryy, trv, tr_cov, tex, tey, te_cov,
                                     trend_at_data=rf_tr, trend_at_targets=rf_te,
                                     n_lags=12, max_neighbors=24)
-        wa = gs.warped_kriging(trx, tryy, trv, tex, tey, warp="auto",
-                               quantiles=[0.1, 0.9], n_lags=12, max_neighbors=24,
-                               n_samples=6000, seed=1, floor=0.0)
 
         name = tgt.split("(")[0]
         print(f"  {name:<9}{skew(df[tgt].tolist()):>6.1f}{vecv(tev, ok_pred):>8.1f}"
               f"{vecv(tev, rk['prediction']):>8.1f}{vecv(tev, rf_te):>8.1f}"
-              f"{vecv(tev, hyb['prediction']):>8.1f}{vecv(tev, wa['mean']):>8.1f}")
+              f"{vecv(tev, hyb['prediction']):>8.1f}")
 
-        # 80% interval calibration / validity for the location-only predictors.
+        # Fraction of ordinary-kriging 80% lower bounds below 0 (invalid grade).
         lo_ok = [m - Z90 * math.sqrt(max(s, 0)) for m, s in zip(ok_pred, ok_var)]
-        hi_ok = [m + Z90 * math.sqrt(max(s, 0)) for m, s in zip(ok_pred, ok_var)]
-        lo_w = [q[0] for q in wa["quantiles"]]
-        hi_w = [q[1] for q in wa["quantiles"]]
+        neg_rows.append((name, sum(1 for a in lo_ok if a < 0) / len(lo_ok)))
 
-        def cover(lo, hi):
-            return sum(1 for t, a, b in zip(tev, lo, hi) if a <= t <= b) / len(tev)
-
-        def neg(lo):
-            return sum(1 for a in lo if a < 0) / len(lo)
-
-        calib.append((name, wa["family"], cover(lo_ok, hi_ok), neg(lo_ok),
-                      cover(lo_w, hi_w), neg(lo_w)))
-
-    print("\n80% prediction interval, location-only predictors (nominal coverage 0.80;")
-    print("neg = fraction of lower bounds below 0, invalid for a grade):")
-    print(f"  {'element':<9}{'warp':<11}{'OK cov':>8}{'OK neg':>8}{'warp cov':>10}{'warp neg':>10}")
-    for name, fam, c_ok, n_ok, c_w, n_w in calib:
-        print(f"  {name:<9}{fam:<11}{c_ok:>7.0%}{n_ok:>8.0%}{c_w:>10.0%}{n_w:>10.0%}")
+    print("\nOrdinary-kriging 80% interval: fraction of lower bounds below 0")
+    print("(invalid for a grade) — symmetric Gaussian intervals fail on skew:")
+    print(f"  {'element':<9}{'neg lower bounds':>18}")
+    for name, neg in neg_rows:
+        print(f"  {name:<9}{neg:>17.0%}")
 
     print("\nLight REE (Ce, Nd) track the phosphate proxies (P2O5, Th); Y (heavy)")
     print("tracks Ti/Fe/Zr; La is poorly predicted by any of them. Covariates help")
-    print("in proportion to that signal; the warp keeps skewed intervals positive.")
+    print("in proportion to that signal. The negative-bound fraction grows with skew.")
 
 
 if __name__ == "__main__":

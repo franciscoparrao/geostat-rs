@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Multi-covariate prediction of a rare-earth grade on real Chilean tailings,
-with the full geostat-rs + Smelt machinery — the engine working on the kind of
-data it was built for.
+with the geostat-rs + Smelt machinery — the engine working on the kind of data
+it was built for.
 
-Data: the national tailings geochemistry database (TGPY, `tierras_raras.pkl`,
+Data: the national tailings geochemistry database (`tierras_raras.pkl`,
 2032 samples × 70 geochemical variables). We predict Nd (neodymium, g/t) in the
 densest region (Coquimbo, ~1100 deposits), which is heavily right-skewed
 (skew ~6). The covariates are deliberately NOT the neighbouring light REE
@@ -20,7 +20,6 @@ Li 2016 — a scale-free, cross-validated R²) and RMSE:
   * regression kriging/OLS  (linear trend on the 4 covariates + residual krige)
   * random forest only      (Smelt; covariates, no spatial residual)
   * RF + residual kriging   (Smelt trend + geostat-rs residual krige = RFOK)
-  * warped kriging (auto)   (location only; for calibrated intervals on skew)
 
 Requires `geostat_rs`, `smelt`, numpy, pandas in one environment. Run from the
 repo root (the data path is absolute):
@@ -130,42 +129,29 @@ def main():
                                 trend_at_data=rf_tr, trend_at_targets=rf_te,
                                 n_lags=12, max_neighbors=24)
 
-    # 5. Warped kriging (auto family) — location only; calibrated intervals.
-    wa = gs.warped_kriging(trx, tryy, trv, tex, tey, warp="auto",
-                           quantiles=[0.1, 0.9], n_lags=12, max_neighbors=24,
-                           n_samples=6000, seed=1, floor=0.0)
-
     print(f"  {'method':<26}{'RMSE':>8}{'VEcv %':>9}")
     for name, pred in [
         ("ordinary kriging", ok_pred),
         ("regression kriging (OLS)", rk["prediction"]),
         ("random forest only", rf_te),
         ("RF + residual kriging", hyb["prediction"]),
-        (f"warped auto[{wa['family']}]", wa["mean"]),
     ]:
         print(f"  {name:<26}{rmse(tev, pred):>8.2f}{vecv(tev, pred):>9.1f}")
 
-    # Distributional check: 80% prediction interval for the two location-only
-    # predictors. Ordinary kriging uses a symmetric Gaussian N(pred, var); the
-    # warp uses its P10/P90 quantiles directly.
+    # A symmetric-Gaussian 80% interval from ordinary kriging puts many lower
+    # bounds below zero — invalid for a concentration, and a known limitation of
+    # plain kriging on strongly-skewed grades.
     z = 1.281552  # standard-normal 0.90 quantile
     lo_ok = [m - z * math.sqrt(max(s, 0)) for m, s in zip(ok_pred, ok_var)]
-    hi_ok = [m + z * math.sqrt(max(s, 0)) for m, s in zip(ok_pred, ok_var)]
-    lo_w = [q[0] for q in wa["quantiles"]]
-    hi_w = [q[1] for q in wa["quantiles"]]
-
-    def cov(lo, hi):
-        return sum(1 for t, a, b in zip(tev, lo, hi) if a <= t <= b) / len(tev)
-
     print(
-        f"\n80% prediction interval (nominal 0.80):"
-        f"\n  ordinary kriging   coverage={cov(lo_ok, hi_ok):.0%}  neg-lower-bounds={neg_frac(lo_ok):.0%}"
-        f"\n  warped auto        coverage={cov(lo_w, hi_w):.0%}  neg-lower-bounds={neg_frac(lo_w):.0%}"
+        f"\nordinary-kriging 80% interval: {neg_frac(lo_ok):.0%} of lower bounds are "
+        "negative\n(invalid for a grade) — symmetric Gaussian intervals are unsuited to "
+        "skewed data."
     )
     print(
         "\nVEcv = variance explained by cross-validation (Li 2016); higher is better.\n"
-        "Covariates add predictive accuracy over plain kriging; the warp keeps the\n"
-        "skewed intervals positive where symmetric Gaussian kriging does not."
+        "On Nd the host-mineral proxies lift VEcv far above location-only kriging, and\n"
+        "the ML trend + residual-kriging hybrid is best."
     )
 
 

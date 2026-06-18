@@ -51,14 +51,13 @@ pub mod ik;
 pub mod interpolation;
 pub mod kriging;
 pub mod linalg;
-mod optim;
+pub mod optim;
 mod parallel;
 pub mod regression;
 pub mod rng;
 mod search;
 pub mod simulation;
 pub mod sis;
-pub mod tgp;
 pub mod trans;
 pub mod transform;
 pub mod tuning;
@@ -78,11 +77,6 @@ pub use simulation::{
     SgsConfig, SgsResult, sequential_gaussian_simulation, sequential_gaussian_simulation_3d, sgs_at,
 };
 pub use sis::{SisConfig, sequential_indicator_simulation, sis_at};
-pub use tgp::{
-    AnyMarginal, BoxCox, BoxCoxSinhArcsinh, Composed, FittedMarginal, Identity, MarginalSelection,
-    MarginalTransport, SinhArcsinh, TransportKriging, WarpedEstimate, YeoJohnson,
-    fit_best_marginal, fit_box_cox, fit_box_cox_sinh_arcsinh, fit_sinh_arcsinh, fit_yeo_johnson,
-};
 pub use trans::{LognormalEstimate, lognormal_kriging};
 pub use transform::NormalScore;
 pub use tuning::{TuneResult, tune_idw_power, tune_knn_k, tune_kriging_neighbors};
