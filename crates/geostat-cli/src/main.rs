@@ -1209,6 +1209,7 @@ fn run_cokrige(cmd: CokrigeCmd) -> Result<()> {
     let config = CoKrigingConfig {
         max_neighbors: cmd.neighbors.max_neighbors,
         search_radius: cmd.neighbors.radius,
+        ridge: 0.0,
     };
     let ck = CoKriging::new(vec![&primary, &secondary], &lmc, config)?;
     let (values, variances) = match &cmd.block {

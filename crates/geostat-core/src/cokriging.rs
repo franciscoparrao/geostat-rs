@@ -195,6 +195,13 @@ pub struct CoKrigingConfig {
     pub max_neighbors: Option<usize>,
     /// Search radius per variable.
     pub search_radius: Option<f64>,
+    /// Relative ridge added to the data-data diagonal of the co-kriging system
+    /// (each diagonal entry is multiplied by `1 + ridge`). Co-kriging matrices
+    /// are notoriously ill-conditioned — a strongly correlated secondary or a
+    /// cross-variogram fitted on few collocated points can drive the system
+    /// near-singular and blow the weights up. A tiny ridge (e.g. `1e-6`)
+    /// stabilizes it. Default `0.0` keeps the exact, gstat-validated system.
+    pub ridge: f64,
 }
 
 /// Ordinary co-kriging predictor. `datasets[0]` is the primary variable
@@ -353,6 +360,14 @@ impl<'a, const D: usize> CoKriging<'a, D> {
         }
         // Primary weights sum to 1, secondary weights to 0.
         b[n_total] = 1.0;
+
+        // Optional ridge on the data-data diagonal to stabilize ill-conditioned
+        // systems (leaves the Lagrange rows untouched).
+        if self.config.ridge > 0.0 {
+            for k in 0..n_total {
+                a[[k, k]] *= 1.0 + self.config.ridge;
+            }
+        }
 
         let b0 = b.clone();
         let w = solve(a, b)?;

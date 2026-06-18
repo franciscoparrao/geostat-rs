@@ -421,6 +421,87 @@ fn regression_kriging(
     Ok(out.into())
 }
 
+/// Ordinary co-kriging of a primary variable using a correlated secondary,
+/// under a linear model of coregionalization fitted automatically. The two
+/// variables may have different supports (heterotopic): the direct variograms
+/// use each variable's own points and the cross-variogram is fitted on the
+/// collocated subset (points shared by both, matched on exact coordinates).
+/// `ridge` (default 1e-2) inflates the co-kriging matrix diagonal to keep the
+/// notoriously ill-conditioned system stable; set 0.0 for the exact system.
+/// Returns `(predictions, variances)` of the primary at the targets.
+#[pyfunction]
+#[pyo3(signature = (px, py, pv, sx, sy, sv, target_x, target_y,
+    n_lags = 15, max_dist = None, max_neighbors = None, radius = None, ridge = 1e-2))]
+#[allow(clippy::too_many_arguments)]
+fn co_kriging(
+    px: Vec<f64>,
+    py: Vec<f64>,
+    pv: Vec<f64>,
+    sx: Vec<f64>,
+    sy: Vec<f64>,
+    sv: Vec<f64>,
+    target_x: Vec<f64>,
+    target_y: Vec<f64>,
+    n_lags: usize,
+    max_dist: Option<f64>,
+    max_neighbors: Option<usize>,
+    radius: Option<f64>,
+    ridge: f64,
+) -> PyResult<(Vec<f64>, Vec<f64>)> {
+    use std::collections::HashMap;
+    if target_x.len() != target_y.len() {
+        return Err(PyValueError::new_err(
+            "target_x and target_y differ in length",
+        ));
+    }
+    let primary = point_set(px, py, pv)?;
+    let secondary = point_set(sx, sy, sv)?;
+    let cfg = vario_config(&primary, n_lags, max_dist, None, 0.0, 22.5);
+    let ea = core::experimental_variogram(&primary, &cfg).map_err(err)?;
+    let eb = core::experimental_variogram(&secondary, &cfg).map_err(err)?;
+
+    // Collocated subset (exact coordinate match) for the cross-variogram.
+    let key = |c: &[f64; 2]| (c[0].to_bits(), c[1].to_bits());
+    let sec_lookup: HashMap<(u64, u64), f64> = secondary
+        .coords()
+        .iter()
+        .zip(secondary.values())
+        .map(|(c, &v)| (key(c), v))
+        .collect();
+    let (mut co_coords, mut co_pv, mut co_sv) = (Vec::new(), Vec::new(), Vec::new());
+    for (c, &v) in primary.coords().iter().zip(primary.values()) {
+        if let Some(&s) = sec_lookup.get(&key(c)) {
+            co_coords.push(*c);
+            co_pv.push(v);
+            co_sv.push(s);
+        }
+    }
+    if co_coords.len() < n_lags {
+        return Err(PyValueError::new_err(
+            "too few collocated primary/secondary points to fit the cross-variogram",
+        ));
+    }
+    let prim_co = PointSet::new(co_coords.clone(), co_pv).map_err(err)?;
+    let sec_co = PointSet::new(co_coords, co_sv).map_err(err)?;
+    let eab = core::experimental_cross_variogram(&prim_co, &sec_co, &cfg).map_err(err)?;
+
+    let template = core::fit_best(&ea, &core::ModelKind::ALL).map_err(err)?;
+    let lmc = core::fit_lmc(&ea, &eb, &eab, &template.model).map_err(err)?;
+    let config = core::CoKrigingConfig {
+        max_neighbors,
+        search_radius: radius,
+        ridge,
+    };
+    let ck = core::CoKriging::new(vec![&primary, &secondary], &lmc, config).map_err(err)?;
+    let targets: Vec<[f64; 2]> = target_x
+        .iter()
+        .zip(&target_y)
+        .map(|(&a, &b)| [a, b])
+        .collect();
+    let ests = ck.predict_many(&targets);
+    Ok(ests.into_iter().map(|e| (e.value, e.variance)).unzip())
+}
+
 /// Inverse-distance weighting at the targets. `power` controls locality
 /// (2 is typical); exact at the data. Returns a list of predictions.
 #[pyfunction]
@@ -1095,6 +1176,7 @@ fn geostat_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(regression_kriging, m)?)?;
     m.add_function(wrap_pyfunction!(idw, m)?)?;
     m.add_function(wrap_pyfunction!(knn, m)?)?;
+    m.add_function(wrap_pyfunction!(co_kriging, m)?)?;
     m.add_function(wrap_pyfunction!(compare_methods, m)?)?;
     m.add_function(wrap_pyfunction!(tune_idw_power, m)?)?;
     m.add_function(wrap_pyfunction!(tune_knn_k, m)?)?;

@@ -271,6 +271,10 @@ ik["ccdf"], ik["e_type"], ik["cond_var"]
 rk = gs.regression_kriging(x, y, vals, covars, tx, ty, target_covars)
 rk["prediction"], rk["variance"], rk["trend_coef"]
 
+# Ordinary co-kriging with a correlated secondary (auto-fitted LMC;
+# collocated or heterotopic; `ridge` stabilizes the system).
+pred, var = gs.co_kriging(px, py, pv, sx, sy, sv, tx, ty)
+
 # Baselines + method comparison by leave-one-out VEcv.
 idw_pred = gs.idw(x, y, vals, tx, ty, power=2.0, max_neighbors=16)
 ranking = gs.compare_methods(x, y, vals, max_neighbors=32, knn_k=8)
