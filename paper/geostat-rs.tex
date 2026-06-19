@@ -196,7 +196,10 @@ gstat~2.1.4. Single-threaded, geostat-rs is already faster than gstat at grid
 kriging ($1.2$--$2\times$); with its parallel moving-neighbourhood predictor on
 16 cores it is $6$--$12\times$ faster. Leave-one-out cross-validation is far
 faster still, as gstat's \texttt{krige.cv} carries per-fold R-level overhead
-that the parallel Rust implementation avoids.
+that the parallel Rust implementation avoids. For a global neighbourhood the
+kriging-system matrix is identical for every target, so geostat-rs factorizes it
+once (LU) and only back-substitutes per target, an order-of-magnitude saving on
+large grids.
 
 \begin{table}[t]
 \centering

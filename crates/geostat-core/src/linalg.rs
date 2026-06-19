@@ -8,22 +8,36 @@ use ndarray::Array2;
 
 use crate::error::{GeostatError, Result};
 
-/// Solves the dense system `A x = b` in place via LU with partial pivoting.
+/// An LU factorization with partial pivoting, reusable across many
+/// right-hand sides (the same system matrix, different `b`). This is what makes
+/// global-neighbourhood kriging fast: the system matrix is identical for every
+/// target, so it is factored once and only back-substituted per target.
+#[derive(Debug, Clone)]
+pub struct Lu {
+    /// Combined factors: the strict lower triangle holds the L multipliers
+    /// (unit diagonal implied), the upper triangle (incl. diagonal) holds U.
+    lu: Array2<f64>,
+    /// Row swapped with row `k` at elimination step `k`.
+    piv: Vec<usize>,
+    n: usize,
+}
+
+/// Factorizes `A = P L U` in place via LU with partial pivoting.
 #[allow(clippy::needless_range_loop)]
-pub fn solve(mut a: Array2<f64>, mut b: Vec<f64>) -> Result<Vec<f64>> {
+pub fn lu_factor(mut a: Array2<f64>) -> Result<Lu> {
     let n = a.nrows();
-    if a.ncols() != n || b.len() != n {
+    if a.ncols() != n {
         return Err(GeostatError::DimensionMismatch(format!(
-            "A is {}x{}, b has length {}",
+            "A is {}x{}, must be square",
             a.nrows(),
-            a.ncols(),
-            b.len()
+            a.ncols()
         )));
     }
     let scale = a
         .iter()
         .fold(0.0_f64, |m, v| m.max(v.abs()))
         .max(f64::MIN_POSITIVE);
+    let mut piv = vec![0usize; n];
 
     for k in 0..n {
         // Partial pivoting.
@@ -41,35 +55,68 @@ pub fn solve(mut a: Array2<f64>, mut b: Vec<f64>) -> Result<Vec<f64>> {
                 "pivot {max:.3e} at column {k} (matrix scale {scale:.3e})"
             )));
         }
+        piv[k] = p;
         if p != k {
             for j in 0..n {
                 a.swap([k, j], [p, j]);
             }
-            b.swap(k, p);
         }
         let pivot = a[[k, k]];
         for i in (k + 1)..n {
             let f = a[[i, k]] / pivot;
+            a[[i, k]] = f; // store the multiplier in the L part
             if f != 0.0 {
                 for j in (k + 1)..n {
                     a[[i, j]] -= f * a[[k, j]];
                 }
-                b[i] -= f * b[k];
             }
-            a[[i, k]] = 0.0;
         }
     }
+    Ok(Lu { lu: a, piv, n })
+}
 
-    // Back substitution.
-    let mut x = vec![0.0; n];
-    for i in (0..n).rev() {
-        let mut s = b[i];
-        for j in (i + 1)..n {
-            s -= a[[i, j]] * x[j];
+impl Lu {
+    /// Solves `A x = b` by reusing the factorization. `b` must have length `n`.
+    #[allow(clippy::needless_range_loop)]
+    pub fn solve(&self, mut b: Vec<f64>) -> Vec<f64> {
+        let n = self.n;
+        debug_assert_eq!(b.len(), n);
+        // Apply the row swaps recorded during factorization.
+        for k in 0..n {
+            b.swap(k, self.piv[k]);
         }
-        x[i] = s / a[[i, i]];
+        // Forward substitution (L, unit diagonal).
+        for i in 0..n {
+            let mut s = b[i];
+            for j in 0..i {
+                s -= self.lu[[i, j]] * b[j];
+            }
+            b[i] = s;
+        }
+        // Back substitution (U).
+        for i in (0..n).rev() {
+            let mut s = b[i];
+            for j in (i + 1)..n {
+                s -= self.lu[[i, j]] * b[j];
+            }
+            b[i] = s / self.lu[[i, i]];
+        }
+        b
     }
-    Ok(x)
+}
+
+/// Solves the dense system `A x = b` via LU with partial pivoting.
+pub fn solve(a: Array2<f64>, b: Vec<f64>) -> Result<Vec<f64>> {
+    let n = a.nrows();
+    if b.len() != n {
+        return Err(GeostatError::DimensionMismatch(format!(
+            "A is {}x{}, b has length {}",
+            a.nrows(),
+            a.ncols(),
+            b.len()
+        )));
+    }
+    Ok(lu_factor(a)?.solve(b))
 }
 
 #[cfg(test)]

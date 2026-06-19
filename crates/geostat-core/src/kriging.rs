@@ -5,7 +5,7 @@ use ndarray::Array2;
 use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
 use crate::grid::Grid2D;
-use crate::linalg::solve;
+use crate::linalg::{Lu, lu_factor, solve};
 use crate::search::KdTree;
 use crate::variogram::VariogramModel;
 
@@ -107,6 +107,11 @@ pub struct Kriging<'a, const D: usize = 2> {
     drift_data: Vec<Vec<f64>>,
     drift_mean: Vec<f64>,
     drift_scale: Vec<f64>,
+    // For a global neighbourhood the kriging-system matrix is the same for
+    // every target, so it is factored once here and only back-substituted per
+    // target. `None` for moving neighbourhoods (a different matrix per target)
+    // or if the global system is singular (predict then errors per target).
+    global_lu: Option<Lu>,
 }
 
 impl<'a, const D: usize> Kriging<'a, D> {
@@ -221,7 +226,7 @@ impl<'a, const D: usize> Kriging<'a, D> {
         let tree = (config.max_neighbors.is_some() || config.search_radius.is_some())
             .then(|| KdTree::build(data.coords()));
 
-        Ok(Self {
+        let mut kriging = Self {
             data,
             model,
             config,
@@ -231,7 +236,20 @@ impl<'a, const D: usize> Kriging<'a, D> {
             drift_data,
             drift_mean,
             drift_scale,
-        })
+            global_lu: None,
+        };
+        // Global neighbourhood: factor the (target-independent) system once.
+        // A singular factorization is left as None so predict errors per target
+        // exactly as before.
+        if kriging.tree.is_none() {
+            let nb: Vec<usize> = (0..kriging.data.len()).collect();
+            let m = kriging.config.method.n_drift(D);
+            if kriging.data.len() >= m {
+                let a = kriging.build_lhs(&nb);
+                kriging.global_lu = lu_factor(a).ok();
+            }
+        }
+        Ok(kriging)
     }
 
     fn fill_basis(&self, p: [f64; D], drift: Option<&[f64]>, out: &mut [f64]) {
@@ -308,6 +326,34 @@ impl<'a, const D: usize> Kriging<'a, D> {
         self.predict_inner(target, Some(target_drift))
     }
 
+    /// Builds the (target-independent) kriging-system matrix for the
+    /// conditioning points `nb`: the data--data covariance block plus the drift
+    /// basis rows/columns and the Lagrange constraints.
+    fn build_lhs(&self, nb: &[usize]) -> Array2<f64> {
+        let m = self.config.method.n_drift(D);
+        let n = nb.len();
+        let dim = n + m;
+        let c0 = self.model.covariance_dh([0.0; D]);
+        let mut a = Array2::<f64>::zeros((dim, dim));
+        let mut f = vec![0.0; m];
+        for (ii, &i) in nb.iter().enumerate() {
+            let pi = self.data.coord(i);
+            a[[ii, ii]] = c0;
+            for (jj, &j) in nb.iter().enumerate().skip(ii + 1) {
+                let pj = self.data.coord(j);
+                let c = self.model.covariance_dh(sep(pi, pj));
+                a[[ii, jj]] = c;
+                a[[jj, ii]] = c;
+            }
+            self.fill_basis(pi, self.drift_data.get(i).map(Vec::as_slice), &mut f);
+            for (k, &fk) in f.iter().enumerate() {
+                a[[ii, n + k]] = fk;
+                a[[n + k, ii]] = fk;
+            }
+        }
+        a
+    }
+
     fn predict_inner(
         &self,
         target: [f64; D],
@@ -327,32 +373,24 @@ impl<'a, const D: usize> Kriging<'a, D> {
         let dim = n + m;
         let c0 = self.model.covariance_dh([0.0; D]);
 
-        let mut a = Array2::<f64>::zeros((dim, dim));
+        // Right-hand side: covariances to the target, then its drift basis.
         let mut b = vec![0.0; dim];
-        let mut f = vec![0.0; m];
         for (ii, &i) in nb.iter().enumerate() {
-            let pi = self.data.coord(i);
-            a[[ii, ii]] = c0;
-            for (jj, &j) in nb.iter().enumerate().skip(ii + 1) {
-                let pj = self.data.coord(j);
-                let c = self.model.covariance_dh(sep(pi, pj));
-                a[[ii, jj]] = c;
-                a[[jj, ii]] = c;
-            }
-            self.fill_basis(pi, self.drift_data.get(i).map(Vec::as_slice), &mut f);
-            for (k, &fk) in f.iter().enumerate() {
-                a[[ii, n + k]] = fk;
-                a[[n + k, ii]] = fk;
-            }
-            b[ii] = self.model.covariance_dh(sep(pi, target));
+            b[ii] = self.model.covariance_dh(sep(self.data.coord(i), target));
         }
+        let mut f = vec![0.0; m];
         self.fill_basis(target, target_drift, &mut f);
         for (k, &fk) in f.iter().enumerate() {
             b[n + k] = fk;
         }
 
         let b0 = b.clone();
-        let w = solve(a, b)?;
+        // Reuse the factored global system when available; otherwise build and
+        // solve the per-target (moving-neighbourhood) system.
+        let w = match &self.global_lu {
+            Some(lu) => lu.solve(b),
+            None => solve(self.build_lhs(&nb), b)?,
+        };
 
         let (value, variance, lagrange) = match self.config.method {
             KrigingMethod::Simple { mean } => {
