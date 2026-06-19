@@ -6,3 +6,8 @@
 
 # Generated example outputs
 examples/*.csv
+
+# Generated figures
+figures/*.pdf
+figures/*.png
+figures/data/

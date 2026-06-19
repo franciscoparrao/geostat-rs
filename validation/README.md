@@ -157,6 +157,19 @@ kriging geostat-rs uses the Journel & Huijbregts (1978) formula
 gstat-validated to machine precision, but the OK back-transform is not
 bit-compared to krigeTg.
 
+## v0.6 results (mathematical interpolators)
+
+| Check | Max difference | Verdict |
+|---|---|---|
+| Inverse-distance weighting (power 2, global) vs `gstat::idw`, meuse.grid (3103 cells) | 1.9e-14 | machine precision |
+
+The other v0.6 additions are validated by construction or against the methods
+above: regression kriging reduces to ordinary kriging under a constant trend
+and recovers exact OLS coefficients (unit tests); k-NN/IDW cross-validation
+reuses the gstat-validated neighbour search; co-kriging with `ridge = 0` is the
+same system validated in v0.2/v0.4; VEcv/E₁ match their definitions (Li 2016).
+Reproduce: `Rscript validation/idw_gstat.R` then `python3 validation/compare_idw.py`.
+
 ## Reproduce
 
 ```sh
