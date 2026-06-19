@@ -184,6 +184,39 @@ to machine precision.}
 \label{fig:parity}
 \end{figure}
 
+\section{Performance}
+\label{sec:performance}
+
+Table~\ref{tab:bench} times ordinary kriging on regular grids of increasing
+size and leave-one-out cross-validation, conditioning on the 155 Meuse points
+with a 32-point moving neighbourhood and the same fitted model. Only the
+operation is timed (data preloaded, best of three runs); geostat-rs is timed
+through its Python binding (a thin wrapper over the Rust compute) against
+gstat~2.1.4. Single-threaded, geostat-rs is already faster than gstat at grid
+kriging ($1.2$--$2\times$); with its parallel moving-neighbourhood predictor on
+16 cores it is $6$--$12\times$ faster. Leave-one-out cross-validation is far
+faster still, as gstat's \texttt{krige.cv} carries per-fold R-level overhead
+that the parallel Rust implementation avoids.
+
+\begin{table}[t]
+\centering
+\caption{Wall-clock time (ms, best of 3) for ordinary kriging and
+leave-one-out cross-validation. Hardware: 12th-gen Intel Core i7-1270P
+(16 logical cores); gstat 2.1.4 single-threaded.}
+\label{tab:bench}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+Task & gstat & \shortstack[r]{geostat-rs\\(1 core)} &
+\shortstack[r]{geostat-rs\\(16 cores)} & speedup \\
+\midrule
+OK grid, 2\,500 cells   & 184  & 89   & 15  & $12\times$ \\
+OK grid, 10\,000 cells  & 570  & 472  & 60  & $10\times$ \\
+OK grid, 40\,000 cells  & 2173 & 1595 & 341 & $6\times$ \\
+LOO cross-validation (155 pts) & 1368 & 8.9 & 5.2 & $263\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 \section{Predictive accuracy, comparison and tuning}
 \label{sec:accuracy}
 
