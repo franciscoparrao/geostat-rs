@@ -11,3 +11,13 @@ examples/*.csv
 figures/*.pdf
 figures/*.png
 figures/data/
+
+# LaTeX build artifacts
+paper/*.aux
+paper/*.log
+paper/*.bbl
+paper/*.blg
+paper/*.out
+paper/*.pdf
+paper/*.png
+paper/*.spl
