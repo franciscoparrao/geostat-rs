@@ -99,7 +99,17 @@ sequential simulation uses an incremental bucket grid. A deterministic
 random-number generator (xoshiro256++) makes simulation reproducible:
 the same seed yields identical realizations on any platform. Native parallelism
 (rayon) is behind a feature flag that is disabled for the wasm32 target. The
-Python module reproduces the CLI bit-for-bit.
+Python module reproduces the CLI bit-for-bit, and the WebAssembly build runs
+the same engine in the browser with no server (Figure~\ref{fig:wasm}).
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.7\linewidth]{fig_wasm.png}
+\caption{The WebAssembly build running entirely client-side in a browser: it
+fits a variogram and ordinary-kriges a $60\times60$ grid of a synthetic field,
+rendering the prediction surface on a canvas.}
+\label{fig:wasm}
+\end{figure}
 
 \section{Methods}
 \label{sec:methods}

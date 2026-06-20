@@ -21,5 +21,10 @@ Figures:
 - `fig_multielement.pdf` — rare-earth grade prediction by element × method
   (covariates + ML-geostat hybrid). **Confirm the tailings dataset is clear to
   publish before including this figure.**
+- `fig_wasm.png` — screenshot of the WebAssembly build running in the browser
+  (a committed static asset, not produced by the pipeline). To regenerate:
+  `wasm-pack build crates/geostat-wasm --target web --release`, serve the repo
+  root (`python3 -m http.server`), open `/examples/wasm-demo/` and screenshot.
 
-Generated `data/*.csv`, `*.pdf` and `*.png` are git-ignored; rerun to rebuild.
+Generated `data/*.csv`, `*.pdf` and other `*.png` are git-ignored; rerun to
+rebuild. `fig_wasm.png` is the committed exception.

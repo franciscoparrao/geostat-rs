@@ -10,6 +10,7 @@ examples/*.csv
 # Generated figures
 figures/*.pdf
 figures/*.png
+!figures/fig_wasm.png
 figures/data/
 
 # LaTeX build artifacts
