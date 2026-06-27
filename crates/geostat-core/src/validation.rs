@@ -195,6 +195,81 @@ pub fn leave_one_out_with_drift<const D: usize>(
     })
 }
 
+/// Assigns each of `n` points to one of `k` folds by a deterministic shuffle,
+/// returning the per-point fold index and the membership lists. Folds are
+/// balanced to within one point.
+fn fold_assignment(n: usize, k: usize, seed: u64) -> (Vec<usize>, Vec<Vec<usize>>) {
+    let mut order: Vec<usize> = (0..n).collect();
+    crate::rng::Rng::new(seed).shuffle(&mut order);
+    let mut fold_of = vec![0usize; n];
+    let mut members = vec![Vec::new(); k];
+    for (j, &i) in order.iter().enumerate() {
+        let f = j % k;
+        fold_of[i] = f;
+        members[f].push(i);
+    }
+    (fold_of, members)
+}
+
+/// `k`-fold cross-validation: the data are split into `k` balanced folds (by a
+/// deterministic, seed-reproducible shuffle); each fold is predicted in turn
+/// from the union of the other folds. With `k = n` this reduces to
+/// leave-one-out, but for large `n` it is roughly `k`-times cheaper, which makes
+/// it the practical choice for hyperparameter tuning.
+///
+/// The result is in dataset order, so every [`CvResult`] accuracy measure
+/// applies unchanged.
+pub fn k_fold<const D: usize>(
+    data: &PointSet<D>,
+    model: &VariogramModel,
+    config: &KrigingConfig,
+    k: usize,
+    seed: u64,
+) -> Result<CvResult> {
+    let n = data.len();
+    if n < 3 {
+        return Err(GeostatError::InsufficientData(
+            "cross-validation requires at least 3 points".into(),
+        ));
+    }
+    if !(2..=n).contains(&k) {
+        return Err(GeostatError::InvalidParameter(format!(
+            "k-fold requires 2 <= k <= n (k={k}, n={n})"
+        )));
+    }
+    let (fold_of, members) = fold_assignment(n, k, seed);
+
+    // Each fold trains on all points outside it and predicts its own members.
+    let per_fold: Vec<Vec<(usize, f64, f64)>> = par_try_map(k, |f| {
+        let train_coords: Vec<[f64; D]> =
+            (0..n).filter(|&i| fold_of[i] != f).map(|i| data.coord(i)).collect();
+        let train_vals: Vec<f64> =
+            (0..n).filter(|&i| fold_of[i] != f).map(|i| data.value(i)).collect();
+        let train = PointSet::new(train_coords, train_vals)?;
+        let kriging = Kriging::new(&train, model, config.clone())?;
+        let mut out = Vec::with_capacity(members[f].len());
+        for &i in &members[f] {
+            let est = kriging.predict(data.coord(i))?;
+            out.push((i, est.value, est.variance));
+        }
+        Ok(out)
+    })?;
+
+    let mut predicted = vec![0.0; n];
+    let mut variance = vec![0.0; n];
+    for fold_res in per_fold {
+        for (i, p, v) in fold_res {
+            predicted[i] = p;
+            variance[i] = v;
+        }
+    }
+    Ok(CvResult {
+        observed: data.values().to_vec(),
+        predicted,
+        variance,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +360,65 @@ mod tests {
             VariogramModel::new(0.0, vec![Structure::new(ModelKind::Exponential, 1.0, 1.0)])
                 .unwrap();
         assert!(leave_one_out(&data, &model, &KrigingConfig::default()).is_err());
+    }
+
+    fn smooth_field(n: usize, seed: u64) -> PointSet {
+        let mut rng = Rng::new(seed);
+        let mut coords = Vec::new();
+        let mut values = Vec::new();
+        for _ in 0..n {
+            let x = rng.uniform() * 100.0;
+            let y = rng.uniform() * 100.0;
+            coords.push([x, y]);
+            values.push((x / 20.0).sin() + (y / 20.0).cos());
+        }
+        PointSet::new(coords, values).unwrap()
+    }
+
+    #[test]
+    fn k_equals_n_matches_leave_one_out() {
+        // With one point per fold, k-fold is exactly leave-one-out.
+        let data = smooth_field(40, 5);
+        let model =
+            VariogramModel::new(0.01, vec![Structure::new(ModelKind::Spherical, 1.0, 50.0)])
+                .unwrap();
+        let cfg = KrigingConfig::default();
+        let loo = leave_one_out(&data, &model, &cfg).unwrap();
+        let kf = k_fold(&data, &model, &cfg, data.len(), 123).unwrap();
+        for i in 0..data.len() {
+            assert!((kf.predicted[i] - loo.predicted[i]).abs() < 1e-12);
+            assert!((kf.variance[i] - loo.variance[i]).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn k_fold_is_deterministic_and_balanced() {
+        let data = smooth_field(53, 8);
+        let model =
+            VariogramModel::new(0.01, vec![Structure::new(ModelKind::Spherical, 1.0, 50.0)])
+                .unwrap();
+        let cfg = KrigingConfig::default();
+        // Same seed -> identical predictions; folds within one point of each other.
+        let a = k_fold(&data, &model, &cfg, 5, 42).unwrap();
+        let b = k_fold(&data, &model, &cfg, 5, 42).unwrap();
+        assert_eq!(a.predicted, b.predicted);
+        let (_, members) = fold_assignment(53, 5, 42);
+        let sizes: Vec<usize> = members.iter().map(Vec::len).collect();
+        let total: usize = sizes.iter().sum();
+        assert_eq!(total, 53, "every point assigned exactly once");
+        assert!(sizes.iter().max().unwrap() - sizes.iter().min().unwrap() <= 1);
+        // A reasonable model still has predictive skill under 5-fold.
+        assert!(a.vecv() > 50.0, "vecv {}", a.vecv());
+    }
+
+    #[test]
+    fn k_fold_rejects_bad_k() {
+        let data = smooth_field(10, 1);
+        let model =
+            VariogramModel::new(0.01, vec![Structure::new(ModelKind::Spherical, 1.0, 50.0)])
+                .unwrap();
+        let cfg = KrigingConfig::default();
+        assert!(k_fold(&data, &model, &cfg, 1, 0).is_err()); // k < 2
+        assert!(k_fold(&data, &model, &cfg, 11, 0).is_err()); // k > n
     }
 }

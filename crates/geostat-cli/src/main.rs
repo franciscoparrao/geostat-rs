@@ -11,7 +11,7 @@ use geostat_core::{
     CoKriging, CoKrigingConfig, DirectionConfig, Grid2D, IkConfig, Kriging, KrigingConfig,
     KrigingMethod, ModelKind, PointSet, SgsConfig, SisConfig, VariogramConfig, VariogramModel,
     experimental_cross_variogram, experimental_variogram, fit_best, fit_lmc, indicator_kriging,
-    leave_one_out, leave_one_out_with_drift, sequential_gaussian_simulation,
+    k_fold, leave_one_out, leave_one_out_with_drift, sequential_gaussian_simulation,
     sequential_indicator_simulation,
 };
 
@@ -328,6 +328,14 @@ struct CvCmd {
     drift_cols: Option<String>,
     #[command(flatten)]
     neighbors: NeighborOpts,
+    /// Use k-fold cross-validation (k folds) instead of leave-one-out. Faster
+    /// on large datasets; the split is reproducible via --seed. Not yet
+    /// supported together with --drift-cols.
+    #[arg(long, value_name = "K")]
+    folds: Option<usize>,
+    /// RNG seed for the k-fold split
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
     /// Write per-point residuals to a CSV file
     #[arg(short, long)]
     output: Option<PathBuf>,
@@ -1199,7 +1207,10 @@ fn run_cv(cmd: CvCmd) -> Result<()> {
             max_neighbors: cmd.neighbors.max_neighbors,
             search_radius: cmd.neighbors.radius,
         };
-        let cv = leave_one_out(&data, &model, &config)?;
+        let cv = match cmd.folds {
+            Some(k) => k_fold(&data, &model, &config, k, cmd.seed)?,
+            None => leave_one_out(&data, &model, &config)?,
+        };
         print_cv_report(&cv, data.len());
         if cmd.output.is_some() {
             bail!("--output is not supported in 3-D mode yet");
@@ -1208,6 +1219,9 @@ fn run_cv(cmd: CvCmd) -> Result<()> {
     }
 
     let (data, cv) = if let Some(drift_spec) = &cmd.drift_cols {
+        if cmd.folds.is_some() {
+            bail!("--folds (k-fold) is not yet supported with --drift-cols");
+        }
         let drift_cols: Vec<String> = drift_spec
             .split(',')
             .map(|s| s.trim().to_string())
@@ -1235,7 +1249,10 @@ fn run_cv(cmd: CvCmd) -> Result<()> {
             max_neighbors: cmd.neighbors.max_neighbors,
             search_radius: cmd.neighbors.radius,
         };
-        let cv = leave_one_out(&data, &model, &config)?;
+        let cv = match cmd.folds {
+            Some(k) => k_fold(&data, &model, &config, k, cmd.seed)?,
+            None => leave_one_out(&data, &model, &config)?,
+        };
         (data, cv)
     };
 

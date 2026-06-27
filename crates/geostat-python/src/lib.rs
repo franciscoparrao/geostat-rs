@@ -294,11 +294,12 @@ fn krige_grid(
     }
 }
 
-/// Leave-one-out cross-validation. Returns a dict with `me`, `mae`, `rmse`,
-/// `msdr`, `predicted` and `variance`.
+/// Cross-validation. Leave-one-out by default; pass `folds=k` for `k`-fold
+/// (faster on large datasets, reproducible via `seed`). Returns a dict with
+/// `me`, `mae`, `rmse`, `msdr`, `vecv`, `e1`, `predicted` and `variance`.
 #[pyfunction]
 #[pyo3(signature = (x, y, values, model, method = "ordinary", mean = None,
-    degree = 1, max_neighbors = None, radius = None))]
+    degree = 1, max_neighbors = None, radius = None, folds = None, seed = 0))]
 #[allow(clippy::too_many_arguments)]
 fn loo_cv(
     py: Python<'_>,
@@ -311,6 +312,8 @@ fn loo_cv(
     degree: u8,
     max_neighbors: Option<usize>,
     radius: Option<f64>,
+    folds: Option<usize>,
+    seed: u64,
 ) -> PyResult<Py<PyDict>> {
     let data = point_set(x, y, values)?;
     let config = KrigingConfig {
@@ -318,7 +321,10 @@ fn loo_cv(
         max_neighbors,
         search_radius: radius,
     };
-    let cv = core::leave_one_out(&data, &model.inner, &config).map_err(err)?;
+    let cv = match folds {
+        Some(k) => core::k_fold(&data, &model.inner, &config, k, seed).map_err(err)?,
+        None => core::leave_one_out(&data, &model.inner, &config).map_err(err)?,
+    };
     let out = PyDict::new(py);
     out.set_item("me", cv.mean_error())?;
     out.set_item("mae", cv.mae())?;
