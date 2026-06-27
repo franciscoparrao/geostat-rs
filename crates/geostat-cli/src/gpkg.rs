@@ -39,6 +39,18 @@ fn open(path: &Path) -> Result<Connection> {
 /// Lists the vector feature layers in a GeoPackage.
 pub fn list_feature_layers(path: &Path) -> Result<Vec<LayerInfo>> {
     let conn = open(path)?;
+    // A valid GeoPackage may hold only raster coverages, with no geometry-column
+    // table at all; that is "no feature layers", not an error.
+    let has_geom_cols: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='gpkg_geometry_columns'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !has_geom_cols {
+        return Ok(Vec::new());
+    }
     let mut stmt = conn
         .prepare(
             "SELECT c.table_name, g.column_name, g.geometry_type_name, c.srs_id \
@@ -526,6 +538,211 @@ pub fn write_raster(
     Ok(())
 }
 
+/// A single-band raster read back from a GeoPackage 2D Gridded Coverage.
+///
+/// Values are in grid storage order (`iy*nx + ix`, y increasing, so row 0 is the
+/// southernmost). Cells with no data are `NaN`.
+pub struct RasterGrid {
+    /// Coverage (tile-pyramid table) name.
+    pub name: String,
+    /// Spatial reference system id (from `gpkg_contents`).
+    pub srs_id: i64,
+    /// Number of columns.
+    pub nx: usize,
+    /// Number of rows.
+    pub ny: usize,
+    /// `[min_x, min_y, max_x, max_y]` of the coverage extent.
+    pub bbox: [f64; 4],
+    /// Cell values, grid storage order (`iy*nx + ix`); `NaN` where no data.
+    pub values: Vec<f64>,
+}
+
+impl RasterGrid {
+    /// Samples the value at `(x, y)` by nearest cell (centres on
+    /// `grid-value-is-center`). Returns `None` outside the extent or on a
+    /// no-data cell, so it can feed covariates straight into kriging.
+    pub fn sample(&self, x: f64, y: f64) -> Option<f64> {
+        let [min_x, min_y, max_x, max_y] = self.bbox;
+        if x < min_x || x > max_x || y < min_y || y > max_y {
+            return None;
+        }
+        let px = (max_x - min_x) / self.nx as f64;
+        let py = (max_y - min_y) / self.ny as f64;
+        let ix = (((x - min_x) / px) as usize).min(self.nx - 1);
+        let iy = (((y - min_y) / py) as usize).min(self.ny - 1);
+        let v = self.values[iy * self.nx + ix];
+        v.is_finite().then_some(v)
+    }
+}
+
+/// Lists the 2D-gridded-coverage (raster) layers in a GeoPackage.
+pub fn list_raster_layers(path: &Path) -> Result<Vec<String>> {
+    let conn = open(path)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT table_name FROM gpkg_contents \
+             WHERE data_type = '2d-gridded-coverage' ORDER BY table_name",
+        )
+        .context("querying gpkg_contents (is this a GeoPackage?)")?;
+    let names = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(names)
+}
+
+/// Reads a single-band raster from a GeoPackage 2D Gridded Coverage (the inverse
+/// of [`write_raster`]). If `layer` is `None`, the single coverage is used.
+///
+/// Scope: the `integer` datatype (16-bit PNG tiles) with the coverage-level
+/// `scale`/`offset` mapping `value = pixel*scale + offset` and `data_null` as
+/// the no-data pixel — the layout geostat-rs writes and the common GDAL/QGIS
+/// integer coverage. The `float` datatype (TIFF tiles) is not handled. Tiles at
+/// the finest zoom level are mosaicked; the row order is flipped from
+/// image (north→south) to grid (y increasing).
+pub fn read_raster(path: &Path, layer: Option<&str>) -> Result<RasterGrid> {
+    let names = list_raster_layers(path)?;
+    if names.is_empty() {
+        bail!("no 2d-gridded-coverage layers found in {}", path.display());
+    }
+    let name = match layer {
+        Some(l) => names
+            .iter()
+            .find(|n| n.as_str() == l)
+            .cloned()
+            .with_context(|| format!("raster layer '{l}' not found in {}", path.display()))?,
+        None => {
+            if names.len() > 1 {
+                bail!(
+                    "{} has multiple raster layers; choose one with --layer (available: {})",
+                    path.display(),
+                    names.join(", ")
+                );
+            }
+            names[0].clone()
+        }
+    };
+
+    let conn = open(path)?;
+    let datatype: String = conn
+        .query_row(
+            "SELECT datatype FROM gpkg_2d_gridded_coverage_ancillary WHERE tile_matrix_set_name = ?1",
+            rusqlite::params![name],
+            |r| r.get(0),
+        )
+        .with_context(|| format!("reading coverage ancillary for '{name}'"))?;
+    if datatype != "integer" {
+        bail!("coverage '{name}' has datatype '{datatype}'; only 'integer' (PNG) is supported");
+    }
+    let (scale, offset, data_null): (f64, f64, Option<f64>) = conn.query_row(
+        "SELECT scale, offset, data_null FROM gpkg_2d_gridded_coverage_ancillary \
+         WHERE tile_matrix_set_name = ?1",
+        rusqlite::params![name],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let null_px = data_null.unwrap_or(0.0);
+
+    let (srs_id, min_x, min_y, max_x, max_y): (i64, f64, f64, f64, f64) = conn.query_row(
+        "SELECT srs_id, min_x, min_y, max_x, max_y FROM gpkg_tile_matrix_set WHERE table_name = ?1",
+        rusqlite::params![name],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    )?;
+
+    // Finest zoom level holds the full-resolution grid.
+    let (zoom, mw, mh, tw, th): (i64, i64, i64, i64, i64) = conn.query_row(
+        "SELECT zoom_level, matrix_width, matrix_height, tile_width, tile_height \
+         FROM gpkg_tile_matrix WHERE table_name = ?1 ORDER BY zoom_level DESC LIMIT 1",
+        rusqlite::params![name],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    )?;
+    let (mw, mh, tw, th) = (mw as usize, mh as usize, tw as usize, th as usize);
+    let nx = mw * tw;
+    let ny = mh * th;
+
+    // Mosaic the tiles into a north-up image, then flip rows into grid order.
+    let mut img = vec![f64::NAN; nx * ny];
+    let mut stmt = conn.prepare(&format!(
+        "SELECT tile_column, tile_row, tile_data FROM {} WHERE zoom_level = ?1",
+        quote_ident(&name)
+    ))?;
+    let tiles = stmt.query_map(rusqlite::params![zoom], |r| {
+        Ok((
+            r.get::<_, i64>(0)? as usize,
+            r.get::<_, i64>(1)? as usize,
+            r.get::<_, Vec<u8>>(2)?,
+        ))
+    })?;
+    for tile in tiles {
+        let (tcol, trow, png_blob) = tile?;
+        let pixels = decode_png_u16(&png_blob, tw, th)?;
+        for ty in 0..th {
+            let img_row = trow * th + ty;
+            if img_row >= ny {
+                continue;
+            }
+            for tx in 0..tw {
+                let img_col = tcol * tw + tx;
+                if img_col >= nx {
+                    continue;
+                }
+                let px = pixels[ty * tw + tx] as f64;
+                img[img_row * nx + img_col] = if px == null_px {
+                    f64::NAN
+                } else {
+                    px * scale + offset
+                };
+            }
+        }
+    }
+
+    // Image rows run north→south; grid storage is y increasing.
+    let mut values = vec![f64::NAN; nx * ny];
+    for img_row in 0..ny {
+        let iy = ny - 1 - img_row;
+        values[iy * nx..iy * nx + nx].copy_from_slice(&img[img_row * nx..img_row * nx + nx]);
+    }
+
+    Ok(RasterGrid {
+        name,
+        srs_id,
+        nx,
+        ny,
+        bbox: [min_x, min_y, max_x, max_y],
+        values,
+    })
+}
+
+/// Decodes a 16-bit grayscale PNG tile into a `tw*th` row-major `u16` buffer.
+fn decode_png_u16(blob: &[u8], tw: usize, th: usize) -> Result<Vec<u16>> {
+    let dec = png::Decoder::new(std::io::Cursor::new(blob));
+    let mut reader = dec
+        .read_info()
+        .map_err(|e| anyhow::anyhow!("PNG header: {e}"))?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut buf)
+        .map_err(|e| anyhow::anyhow!("PNG data: {e}"))?;
+    if info.bit_depth != png::BitDepth::Sixteen
+        || info.color_type != png::ColorType::Grayscale
+    {
+        bail!(
+            "tile is {:?}/{:?}; expected 16-bit grayscale",
+            info.bit_depth,
+            info.color_type
+        );
+    }
+    if info.width as usize != tw || info.height as usize != th {
+        bail!(
+            "tile is {}x{} but the tile matrix declares {tw}x{th}",
+            info.width,
+            info.height
+        );
+    }
+    let pixels = (0..tw * th)
+        .map(|i| u16::from_be_bytes([buf[i * 2], buf[i * 2 + 1]]))
+        .collect();
+    Ok(pixels)
+}
+
 fn rd_u32(b: &[u8], le: bool) -> u32 {
     let a = [b[0], b[1], b[2], b[3]];
     if le {
@@ -702,6 +919,52 @@ mod tests {
             )
             .unwrap();
         assert_eq!(dt, "integer");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn raster_write_then_read_round_trips() {
+        let path = std::env::temp_dir().join("geostat_rs_raster_roundtrip.gpkg");
+        let _ = std::fs::remove_file(&path);
+        let (nx, ny) = (5, 4);
+        // A smooth ramp plus one no-data cell.
+        let mut values: Vec<f64> = (0..nx * ny).map(|i| 2.0 + 0.5 * i as f64).collect();
+        values[7] = f64::NAN;
+        let bbox = [100.0, 200.0, 150.0, 240.0]; // 10x10 m cells
+        write_raster(&path, "dem", 32719, nx, ny, bbox, &values).unwrap();
+
+        assert_eq!(list_raster_layers(&path).unwrap(), vec!["dem".to_string()]);
+        // A raster-only GeoPackage has no feature layers (and must not error).
+        assert!(list_feature_layers(&path).unwrap().is_empty());
+        let g = read_raster(&path, None).unwrap();
+        assert_eq!((g.nx, g.ny), (nx, ny));
+        assert_eq!(g.srs_id, 32719);
+        assert_eq!(g.bbox, bbox);
+
+        // 16-bit quantisation: reconstructed values within one scale step, and
+        // the no-data cell stays NaN.
+        let span = (values.iter().copied().filter(|v| v.is_finite()).fold(f64::NEG_INFINITY, f64::max)
+            - values.iter().copied().filter(|v| v.is_finite()).fold(f64::INFINITY, f64::min))
+            .max(f64::MIN_POSITIVE);
+        let step = span / 65534.0;
+        for (i, &v) in values.iter().enumerate() {
+            if v.is_finite() {
+                assert!((g.values[i] - v).abs() <= step + 1e-9, "cell {i}: {} vs {v}", g.values[i]);
+            } else {
+                assert!(g.values[i].is_nan(), "cell {i} should be NaN");
+            }
+        }
+
+        // Sampling: a point inside cell (ix=0, iy=0) returns that cell; outside
+        // the extent returns None; the no-data cell returns None.
+        let px = (bbox[2] - bbox[0]) / nx as f64;
+        let py = (bbox[3] - bbox[1]) / ny as f64;
+        let inside = g.sample(bbox[0] + 0.5 * px, bbox[1] + 0.5 * py).unwrap();
+        assert!((inside - g.values[0]).abs() <= step + 1e-9);
+        assert!(g.sample(bbox[0] - 1.0, bbox[1]).is_none());
+        // Cell index 7 is (ix=2, iy=1); centre it and expect no-data -> None.
+        let nd = g.sample(bbox[0] + 2.5 * px, bbox[1] + 1.5 * py);
+        assert!(nd.is_none(), "no-data cell must sample to None, got {nd:?}");
         let _ = std::fs::remove_file(&path);
     }
 

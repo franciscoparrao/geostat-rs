@@ -48,8 +48,10 @@ enum Command {
     Compare(CompareCmd),
     /// Tune a method's hyperparameter by leave-one-out VEcv
     Tune(TuneCmd),
-    /// List the vector feature layers in a GeoPackage
+    /// List the vector feature and raster layers in a GeoPackage
     GpkgInfo(GpkgInfoCmd),
+    /// Sample a GeoPackage raster (e.g. a DEM/NDVI covariate) at point locations
+    GpkgSample(GpkgSampleCmd),
 }
 
 #[derive(Args)]
@@ -450,6 +452,7 @@ fn main() -> Result<()> {
         Command::Compare(cmd) => run_compare(cmd),
         Command::Tune(cmd) => run_tune(cmd),
         Command::GpkgInfo(cmd) => run_gpkg_info(cmd),
+        Command::GpkgSample(cmd) => run_gpkg_sample(cmd),
     }
 }
 
@@ -523,22 +526,96 @@ struct GpkgInfoCmd {
     input: PathBuf,
 }
 
+#[derive(Args)]
+struct GpkgSampleCmd {
+    /// GeoPackage raster (2D gridded coverage) to sample
+    #[arg(short, long)]
+    raster: PathBuf,
+    /// Raster layer name (when the file has several coverages)
+    #[arg(long)]
+    layer: Option<String>,
+    /// CSV of point locations to sample at
+    #[arg(short, long)]
+    points: PathBuf,
+    /// X coordinate column in the points CSV
+    #[arg(long, default_value = "x")]
+    x_col: String,
+    /// Y coordinate column in the points CSV
+    #[arg(long, default_value = "y")]
+    y_col: String,
+    /// Output CSV (x,y,<value>); points outside the extent or on no-data are
+    /// written with an empty value
+    #[arg(short, long)]
+    output: PathBuf,
+    /// Name of the sampled-value column in the output
+    #[arg(long, default_value = "value")]
+    value_col: String,
+}
+
+fn run_gpkg_sample(cmd: GpkgSampleCmd) -> Result<()> {
+    let grid = gpkg::read_raster(&cmd.raster, cmd.layer.as_deref())?;
+    let (coords, _) = io_utils::read_targets(&cmd.points, &cmd.x_col, &cmd.y_col, &[])?;
+
+    let mut out = String::new();
+    out.push_str(&format!("{},{},{}\n", cmd.x_col, cmd.y_col, cmd.value_col));
+    let mut hit = 0usize;
+    for c in &coords {
+        match grid.sample(c[0], c[1]) {
+            Some(v) => {
+                hit += 1;
+                out.push_str(&format!("{},{},{}\n", c[0], c[1], v));
+            }
+            None => out.push_str(&format!("{},{},\n", c[0], c[1])),
+        }
+    }
+    std::fs::write(&cmd.output, out)
+        .with_context(|| format!("writing {}", cmd.output.display()))?;
+    println!(
+        "Sampled raster '{}' ({}x{}) at {} points: {hit} hit, {} outside/no-data -> {}",
+        grid.name,
+        grid.nx,
+        grid.ny,
+        coords.len(),
+        coords.len() - hit,
+        cmd.output.display()
+    );
+    Ok(())
+}
+
 fn run_gpkg_info(cmd: GpkgInfoCmd) -> Result<()> {
     let layers = gpkg::list_feature_layers(&cmd.input)?;
-    if layers.is_empty() {
-        println!("No vector feature layers in {}", cmd.input.display());
+    let rasters = gpkg::list_raster_layers(&cmd.input)?;
+    if layers.is_empty() && rasters.is_empty() {
+        println!("No feature or raster layers in {}", cmd.input.display());
         return Ok(());
     }
-    println!("Feature layers in {}:", cmd.input.display());
-    println!(
-        "  {:<24}{:<12}{:<14}{:>10}{:>10}",
-        "layer", "geom_col", "type", "srs_id", "features"
-    );
-    for l in &layers {
+    if !layers.is_empty() {
+        println!("Feature layers in {}:", cmd.input.display());
         println!(
             "  {:<24}{:<12}{:<14}{:>10}{:>10}",
-            l.name, l.geometry_column, l.geometry_type, l.srs_id, l.n_features
+            "layer", "geom_col", "type", "srs_id", "features"
         );
+        for l in &layers {
+            println!(
+                "  {:<24}{:<12}{:<14}{:>10}{:>10}",
+                l.name, l.geometry_column, l.geometry_type, l.srs_id, l.n_features
+            );
+        }
+    }
+    if !rasters.is_empty() {
+        println!("Raster (2D gridded coverage) layers in {}:", cmd.input.display());
+        println!("  {:<24}{:<14}{:>10}", "layer", "size", "srs_id");
+        for name in &rasters {
+            match gpkg::read_raster(&cmd.input, Some(name)) {
+                Ok(g) => println!(
+                    "  {:<24}{:<14}{:>10}",
+                    g.name,
+                    format!("{}x{}", g.nx, g.ny),
+                    g.srs_id
+                ),
+                Err(e) => println!("  {name:<24}(unreadable: {e})"),
+            }
+        }
     }
     Ok(())
 }

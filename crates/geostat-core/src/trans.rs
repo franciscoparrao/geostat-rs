@@ -75,8 +75,13 @@ pub fn lognormal_kriging<const D: usize>(
                 } else {
                     0.5 * est.variance - mu
                 };
+                // Far from data the log variance can be large enough that the
+                // back-transform exp() overflows to +inf. That is not a usable
+                // estimate, so report it as NaN (matching the predict-error
+                // branch) rather than silently returning an infinity.
+                let value = (est.value + correction).exp();
                 LognormalEstimate {
-                    value: (est.value + correction).exp(),
+                    value: if value.is_finite() { value } else { f64::NAN },
                     log_mean: est.value,
                     log_variance: est.variance,
                 }
@@ -145,6 +150,27 @@ mod tests {
         let e = est[0];
         assert!(e.log_variance > 0.0);
         assert!(e.value > e.log_mean.exp(), "correction must inflate");
+    }
+
+    #[test]
+    fn overflowing_back_transform_is_nan_not_inf() {
+        // A pathologically large sill makes the simple-kriging variance huge
+        // away from data, so 0.5*variance exceeds the exp() overflow threshold
+        // (~709). The back-transform must report NaN, never +inf.
+        let data = lognormal_field(40, 7);
+        let model = VariogramModel::new(
+            10.0,
+            vec![Structure::new(ModelKind::Spherical, 2000.0, 5.0)],
+        )
+        .unwrap();
+        let cfg = KrigingConfig {
+            method: KrigingMethod::Simple { mean: 0.0 },
+            ..Default::default()
+        };
+        // A target far from every datum -> variance near the full sill.
+        let est = lognormal_kriging(&data, &[[500.0, 500.0]], &model, &cfg).unwrap();
+        assert!(est[0].value.is_nan(), "expected NaN, got {}", est[0].value);
+        assert!(!est[0].value.is_infinite());
     }
 
     #[test]
