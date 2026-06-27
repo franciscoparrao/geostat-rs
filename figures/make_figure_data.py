@@ -100,8 +100,8 @@ def fig_idw_tune():
 def fig_multielement():
     """REE hold-out VEcv by element x method (publishable methods only).
 
-    Data provenance: the national tailings geochemistry database; confirm it is
-    clear to publish before including this figure. No transport kriging here.
+    Data provenance: the public geochemical registry of tailings deposits in
+    Chile (SERNAGEOMIN, 2023), openly available. No transport kriging here.
     """
     try:
         import numpy as np

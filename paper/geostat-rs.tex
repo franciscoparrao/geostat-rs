@@ -64,16 +64,29 @@ regression kriging \sep GeoPackage
 \section{Introduction}
 \label{sec:intro}
 
-Spatially continuous data are increasingly required across ecology, agronomy,
-geochemistry, mining and environmental science, but are rarely available
-directly: they must be predicted from point samples by spatial predictive
-methods \citep{li2021}. The de-facto reference implementation, \texttt{gstat}
-\citep{pebesma2004}, is feature-complete but bound to the \textsf{R} runtime and
-slow at scale; GSLIB \citep{deutsch1998} is fast Fortran with no modern
-bindings, WebAssembly or Python interface. No geostatistics engine combines a
-single-binary, dependency-light deployment with cross-platform reproducibility,
-a unified 2-D/3-D core, Python and WebAssembly bindings, and numerical fidelity
-to gstat.
+Spatially continuous fields --- ore grades, element concentrations, soil and
+environmental variables --- are increasingly required across ecology, agronomy,
+geochemistry, mining and environmental science, yet are rarely measured
+exhaustively: they must be predicted from sparse point samples
+\citep{li2021,goovaerts1997}. Geostatistics supplies the established machinery
+for this --- variography to characterise spatial dependence, kriging to predict
+with quantified uncertainty, and stochastic simulation to represent it --- and a
+growing body of work couples it with machine learning for the trend component
+\citep{hengl2018}. A practitioner therefore needs a single tool that spans this
+whole workflow, validates against an accepted reference, and deploys without a
+heavy runtime.
+
+Two implementations anchor the field. \texttt{gstat} \citep{pebesma2004} is
+comprehensive and the de-facto reference, but is bound to the \textsf{R}
+runtime, single-threaded in its hot paths, and offers no single-binary or
+in-browser deployment; GSLIB \citep{deutsch1998} is fast, canonical Fortran but
+arcane and without modern packaging, bindings or a Python/WebAssembly interface.
+The Python geostatistics ecosystem --- for example GSTools \citep{mueller2022}
+and SciKit-GStat \citep{maelicke2022} --- is convenient and scriptable but
+pure-Python in performance and likewise without a single-binary or client-side
+target. No engine combines dependency-light single-binary deployment,
+cross-platform reproducibility, a unified 2-D/3-D core, Python and WebAssembly
+bindings, and numerical fidelity to gstat.
 
 We present geostat-rs to fill that gap. Its design goals are: (i) a single
 binary with no heavy runtime or GDAL chain; (ii) reproducible results across
@@ -147,8 +160,10 @@ on the same data, and hyperparameters (IDW power, $k$-NN $k$, kriging
 neighbourhood size) are tuned by maximizing VEcv rather than by a model fit.
 
 \textbf{Input/output.} CSV; OGC GeoPackage point layers (read and write) and
-single-band 2D-gridded-coverage raster (write), implemented in pure Rust via
-bundled SQLite and a PNG encoder, i.e.\ without a GDAL dependency.
+single-band 2D-gridded-coverage raster (read and write, integer datatype),
+implemented in pure Rust via bundled SQLite and a PNG codec, i.e.\ without a
+GDAL dependency; a read raster can be sampled at point locations to attach a
+covariate (e.g.\ a DEM) for external-drift or regression kriging.
 
 \section{Validation against gstat}
 \label{sec:validation}
@@ -258,7 +273,9 @@ log-zinc.}
 \section{Application: rare-earth grade prediction with an ML hybrid}
 \label{sec:application}
 
-We predict rare-earth grades on $\sim$1100 mine-tailings deposits from non-rare-earth
+We predict rare-earth grades on $\sim$1100 mine-tailings deposits, drawn from the
+public geochemical registry of tailings deposits in Chile
+\citep{sernageomin2023}, from non-rare-earth
 host-mineral proxies (P$_2$O$_5$, Th for phosphates/monazite; TiO$_2$,
 Fe$_2$O$_3$, Zr for Ti--Fe oxides and zircon), deliberately excluding
 neighbouring rare-earth elements, which are co-measured and would constitute
@@ -298,6 +315,42 @@ residual-kriging hybrid is best where signal exists.}
 \label{fig:ree}
 \end{figure}
 
+\section{Discussion and limitations}
+\label{sec:discussion}
+
+geostat-rs shows that a single Rust core can deliver the classical
+geostatistical workflow --- variography, the kriging family and stochastic
+simulation --- at numerical parity with gstat while adding cross-platform
+reproducibility, native parallelism, and Python and in-browser deployment from
+one code base. Pairing that core with a predictive-accuracy-first evaluation
+layer (VEcv-based comparison and tuning) and bring-your-own-trend regression
+kriging connects classical geostatistics to the machine-learning workflow
+without leaving the engine or adding an \textsf{R} or scikit-learn dependency.
+
+Several limitations bound the present scope. Kriging systems are solved by dense
+LU factorization: this is robust for the moving-neighbourhood regime that
+dominates practice, and for a global neighbourhood the single-factorization
+reuse keeps large grids tractable, but it does not target the very large dense
+or sparse systems for which approximate or covariance-tapering solvers would be
+required. Computation is CPU-only and single-machine --- there is no GPU path
+and no out-of-core or distributed mode --- so problem size is bounded by memory.
+GeoPackage support reads and writes vector points and integer raster coverages,
+but the float (TIFF-tile) coverage datatype and additional formats remain to be
+added.
+Validation and benchmarking here target the classical datasets (Meuse, Walker
+Lake) and a single regional application; a broader empirical study across data
+types and scales is left for future work, and the predictive-accuracy
+comparison is deliberately confined to the methods in the engine rather than
+surveying the wider machine-learning literature.
+
+Future directions include GPU and out-of-core execution for larger grids,
+additional input/output formats and full GeoPackage raster support for tighter
+GIS interchange, and broader application studies. The deterministic,
+dependency-light design is intended to make geostat-rs usable both as a
+standalone tool and as an embeddable component of larger Rust geocomputing
+pipelines, with results that remain reproducible across the platforms on which
+it runs.
+
 \section{Software availability and reproducibility}
 \label{sec:availability}
 
@@ -305,7 +358,10 @@ geostat-rs is released under MIT or Apache-2.0, with crates for the core, CLI,
 Python and WebAssembly. All validations are reproduced by the R reference
 scripts and Python comparison scripts in the repository, and all figures by the
 provided data-generation and plotting scripts. Results are deterministic and
-platform-independent.
+platform-independent. The Meuse and Walker Lake benchmark datasets are
+distributed with \textsf{gstat}; the rare-earth application uses the public
+geochemical registry of tailings deposits in Chile \citep{sernageomin2023},
+openly available from the national geology and mining service.
 
 \section*{Acknowledgements}
 %% TODO

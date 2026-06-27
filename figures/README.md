@@ -19,8 +19,8 @@ Figures:
 - `fig_compare.pdf` — leave-one-out VEcv by method on Meuse log-zinc.
 - `fig_idw_tune.pdf` — IDW power tuned by predictive accuracy (VEcv).
 - `fig_multielement.pdf` — rare-earth grade prediction by element × method
-  (covariates + ML-geostat hybrid). **Confirm the tailings dataset is clear to
-  publish before including this figure.**
+  (covariates + ML-geostat hybrid). Uses the public geochemical registry of
+  tailings deposits in Chile (SERNAGEOMIN, 2023).
 - `fig_wasm.png` — screenshot of the WebAssembly build running in the browser
   (a committed static asset, not produced by the pipeline). To regenerate:
   `wasm-pack build crates/geostat-wasm --target web --release`, serve the repo
