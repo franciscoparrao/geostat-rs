@@ -18,6 +18,10 @@ Figures:
   machine-precision agreement (the validation centrepiece).
 - `fig_compare.pdf` — leave-one-out VEcv by method on Meuse log-zinc.
 - `fig_idw_tune.pdf` — IDW power tuned by predictive accuracy (VEcv).
+- `fig_anisotropy.pdf` — Meuse log-zinc anisotropy: the 2-D variogram map plus
+  directional variograms along the fitted major/minor axes with the fitted
+  anisotropic model (recovers the NE-SW river-floodplain continuity). Needs the
+  `variogram_map` and `fit_anisotropic` Python bindings (rebuild the module).
 - `fig_multielement.pdf` — rare-earth grade prediction by element × method
   (covariates + ML-geostat hybrid). Uses the public geochemical registry of
   tailings deposits in Chile (SERNAGEOMIN, 2023).

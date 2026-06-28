@@ -15,6 +15,7 @@ Run from the repo root, after `Rscript validation/gstat_reference.R` and
 """
 
 import csv
+import json
 import math
 import random
 from pathlib import Path
@@ -97,6 +98,60 @@ def fig_idw_tune():
     print(f"  best IDW power = {res['best']} (VEcv {res['best_vecv']:.1f})")
 
 
+def fig_anisotropy():
+    """Meuse log-zinc anisotropy: the 2-D variogram map plus directional
+    variograms along the fitted major and minor axes with the fitted
+    anisotropic model overlaid. Showcases the variogram map and the automatic
+    geometric-anisotropy fit on a textbook dataset."""
+    x, y, v = meuse()
+    diag = math.hypot(max(x) - min(x), max(y) - min(y))
+    max_dist = diag / 3.0
+    n_lags = 15
+
+    # 2-D variogram map spanning roughly the populated lag region.
+    n_map = 12
+    lag_width = max_dist / n_map
+    vm = gs.variogram_map(x, y, v, n_lags=n_map, lag_width=lag_width)
+    rows = [
+        (hx, hy, (g if g == g else ""), npr)
+        for hx, hy, g, npr in zip(vm["hx"], vm["hy"], vm["gamma"], vm["n_pairs"])
+    ]
+    write_csv(OUT / "meuse_vmap.csv", ["hx", "hy", "gamma", "n_pairs"], rows)
+
+    # Fit the anisotropic model and read its parameters.
+    model = gs.fit_anisotropic(x, y, v, n_dirs=4, n_lags=n_lags, max_dist=max_dist)
+    az, ratio = model.anisotropy()
+    minor_az = (az + 90.0) % 180.0
+    mj = json.loads(model.to_json())
+    st = mj["structures"][0]
+    write_csv(
+        OUT / "meuse_aniso_params.csv",
+        ["azimuth", "ratio", "major_range", "minor_range", "nugget", "sill"],
+        [(az, ratio, st["range"], st["range"] * ratio, mj["nugget"], st["sill"])],
+    )
+
+    # Directional experimental variograms along the major and minor axes.
+    dir_rows = []
+    for name, a in [("major", az), ("minor", minor_az)]:
+        h, gamma, npr = gs.experimental_variogram(
+            x, y, v, n_lags=n_lags, max_dist=max_dist, azimuth=a, tolerance=25.0
+        )
+        for hi, gi, ni in zip(h, gamma, npr):
+            if ni > 0 and gi == gi:
+                dir_rows.append((name, hi, gi, ni))
+    write_csv(OUT / "meuse_aniso_dir.csv", ["axis", "h", "gamma", "n_pairs"], dir_rows)
+
+    # Fitted model curves: major uses gamma(h); minor stretches the lag by the
+    # ratio (the minor-axis effective range is ratio*major).
+    fit_rows = []
+    for i in range(101):
+        hi = max_dist * i / 100.0
+        fit_rows.append(("major", hi, model.gamma(hi)))
+        fit_rows.append(("minor", hi, model.gamma(hi / ratio)))
+    write_csv(OUT / "meuse_aniso_fit.csv", ["axis", "h", "gamma"], fit_rows)
+    print(f"  fitted anisotropy: azimuth {az:.1f} deg, ratio {ratio:.3f}")
+
+
 def fig_multielement():
     """REE hold-out VEcv by element x method (publishable methods only).
 
@@ -169,6 +224,7 @@ def main():
     fig_parity()
     fig_compare()
     fig_idw_tune()
+    fig_anisotropy()
     fig_multielement()
     print("Done. Render with: Rscript figures/figures.R")
 

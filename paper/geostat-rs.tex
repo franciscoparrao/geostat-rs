@@ -134,7 +134,21 @@ exponential, Gaussian, Mat\'ern $\nu=3/2,5/2$), nested with a nugget and with
 geometric anisotropy; weighted-least-squares fitting with gstat's default
 $N_j/h_j^2$ weights via Nelder--Mead, with automatic best-family selection and
 optional joint fitting of geometric anisotropy (major-axis azimuth and
-minor/major ratio) across directional variograms.
+minor/major ratio) across directional variograms. On Meuse log-zinc
+(Figure~\ref{fig:anis}) the fit recovers the textbook NE--SW continuity of the
+river floodplain (major azimuth $\approx 36^\circ$, minor/major ratio
+$\approx0.24$), consistent with the elongation of the variogram map.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{fig_anisotropy.pdf}
+\caption{Anisotropy of Meuse log-zinc. (a) The 2-D variogram map; the dashed
+line marks the fitted major axis. (b) Directional experimental variograms along
+the fitted major and minor axes (point size $\propto$ pair count) with the
+jointly fitted anisotropic model. The major axis (NE--SW, $\approx 36^\circ$)
+has the longer range; the minor axis reaches the sill within ${\sim}900$\,m.}
+\label{fig:anis}
+\end{figure}
 
 \textbf{Kriging.} Simple, ordinary, universal (polynomial drift) and
 external-drift kriging; ordinary co-kriging (collocated and heterotopic) under a
