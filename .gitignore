@@ -22,3 +22,7 @@ paper/*.out
 paper/*.pdf
 paper/*.png
 paper/*.spl
+
+# Python bytecode
+__pycache__/
+*.pyc
