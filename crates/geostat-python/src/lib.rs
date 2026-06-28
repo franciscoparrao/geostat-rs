@@ -142,6 +142,40 @@ fn experimental_variogram(
     Ok((h, gamma, np))
 }
 
+/// 2-D variogram map (lag-space semivariance surface) for spotting anisotropy.
+/// Returns a dict with `size` (grid side = 2*n_lags+1), `lag_width`, and flat
+/// row-major (`iy*size+ix`) lists `hx`, `hy`, `gamma` (NaN where empty) and
+/// `n_pairs`.
+#[pyfunction]
+#[pyo3(signature = (x, y, values, n_lags = 15, lag_width = 1.0))]
+fn variogram_map(
+    py: Python<'_>,
+    x: Vec<f64>,
+    y: Vec<f64>,
+    values: Vec<f64>,
+    n_lags: usize,
+    lag_width: f64,
+) -> PyResult<Py<PyDict>> {
+    let data = point_set(x, y, values)?;
+    let m = core::variogram_map(&data, n_lags, lag_width).map_err(err)?;
+    let (mut hx, mut hy) = (Vec::new(), Vec::new());
+    for iy in 0..m.size {
+        for ix in 0..m.size {
+            let (lx, ly) = m.lag(ix, iy);
+            hx.push(lx);
+            hy.push(ly);
+        }
+    }
+    let out = PyDict::new(py);
+    out.set_item("size", m.size)?;
+    out.set_item("lag_width", m.lag_width)?;
+    out.set_item("hx", hx)?;
+    out.set_item("hy", hy)?;
+    out.set_item("gamma", &m.gamma)?;
+    out.set_item("n_pairs", &m.n_pairs)?;
+    Ok(out.into())
+}
+
 /// Fits a variogram model to the data by weighted least squares.
 /// `kinds` is "best" or a comma-separated list (spherical, exponential,
 /// gaussian, matern15, matern25).
@@ -963,6 +997,7 @@ fn indicator_kriging(
 fn geostat_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<VariogramModel>()?;
     m.add_function(wrap_pyfunction!(experimental_variogram, m)?)?;
+    m.add_function(wrap_pyfunction!(variogram_map, m)?)?;
     m.add_function(wrap_pyfunction!(fit_variogram, m)?)?;
     m.add_function(wrap_pyfunction!(krige, m)?)?;
     m.add_function(wrap_pyfunction!(krige_grid, m)?)?;

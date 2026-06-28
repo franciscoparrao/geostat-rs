@@ -12,7 +12,7 @@ use geostat_core::{
     KrigingMethod, ModelKind, PointSet, SgsConfig, SisConfig, VariogramConfig, VariogramModel,
     experimental_cross_variogram, experimental_variogram, fit_best, fit_lmc, indicator_kriging,
     k_fold, leave_one_out, leave_one_out_with_drift, sequential_gaussian_simulation,
-    sequential_indicator_simulation,
+    sequential_indicator_simulation, variogram_map,
 };
 
 #[derive(Parser)]
@@ -30,6 +30,8 @@ struct Cli {
 enum Command {
     /// Compute an experimental variogram and optionally fit a model
     Variogram(VariogramCmd),
+    /// Compute a 2-D variogram map (lag-space surface) to reveal anisotropy
+    Vmap(VmapCmd),
     /// Kriging interpolation (ordinary/simple/universal/external drift)
     Krige(KrigeCmd),
     /// Ordinary co-kriging with a secondary variable (LMC)
@@ -450,6 +452,7 @@ struct IkCmd {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Variogram(cmd) => run_variogram(cmd),
+        Command::Vmap(cmd) => run_vmap(cmd),
         Command::Krige(cmd) => run_krige(cmd),
         Command::Cokrige(cmd) => run_cokrige(cmd),
         Command::Cv(cmd) => run_cv(cmd),
@@ -875,6 +878,67 @@ fn run_rk(cmd: RkCmd) -> Result<()> {
     println!("Output written to {}", cmd.output.display());
     Ok(())
 }
+#[derive(Args)]
+struct VmapCmd {
+    #[command(flatten)]
+    input: InputOpts,
+    /// Number of lag cells on each side of the origin (map side = 2*n_lags+1)
+    #[arg(long, default_value_t = 15)]
+    n_lags: usize,
+    /// Lag cell size in distance units. Default: a fifteenth of the data
+    /// bounding-box half-diagonal.
+    #[arg(long)]
+    lag_width: Option<f64>,
+    /// Output CSV (hx,hy,gamma,n_pairs)
+    #[arg(short, long)]
+    output: PathBuf,
+}
+
+fn run_vmap(cmd: VmapCmd) -> Result<()> {
+    if cmd.input.z_col.is_some() {
+        bail!("the variogram map is 2-D only (drop --z-col)");
+    }
+    let data = cmd.input.read()?;
+    println!(
+        "Loaded {} points from {}",
+        data.len(),
+        cmd.input.input.display()
+    );
+    let lag_width = match cmd.lag_width {
+        Some(w) => w,
+        None => {
+            let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+            for c in data.coords() {
+                for d in 0..2 {
+                    lo[d] = lo[d].min(c[d]);
+                    hi[d] = hi[d].max(c[d]);
+                }
+            }
+            let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2)).sqrt();
+            diag / 2.0 / cmd.n_lags as f64
+        }
+    };
+    let m = variogram_map(&data, cmd.n_lags, lag_width)?;
+    println!(
+        "Variogram map {0}x{0}, lag width {1:.4}",
+        m.size, m.lag_width
+    );
+    let mut out = String::from("hx,hy,gamma,n_pairs\n");
+    for iy in 0..m.size {
+        for ix in 0..m.size {
+            let (hx, hy) = m.lag(ix, iy);
+            let g = m.gamma_at(ix, iy);
+            let np = m.n_pairs[iy * m.size + ix];
+            let gstr = if g.is_finite() { g.to_string() } else { String::new() };
+            out.push_str(&format!("{hx},{hy},{gstr},{np}\n"));
+        }
+    }
+    std::fs::write(&cmd.output, out)
+        .with_context(|| format!("writing {}", cmd.output.display()))?;
+    println!("Variogram map written to {}", cmd.output.display());
+    Ok(())
+}
+
 fn run_variogram(cmd: VariogramCmd) -> Result<()> {
     if cmd.input.z_col.is_some() {
         let data = cmd.input.read3()?;
