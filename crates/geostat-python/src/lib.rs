@@ -110,6 +110,15 @@ impl VariogramModel {
         self.inner.total_sill()
     }
 
+    /// Geometric anisotropy of the first anisotropic structure as
+    /// `(major_azimuth_deg, minor_over_major_ratio)`, or `None` if isotropic.
+    fn anisotropy(&self) -> Option<(f64, f64)> {
+        self.inner
+            .structures
+            .iter()
+            .find_map(|s| s.anis.map(|a| (a.azimuth_deg, a.ratio)))
+    }
+
     fn __repr__(&self) -> String {
         format!("VariogramModel({})", self.inner)
     }
@@ -193,6 +202,28 @@ fn fit_variogram(
     let cfg = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
     let ev = core::experimental_variogram(&data, &cfg).map_err(err)?;
     let fit = core::fit_best(&ev, &parse_kinds(kinds)?).map_err(err)?;
+    Ok(VariogramModel { inner: fit.model })
+}
+
+/// Fits a geometrically anisotropic variogram model: estimates the major-axis
+/// azimuth and the minor/major range ratio from `n_dirs` directional
+/// variograms. `kinds` is "best" or a comma-separated family list. The returned
+/// model carries the anisotropy; `model.anisotropy()` exposes (azimuth, ratio).
+#[pyfunction]
+#[pyo3(signature = (x, y, values, n_dirs = 4, n_lags = 15, max_dist = None, kinds = "best"))]
+fn fit_anisotropic(
+    x: Vec<f64>,
+    y: Vec<f64>,
+    values: Vec<f64>,
+    n_dirs: usize,
+    n_lags: usize,
+    max_dist: Option<f64>,
+    kinds: &str,
+) -> PyResult<VariogramModel> {
+    let data = point_set(x, y, values)?;
+    let cfg = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
+    let fit = core::fit_anisotropic(&data, &parse_kinds(kinds)?, n_dirs, n_lags, cfg.max_dist)
+        .map_err(err)?;
     Ok(VariogramModel { inner: fit.model })
 }
 
@@ -999,6 +1030,7 @@ fn geostat_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(experimental_variogram, m)?)?;
     m.add_function(wrap_pyfunction!(variogram_map, m)?)?;
     m.add_function(wrap_pyfunction!(fit_variogram, m)?)?;
+    m.add_function(wrap_pyfunction!(fit_anisotropic, m)?)?;
     m.add_function(wrap_pyfunction!(krige, m)?)?;
     m.add_function(wrap_pyfunction!(krige_grid, m)?)?;
     m.add_function(wrap_pyfunction!(loo_cv, m)?)?;

@@ -132,7 +132,9 @@ azimuth and a 3-D dip cone), a 2-D variogram map for diagnosing anisotropy, and
 cross-variograms; theoretical models (spherical,
 exponential, Gaussian, Mat\'ern $\nu=3/2,5/2$), nested with a nugget and with
 geometric anisotropy; weighted-least-squares fitting with gstat's default
-$N_j/h_j^2$ weights via Nelder--Mead, with automatic best-family selection.
+$N_j/h_j^2$ weights via Nelder--Mead, with automatic best-family selection and
+optional joint fitting of geometric anisotropy (major-axis azimuth and
+minor/major ratio) across directional variograms.
 
 \textbf{Kriging.} Simple, ordinary, universal (polynomial drift) and
 external-drift kriging; ordinary co-kriging (collocated and heterotopic) under a

@@ -10,9 +10,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use geostat_core::{
     CoKriging, CoKrigingConfig, DirectionConfig, Grid2D, IkConfig, Kriging, KrigingConfig,
     KrigingMethod, ModelKind, PointSet, SgsConfig, SisConfig, VariogramConfig, VariogramModel,
-    experimental_cross_variogram, experimental_variogram, fit_best, fit_lmc, indicator_kriging,
-    k_fold, leave_one_out, leave_one_out_with_drift, sequential_gaussian_simulation,
-    sequential_indicator_simulation, variogram_map,
+    experimental_cross_variogram, experimental_variogram, fit_anisotropic, fit_best, fit_lmc,
+    indicator_kriging, k_fold, leave_one_out, leave_one_out_with_drift,
+    sequential_gaussian_simulation, sequential_indicator_simulation, variogram_map,
 };
 
 #[derive(Parser)]
@@ -231,6 +231,14 @@ struct VariogramCmd {
     /// (spherical, exponential, gaussian, matern15, matern25)
     #[arg(long)]
     fit: Option<String>,
+    /// Fit a geometrically anisotropic model: estimate the major-axis azimuth
+    /// and minor/major range ratio from directional variograms (2-D only).
+    /// Combine with --fit to restrict the candidate families.
+    #[arg(long)]
+    anisotropic: bool,
+    /// Number of directions for the anisotropy fit
+    #[arg(long, default_value_t = 4)]
+    n_dirs: usize,
     /// Write experimental variogram bins to a CSV file
     #[arg(short, long)]
     output: Option<PathBuf>,
@@ -941,6 +949,9 @@ fn run_vmap(cmd: VmapCmd) -> Result<()> {
 
 fn run_variogram(cmd: VariogramCmd) -> Result<()> {
     if cmd.input.z_col.is_some() {
+        if cmd.anisotropic {
+            bail!("--anisotropic is 2-D only (drop --z-col)");
+        }
         let data = cmd.input.read3()?;
         println!("Loaded {} 3-D points", data.len());
         return variogram_report(&data, &cmd);
@@ -951,7 +962,59 @@ fn run_variogram(cmd: VariogramCmd) -> Result<()> {
         data.len(),
         cmd.input.input.display()
     );
+    if cmd.anisotropic {
+        return anisotropic_report(&data, &cmd);
+    }
     variogram_report(&data, &cmd)
+}
+
+fn anisotropic_report(data: &PointSet<2>, cmd: &VariogramCmd) -> Result<()> {
+    let cfg = cmd.vario.config(data);
+    let ev = experimental_variogram(data, &cfg)?;
+    println!(
+        "\nOmnidirectional variogram (max_dist = {:.2}):",
+        cfg.max_dist
+    );
+    println!("{:>4} {:>12} {:>12} {:>8}", "lag", "h", "gamma", "pairs");
+    for (i, b) in ev.bins.iter().enumerate() {
+        let gamma = if b.n_pairs > 0 {
+            format!("{:.6}", b.gamma)
+        } else {
+            "NA".to_string()
+        };
+        println!("{:>4} {:>12.2} {:>12} {:>8}", i + 1, b.h, gamma, b.n_pairs);
+    }
+
+    let kinds = match &cmd.fit {
+        Some(spec) => parse_kinds(spec)?,
+        None => ModelKind::ALL.to_vec(),
+    };
+    let fit = fit_anisotropic(data, &kinds, cmd.n_dirs, cfg.n_lags, cfg.max_dist)?;
+    let s = fit.model.structures[0];
+    let a = s
+        .anis
+        .expect("anisotropy fit always produces an anisotropic structure");
+    println!("\nFitted anisotropic model ({} directions):", cmd.n_dirs);
+    println!("  family:          {}", s.kind);
+    println!("  nugget:          {:.4}", fit.model.nugget);
+    println!("  partial sill:    {:.4}", s.sill);
+    println!("  major range:     {:.4}", s.range);
+    println!("  minor range:     {:.4}", s.range * a.ratio);
+    println!("  major azimuth:   {:.2} deg (clockwise from north)", a.azimuth_deg);
+    println!("  ratio (min/maj): {:.4}", a.ratio);
+    println!("  weighted SSE:    {:.6e}", fit.wsse);
+    if a.ratio > 0.95 {
+        println!("  note: ratio ~ 1 -> data look near-isotropic; azimuth is not meaningful");
+    }
+    if let Some(path) = &cmd.model_out {
+        io_utils::write_model(path, &fit.model)?;
+        println!("Model written to {}", path.display());
+    }
+    if let Some(path) = &cmd.output {
+        io_utils::write_variogram_csv(path, &ev)?;
+        println!("Omnidirectional bins written to {}", path.display());
+    }
+    Ok(())
 }
 
 fn variogram_report<const D: usize>(data: &PointSet<D>, cmd: &VariogramCmd) -> Result<()> {

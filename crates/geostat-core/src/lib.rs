@@ -84,5 +84,5 @@ pub use validation::{CvResult, k_fold, leave_one_out, leave_one_out_with_drift};
 pub use variogram::{
     Anisotropy, DirectionConfig, ExperimentalVariogram, FitResult, LagBin, ModelKind, Structure,
     VariogramConfig, VariogramMap, VariogramModel, experimental_cross_variogram,
-    experimental_variogram, fit_best, fit_model, variogram_map,
+    experimental_variogram, fit_anisotropic, fit_best, fit_model, variogram_map,
 };
