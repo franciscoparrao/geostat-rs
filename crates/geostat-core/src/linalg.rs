@@ -76,6 +76,12 @@ pub fn lu_factor(mut a: Array2<f64>) -> Result<Lu> {
 }
 
 impl Lu {
+    /// Log of the absolute value of the determinant, `ln|det A| = Σ ln|U_ii|`.
+    /// For a symmetric positive-definite matrix this is `ln(det A)`.
+    pub fn ln_det_abs(&self) -> f64 {
+        (0..self.n).map(|i| self.lu[[i, i]].abs().ln()).sum()
+    }
+
     /// Solves `A x = b` by reusing the factorization. `b` must have length `n`.
     #[allow(clippy::needless_range_loop)]
     pub fn solve(&self, mut b: Vec<f64>) -> Vec<f64> {
