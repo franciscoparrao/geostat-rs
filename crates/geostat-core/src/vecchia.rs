@@ -24,7 +24,8 @@ use std::f64::consts::PI;
 use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
 use crate::linalg::solve;
-use crate::variogram::VariogramModel;
+use crate::optim::nelder_mead;
+use crate::variogram::{ModelKind, Structure, VariogramModel};
 
 /// Squared Euclidean distance between two points.
 fn dist2<const D: usize>(a: &[f64; D], b: &[f64; D]) -> f64 {
@@ -109,6 +110,94 @@ fn nearest_predecessors<const D: usize>(
     scored.into_iter().map(|(_, j)| j).collect()
 }
 
+/// A reusable Vecchia conditioning structure: the point ordering and, for each
+/// ordered point, the indices of its nearest predecessors. It depends only on
+/// the geometry (coordinates, `m`, ordering), not on the covariance model, so it
+/// is built once and reused across every likelihood evaluation --- which is what
+/// makes maximum-likelihood fitting ([`vecchia_mle`]) efficient.
+#[derive(Debug, Clone)]
+pub struct VecchiaPlan {
+    /// The point ordering (a permutation of `0..n`).
+    pub order: Vec<usize>,
+    /// `neighbours[k]` = conditioning indices for `order[k]`.
+    neighbours: Vec<Vec<usize>>,
+}
+
+/// Builds a [`VecchiaPlan`] for `coords` with conditioning size `m`, using the
+/// supplied ordering or [`maxmin_order`] when `None`.
+pub fn vecchia_plan<const D: usize>(
+    coords: &[[f64; D]],
+    m: usize,
+    order: Option<&[usize]>,
+) -> Result<VecchiaPlan> {
+    let n = coords.len();
+    if n < 2 {
+        return Err(GeostatError::InsufficientData(
+            "Vecchia requires at least 2 points".into(),
+        ));
+    }
+    if m == 0 {
+        return Err(GeostatError::InvalidParameter(
+            "conditioning size m must be at least 1".into(),
+        ));
+    }
+    let order = match order {
+        Some(o) => {
+            if o.len() != n {
+                return Err(GeostatError::DimensionMismatch(format!(
+                    "order has {} entries for {n} points",
+                    o.len()
+                )));
+            }
+            o.to_vec()
+        }
+        None => maxmin_order(coords),
+    };
+    let neighbours = (0..n)
+        .map(|k| nearest_predecessors(coords, order[k], &order[..k], m))
+        .collect();
+    Ok(VecchiaPlan { order, neighbours })
+}
+
+/// Vecchia log-likelihood for a precomputed [`VecchiaPlan`] (the hot path).
+fn loglik_with_plan<const D: usize>(
+    data: &PointSet<D>,
+    model: &VariogramModel,
+    plan: &VecchiaPlan,
+) -> Result<f64> {
+    let coords = data.coords();
+    let mean = data.mean();
+    let z: Vec<f64> = data.values().iter().map(|v| v - mean).collect();
+    let sill = model.total_sill(); // C(0)
+
+    let mut loglik = 0.0;
+    for (k, &i) in plan.order.iter().enumerate() {
+        let nb = &plan.neighbours[k];
+        let (mu, var) = if nb.is_empty() {
+            (0.0, sill) // first point: marginal
+        } else {
+            let s = nb.len();
+            // K_SS (neighbour covariance) and k_i (target-neighbour covariance).
+            let mut kss = vec![0.0; s * s];
+            let mut ki = vec![0.0; s];
+            for a in 0..s {
+                ki[a] = model.covariance_dh(sep(&coords[i], &coords[nb[a]]));
+                for b in 0..s {
+                    kss[a * s + b] = model.covariance_dh(sep(&coords[nb[a]], &coords[nb[b]]));
+                }
+            }
+            let arr = ndarray::Array2::from_shape_vec((s, s), kss).expect("square K_SS");
+            let w = solve(arr, ki.clone())?; // w = K_SS^{-1} k_i
+            let mu: f64 = w.iter().zip(nb).map(|(&wj, &j)| wj * z[j]).sum();
+            let reduction: f64 = w.iter().zip(&ki).map(|(&wj, &kj)| wj * kj).sum();
+            (mu, (sill - reduction).max(1e-12))
+        };
+        let r = z[i] - mu;
+        loglik += -0.5 * ((2.0 * PI).ln() + var.ln() + r * r / var);
+    }
+    Ok(loglik)
+}
+
 /// Vecchia-approximated Gaussian log-likelihood of `data` under `model`, with
 /// each point conditioning on its `m` nearest predecessors in `order` (defaults
 /// to [`maxmin_order`] when `None`). Values are centred by their mean (a known
@@ -121,67 +210,92 @@ pub fn vecchia_loglik<const D: usize>(
     m: usize,
     order: Option<&[usize]>,
 ) -> Result<f64> {
-    let n = data.len();
-    if n < 2 {
-        return Err(GeostatError::InsufficientData(
-            "Vecchia log-likelihood requires at least 2 points".into(),
-        ));
-    }
-    if m == 0 {
-        return Err(GeostatError::InvalidParameter(
-            "conditioning size m must be at least 1".into(),
-        ));
-    }
-    let coords = data.coords();
-    let mean = data.mean();
-    let z: Vec<f64> = data.values().iter().map(|v| v - mean).collect();
-    let sill = model.total_sill(); // C(0)
+    let plan = vecchia_plan(data.coords(), m, order)?;
+    loglik_with_plan(data, model, &plan)
+}
 
-    let owned;
-    let order = match order {
-        Some(o) => {
-            if o.len() != n {
-                return Err(GeostatError::DimensionMismatch(format!(
-                    "order has {} entries for {n} points",
-                    o.len()
-                )));
-            }
-            o
+/// Result of a Vecchia maximum-likelihood fit.
+#[derive(Debug, Clone)]
+pub struct VecchiaFit {
+    /// Fitted single-structure model (nugget + one structure).
+    pub model: VariogramModel,
+    /// Maximized Vecchia log-likelihood.
+    pub loglik: f64,
+}
+
+/// Fits a single-structure model of the given `kind` (nugget + partial sill +
+/// range) to `data` by **maximum likelihood**, maximizing the Vecchia
+/// approximation with conditioning size `m`. The plan is built once and reused
+/// across optimizer evaluations.
+///
+/// This is the scalable counterpart to variogram weighted-least-squares fitting:
+/// it fits the covariance directly to the data likelihood, and with the Vecchia
+/// approximation it stays `O(n m^3)` per evaluation rather than `O(n^3)`.
+pub fn vecchia_mle<const D: usize>(
+    data: &PointSet<D>,
+    kind: ModelKind,
+    m: usize,
+    order: Option<&[usize]>,
+) -> Result<VecchiaFit> {
+    let plan = vecchia_plan(data.coords(), m, order)?;
+
+    // Initial scales: sample variance for the sill, a fraction of the domain
+    // extent for the range.
+    let mean = data.mean();
+    let var0 = (data.values().iter().map(|v| (v - mean).powi(2)).sum::<f64>()
+        / data.len() as f64)
+        .max(1e-12);
+    let coords = data.coords();
+    let mut lo = [f64::INFINITY; D];
+    let mut hi = [f64::NEG_INFINITY; D];
+    for p in coords {
+        for d in 0..D {
+            lo[d] = lo[d].min(p[d]);
+            hi[d] = hi[d].max(p[d]);
         }
-        None => {
-            owned = maxmin_order(coords);
-            &owned
+    }
+    let extent = (0..D).map(|d| (hi[d] - lo[d]).powi(2)).sum::<f64>().sqrt();
+    let range0 = (extent / 3.0).max(1e-9);
+
+    // Parameters are multipliers of (var0, var0, range0); penalize invalid ones.
+    let objective = |x: &[f64]| -> f64 {
+        let nugget = x[0] * var0;
+        let psill = x[1] * var0;
+        let range = x[2] * range0;
+        let mut pen = 0.0;
+        if nugget < 0.0 {
+            pen += nugget * nugget;
+        }
+        if psill <= 0.0 {
+            pen += 1.0 + psill * psill;
+        }
+        if range <= 0.0 {
+            pen += 1.0 + range * range;
+        }
+        if pen > 0.0 {
+            return 1e12 * (1.0 + pen);
+        }
+        let model = VariogramModel {
+            nugget,
+            structures: vec![Structure::new(kind, psill, range)],
+        };
+        // Minimize the negative log-likelihood; a singular system is rejected.
+        match loglik_with_plan(data, &model, &plan) {
+            Ok(ll) if ll.is_finite() => -ll,
+            _ => 1e12,
         }
     };
 
-    let mut loglik = 0.0;
-    for (k, &i) in order.iter().enumerate() {
-        let nb = nearest_predecessors(coords, i, &order[..k], m);
-        let (mu, var) = if nb.is_empty() {
-            (0.0, sill) // first point: marginal
-        } else {
-            let s = nb.len();
-            // K_SS (neighbour covariance) and k_i (target-neighbour covariance).
-            let mut kss = vec![0.0; s * s];
-            let mut ki = vec![0.0; s];
-            for a in 0..s {
-                ki[a] = model.covariance_dh(sep(&coords[i], &coords[nb[a]]));
-                for b in 0..s {
-                    kss[a * s + b] =
-                        model.covariance_dh(sep(&coords[nb[a]], &coords[nb[b]]));
-                }
-            }
-            let arr = ndarray::Array2::from_shape_vec((s, s), kss)
-                .expect("square K_SS");
-            let w = solve(arr, ki.clone())?; // w = K_SS^{-1} k_i
-            let mu: f64 = w.iter().zip(&nb).map(|(&wj, &j)| wj * z[j]).sum();
-            let reduction: f64 = w.iter().zip(&ki).map(|(&wj, &kj)| wj * kj).sum();
-            (mu, (sill - reduction).max(1e-12))
-        };
-        let r = z[i] - mu;
-        loglik += -0.5 * ((2.0 * PI).ln() + var.ln() + r * r / var);
-    }
-    Ok(loglik)
+    let x0 = [0.1, 0.9, 1.0];
+    let (xb, neg_ll) = nelder_mead(objective, &x0, 0.3, 2000);
+    let model = VariogramModel::new(
+        (xb[0] * var0).max(0.0),
+        vec![Structure::new(kind, (xb[1] * var0).max(1e-12), (xb[2] * range0).max(1e-12))],
+    )?;
+    Ok(VecchiaFit {
+        model,
+        loglik: -neg_ll,
+    })
 }
 
 #[cfg(test)]
@@ -264,5 +378,65 @@ mod tests {
         let model =
             VariogramModel::new(0.1, vec![Structure::new(ModelKind::Spherical, 1.0, 20.0)]).unwrap();
         assert!(vecchia_loglik(&data, &model, 0, None).is_err());
+    }
+
+    #[test]
+    fn mle_full_conditioning_is_exact_optimum() {
+        // With full conditioning the Vecchia likelihood is exact, so the MLE
+        // optimum must be a local optimum of the exact log-likelihood: no small
+        // parameter perturbation may raise it.
+        let data = field(28, 5);
+        let full = data.len() - 1;
+        let fit = vecchia_mle(&data, ModelKind::Exponential, full, None).unwrap();
+        let s = fit.model.structures[0];
+        assert!(s.sill > 0.0 && s.range > 0.0 && fit.model.nugget >= 0.0);
+
+        // fit.loglik is the exact log-likelihood at the optimum (full cond.).
+        for (fn_, fp, fr) in [
+            (1.0, 0.7, 1.0),
+            (1.0, 1.4, 1.0),
+            (1.0, 1.0, 0.7),
+            (1.0, 1.0, 1.4),
+            (3.0, 1.0, 1.0),
+        ] {
+            let pert = VariogramModel::new(
+                (fit.model.nugget * fn_).max(1e-9),
+                vec![Structure::new(s.kind, s.sill * fp, s.range * fr)],
+            )
+            .unwrap();
+            let ll = vecchia_loglik(&data, &pert, full, None).unwrap();
+            assert!(
+                fit.loglik >= ll - 1e-6,
+                "perturbation ({fn_},{fp},{fr}) beats the optimum: {ll} > {}",
+                fit.loglik
+            );
+        }
+    }
+
+    #[test]
+    fn mle_beats_a_wrong_model() {
+        let data = field(60, 9);
+        let fit = vecchia_mle(&data, ModelKind::Exponential, 12, None).unwrap();
+        // The fitted likelihood must exceed that of a badly mis-scaled model.
+        let wrong =
+            VariogramModel::new(0.5, vec![Structure::new(ModelKind::Exponential, 0.1, 5.0)])
+                .unwrap();
+        let ll_wrong = vecchia_loglik(&data, &wrong, 15, None).unwrap();
+        assert!(fit.loglik > ll_wrong, "{} vs wrong {ll_wrong}", fit.loglik);
+    }
+
+    #[test]
+    fn plan_is_reusable() {
+        let data = field(30, 2);
+        let plan = vecchia_plan(data.coords(), 8, None).unwrap();
+        assert_eq!(plan.order.len(), 30);
+        let m1 = VariogramModel::new(0.1, vec![Structure::new(ModelKind::Spherical, 1.0, 20.0)])
+            .unwrap();
+        let m2 = VariogramModel::new(0.2, vec![Structure::new(ModelKind::Spherical, 2.0, 40.0)])
+            .unwrap();
+        // Same plan, different models -> two valid, distinct likelihoods.
+        let a = super::loglik_with_plan(&data, &m1, &plan).unwrap();
+        let b = super::loglik_with_plan(&data, &m2, &plan).unwrap();
+        assert!(a.is_finite() && b.is_finite() && (a - b).abs() > 0.0);
     }
 }

@@ -12,7 +12,7 @@ use std::time::Instant;
 use geostat_core::linalg::lu_factor;
 use geostat_core::rng::Rng;
 use geostat_core::variogram::{ModelKind, Structure, VariogramModel};
-use geostat_core::vecchia::vecchia_loglik;
+use geostat_core::vecchia::{vecchia_loglik, vecchia_mle};
 use geostat_core::PointSet;
 
 fn exact_loglik(data: &PointSet, model: &VariogramModel) -> f64 {
@@ -71,4 +71,14 @@ fn main() {
             println!("{n:>7}  {vt:>12.1}  {:>12}  {:>10}", "(skipped)", "-");
         }
     }
+
+    // Maximum-likelihood covariance fit at scale (where O(n^3) is out of reach).
+    use geostat_core::variogram::ModelKind;
+    let n = 4000;
+    let data = field(n);
+    let t = Instant::now();
+    let fit = vecchia_mle(&data, ModelKind::Exponential, m, None).unwrap();
+    let ft = t.elapsed().as_secs_f64() * 1e3;
+    println!("\nVecchia MLE on n={n} (m={m}): {ft:.0} ms");
+    println!("  fitted: {}  (loglik {:.1})", fit.model, fit.loglik);
 }
