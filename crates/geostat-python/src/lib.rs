@@ -227,6 +227,43 @@ fn fit_anisotropic(
     Ok(VariogramModel { inner: fit.model })
 }
 
+/// Fits a single-structure model by Vecchia maximum likelihood: maximizes the
+/// Vecchia-approximated Gaussian log-likelihood (conditioning size `m`) instead
+/// of variogram weighted least squares. Scales as O(n m^3), so it fits the
+/// covariance to the data likelihood on large `n`. `kind` is one family
+/// (spherical, exponential, gaussian, matern15, matern25).
+#[pyfunction]
+#[pyo3(signature = (x, y, values, kind = "exponential", m = 20))]
+fn vecchia_mle(
+    x: Vec<f64>,
+    y: Vec<f64>,
+    values: Vec<f64>,
+    kind: &str,
+    m: usize,
+) -> PyResult<VariogramModel> {
+    let data = point_set(x, y, values)?;
+    let k = *parse_kinds(kind)?
+        .first()
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("no model kind given"))?;
+    let fit = core::vecchia_mle(&data, k, m, None).map_err(err)?;
+    Ok(VariogramModel { inner: fit.model })
+}
+
+/// Vecchia-approximated Gaussian log-likelihood of the data under `model`, with
+/// conditioning size `m` (exact when `m >= n-1`).
+#[pyfunction]
+#[pyo3(signature = (x, y, values, model, m = 20))]
+fn vecchia_loglik(
+    x: Vec<f64>,
+    y: Vec<f64>,
+    values: Vec<f64>,
+    model: &VariogramModel,
+    m: usize,
+) -> PyResult<f64> {
+    let data = point_set(x, y, values)?;
+    core::vecchia_loglik(&data, &model.inner, m, None).map_err(err)
+}
+
 /// Kriging at arbitrary target locations. Returns `(predictions, variances)`;
 /// failed targets yield NaN.
 #[pyfunction]
@@ -1031,6 +1068,8 @@ fn geostat_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(variogram_map, m)?)?;
     m.add_function(wrap_pyfunction!(fit_variogram, m)?)?;
     m.add_function(wrap_pyfunction!(fit_anisotropic, m)?)?;
+    m.add_function(wrap_pyfunction!(vecchia_mle, m)?)?;
+    m.add_function(wrap_pyfunction!(vecchia_loglik, m)?)?;
     m.add_function(wrap_pyfunction!(krige, m)?)?;
     m.add_function(wrap_pyfunction!(krige_grid, m)?)?;
     m.add_function(wrap_pyfunction!(loo_cv, m)?)?;

@@ -12,7 +12,7 @@ use geostat_core::{
     KrigingMethod, ModelKind, PointSet, SgsConfig, SisConfig, VariogramConfig, VariogramModel,
     experimental_cross_variogram, experimental_variogram, fit_anisotropic, fit_best, fit_lmc,
     indicator_kriging, k_fold, leave_one_out, leave_one_out_with_drift,
-    sequential_gaussian_simulation, sequential_indicator_simulation, variogram_map,
+    sequential_gaussian_simulation, sequential_indicator_simulation, variogram_map, vecchia_mle,
 };
 
 #[derive(Parser)]
@@ -239,6 +239,14 @@ struct VariogramCmd {
     /// Number of directions for the anisotropy fit
     #[arg(long, default_value_t = 4)]
     n_dirs: usize,
+    /// Fit the model by Vecchia maximum likelihood instead of weighted
+    /// least squares (scalable; fits the covariance to the data likelihood).
+    /// Uses the first --fit family, or exponential by default.
+    #[arg(long)]
+    mle: bool,
+    /// Vecchia conditioning size for --mle
+    #[arg(long, default_value_t = 20)]
+    cond: usize,
     /// Write experimental variogram bins to a CSV file
     #[arg(short, long)]
     output: Option<PathBuf>,
@@ -948,6 +956,9 @@ fn run_vmap(cmd: VmapCmd) -> Result<()> {
 }
 
 fn run_variogram(cmd: VariogramCmd) -> Result<()> {
+    if cmd.anisotropic && cmd.mle {
+        bail!("--mle and --anisotropic cannot be combined yet");
+    }
     if cmd.input.z_col.is_some() {
         if cmd.anisotropic {
             bail!("--anisotropic is 2-D only (drop --z-col)");
@@ -1032,7 +1043,19 @@ fn variogram_report<const D: usize>(data: &PointSet<D>, cmd: &VariogramCmd) -> R
         println!("{:>4} {:>12.2} {:>12} {:>8}", i + 1, b.h, gamma, b.n_pairs);
     }
 
-    if let Some(spec) = &cmd.fit {
+    if cmd.mle {
+        let kind = match &cmd.fit {
+            Some(spec) => parse_kinds(spec)?[0],
+            None => ModelKind::Exponential,
+        };
+        let fit = vecchia_mle(data, kind, cmd.cond, None)?;
+        println!("\nVecchia ML fit (m = {}): {}", cmd.cond, fit.model);
+        println!("Log-likelihood: {:.4}", fit.loglik);
+        if let Some(path) = &cmd.model_out {
+            io_utils::write_model(path, &fit.model)?;
+            println!("Model written to {}", path.display());
+        }
+    } else if let Some(spec) = &cmd.fit {
         let kinds = parse_kinds(spec)?;
         let fit = fit_best(&ev, &kinds)?;
         println!("\nFitted model: {}", fit.model);
@@ -1042,7 +1065,7 @@ fn variogram_report<const D: usize>(data: &PointSet<D>, cmd: &VariogramCmd) -> R
             println!("Model written to {}", path.display());
         }
     } else if cmd.model_out.is_some() {
-        bail!("--model-out requires --fit");
+        bail!("--model-out requires --fit or --mle");
     }
 
     if let Some(path) = &cmd.output {

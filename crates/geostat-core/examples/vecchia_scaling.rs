@@ -73,7 +73,6 @@ fn main() {
     }
 
     // Maximum-likelihood covariance fit at scale (where O(n^3) is out of reach).
-    use geostat_core::variogram::ModelKind;
     let n = 4000;
     let data = field(n);
     let t = Instant::now();
