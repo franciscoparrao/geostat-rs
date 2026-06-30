@@ -21,9 +21,11 @@
 
 use std::f64::consts::PI;
 
+use ndarray::Array2;
+
 use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
-use crate::linalg::solve;
+use crate::linalg::{lu_factor, solve};
 use crate::optim::nelder_mead;
 use crate::variogram::{ModelKind, Structure, VariogramModel};
 
@@ -275,13 +277,234 @@ pub fn vecchia_mle<const D: usize>(
         if pen > 0.0 {
             return 1e12 * (1.0 + pen);
         }
+        // A range far beyond the domain is unidentifiable (indistinguishable
+        // from a trend); regularize it back rather than letting it run away.
+        let range_max = 10.0 * extent;
+        let reg = if range > range_max {
+            ((range - range_max) / range_max).powi(2)
+        } else {
+            0.0
+        };
         let model = VariogramModel {
             nugget,
             structures: vec![Structure::new(kind, psill, range)],
         };
         // Minimize the negative log-likelihood; a singular system is rejected.
         match loglik_with_plan(data, &model, &plan) {
-            Ok(ll) if ll.is_finite() => -ll,
+            Ok(ll) if ll.is_finite() => -ll + 1e6 * reg,
+            _ => 1e12,
+        }
+    };
+
+    let x0 = [0.1, 0.9, 1.0];
+    let (xb, neg_ll) = nelder_mead(objective, &x0, 0.3, 2000);
+    let model = VariogramModel::new(
+        (xb[0] * var0).max(0.0),
+        vec![Structure::new(kind, (xb[1] * var0).max(1e-12), (xb[2] * range0).max(1e-12))],
+    )?;
+    Ok(VecchiaFit {
+        model,
+        loglik: -neg_ll,
+    })
+}
+
+/// All monomial exponent tuples over `D` dimensions with total degree
+/// `<= degree` (includes the constant term).
+fn monomials<const D: usize>(degree: u8) -> Vec<[u8; D]> {
+    fn rec<const D: usize>(d: usize, rem: u8, cur: &mut [u8; D], out: &mut Vec<[u8; D]>) {
+        if d == D {
+            out.push(*cur);
+            return;
+        }
+        for e in 0..=rem {
+            cur[d] = e;
+            rec(d + 1, rem - e, cur, out);
+        }
+        cur[d] = 0;
+    }
+    let mut out = Vec::new();
+    let mut cur = [0u8; D];
+    rec(0, degree, &mut cur, &mut out);
+    out
+}
+
+/// Polynomial trend basis `F` (one row per point, one column per monomial up to
+/// `degree`). Coordinates are centred and scaled per dimension so the design
+/// matrix stays well-conditioned at higher degrees.
+fn poly_basis<const D: usize>(coords: &[[f64; D]], degree: u8) -> Vec<Vec<f64>> {
+    let n = coords.len();
+    let mut mean = [0.0; D];
+    for p in coords {
+        for d in 0..D {
+            mean[d] += p[d] / n as f64;
+        }
+    }
+    let mut scale = [1.0; D];
+    for d in 0..D {
+        let var = coords.iter().map(|p| (p[d] - mean[d]).powi(2)).sum::<f64>() / n as f64;
+        scale[d] = var.sqrt().max(1e-12);
+    }
+    let exps = monomials::<D>(degree);
+    coords
+        .iter()
+        .map(|p| {
+            let cs: [f64; D] = std::array::from_fn(|d| (p[d] - mean[d]) / scale[d]);
+            exps.iter()
+                .map(|e| {
+                    let mut v = 1.0;
+                    for d in 0..D {
+                        for _ in 0..e[d] {
+                            v *= cs[d];
+                        }
+                    }
+                    v
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Restricted (and trend-) maximum-likelihood Vecchia log-likelihood: the mean
+/// is `F beta` (estimated by generalized least squares), and the covariance is
+/// fit to the resulting error contrasts. Whitening `z` and the columns of `F`
+/// with the Vecchia factor turns the GLS solve into a small `p x p` system.
+fn reml_loglik_with_plan<const D: usize>(
+    data: &PointSet<D>,
+    model: &VariogramModel,
+    plan: &VecchiaPlan,
+    basis: &[Vec<f64>],
+) -> Result<f64> {
+    let coords = data.coords();
+    let z = data.values();
+    let p = basis[0].len();
+    let n = coords.len();
+    let sill = model.total_sill();
+
+    let mut logdet = 0.0;
+    let mut uz_uz = 0.0;
+    let mut a = vec![0.0; p * p]; // F^T Sigma^{-1} F
+    let mut c = vec![0.0; p]; // F^T Sigma^{-1} z
+    for (k, &i) in plan.order.iter().enumerate() {
+        let nb = &plan.neighbours[k];
+        // Whitened z and trend-row at this ordered point.
+        let (uz, uf, d) = if nb.is_empty() {
+            let sd = sill.sqrt();
+            let uf: Vec<f64> = basis[i].iter().map(|&f| f / sd).collect();
+            (z[i] / sd, uf, sill)
+        } else {
+            let s = nb.len();
+            let mut kss = vec![0.0; s * s];
+            let mut ki = vec![0.0; s];
+            for aa in 0..s {
+                ki[aa] = model.covariance_dh(sep(&coords[i], &coords[nb[aa]]));
+                for bb in 0..s {
+                    kss[aa * s + bb] = model.covariance_dh(sep(&coords[nb[aa]], &coords[nb[bb]]));
+                }
+            }
+            let arr = Array2::from_shape_vec((s, s), kss).expect("square K_SS");
+            let w = solve(arr, ki.clone())?;
+            let d = (sill - w.iter().zip(&ki).map(|(&wj, &kj)| wj * kj).sum::<f64>()).max(1e-12);
+            let sd = d.sqrt();
+            let uz = (z[i] - w.iter().zip(nb).map(|(&wj, &j)| wj * z[j]).sum::<f64>()) / sd;
+            let uf: Vec<f64> = (0..p)
+                .map(|col| {
+                    (basis[i][col] - w.iter().zip(nb).map(|(&wj, &j)| wj * basis[j][col]).sum::<f64>())
+                        / sd
+                })
+                .collect();
+            (uz, uf, d)
+        };
+        logdet += d.ln();
+        uz_uz += uz * uz;
+        for aa in 0..p {
+            c[aa] += uf[aa] * uz;
+            for bb in 0..p {
+                a[aa * p + bb] += uf[aa] * uf[bb];
+            }
+        }
+    }
+
+    // GLS: beta = A^{-1} c; residual quadratic form = uz_uz - c^T beta.
+    let a_arr = Array2::from_shape_vec((p, p), a).expect("square A");
+    let lu = lu_factor(a_arr)?;
+    let beta = lu.solve(c.clone());
+    let ln_det_a = lu.ln_det_abs();
+    let resid = uz_uz - c.iter().zip(&beta).map(|(&ci, &bi)| ci * bi).sum::<f64>();
+
+    let nm = (n - p) as f64;
+    Ok(-0.5 * (nm * (2.0 * PI).ln() + logdet + ln_det_a + resid))
+}
+
+/// Fits a single-structure model by **restricted/trend maximum likelihood**:
+/// the mean is a polynomial trend of `drift_degree` (0 = constant, 1 = linear,
+/// 2 = quadratic) estimated by GLS, and the covariance is fit to the error
+/// contrasts via the Vecchia REML likelihood. Unlike [`vecchia_mle`] (constant
+/// plug-in mean), this does not let a spatial trend inflate the range --- it is
+/// the estimator to use when the field is non-stationary in the mean.
+pub fn vecchia_reml<const D: usize>(
+    data: &PointSet<D>,
+    kind: ModelKind,
+    m: usize,
+    drift_degree: u8,
+    order: Option<&[usize]>,
+) -> Result<VecchiaFit> {
+    let plan = vecchia_plan(data.coords(), m, order)?;
+    let basis = poly_basis(data.coords(), drift_degree);
+    let p = basis[0].len();
+    if data.len() <= p + 1 {
+        return Err(GeostatError::InsufficientData(format!(
+            "REML with degree {drift_degree} needs more than {} points",
+            p + 1
+        )));
+    }
+
+    // Initial scales from the GLS-residual variance about the trend.
+    let mean = data.mean();
+    let var0 = (data.values().iter().map(|v| (v - mean).powi(2)).sum::<f64>()
+        / data.len() as f64)
+        .max(1e-12);
+    let coords = data.coords();
+    let (mut lo, mut hi) = ([f64::INFINITY; D], [f64::NEG_INFINITY; D]);
+    for pt in coords {
+        for d in 0..D {
+            lo[d] = lo[d].min(pt[d]);
+            hi[d] = hi[d].max(pt[d]);
+        }
+    }
+    let extent = (0..D).map(|d| (hi[d] - lo[d]).powi(2)).sum::<f64>().sqrt();
+    let range0 = (extent / 3.0).max(1e-9);
+
+    let objective = |x: &[f64]| -> f64 {
+        let nugget = x[0] * var0;
+        let psill = x[1] * var0;
+        let range = x[2] * range0;
+        let mut pen = 0.0;
+        if nugget < 0.0 {
+            pen += nugget * nugget;
+        }
+        if psill <= 0.0 {
+            pen += 1.0 + psill * psill;
+        }
+        if range <= 0.0 {
+            pen += 1.0 + range * range;
+        }
+        if pen > 0.0 {
+            return 1e12 * (1.0 + pen);
+        }
+        // A range far beyond the domain is unidentifiable (indistinguishable
+        // from a trend); regularize it back rather than letting it run away.
+        let range_max = 10.0 * extent;
+        let reg = if range > range_max {
+            ((range - range_max) / range_max).powi(2)
+        } else {
+            0.0
+        };
+        let model = VariogramModel {
+            nugget,
+            structures: vec![Structure::new(kind, psill, range)],
+        };
+        match reml_loglik_with_plan(data, &model, &plan, &basis) {
+            Ok(ll) if ll.is_finite() => -ll + 1e6 * reg,
             _ => 1e12,
         }
     };
@@ -438,5 +661,120 @@ mod tests {
         let a = super::loglik_with_plan(&data, &m1, &plan).unwrap();
         let b = super::loglik_with_plan(&data, &m2, &plan).unwrap();
         assert!(a.is_finite() && b.is_finite() && (a - b).abs() > 0.0);
+    }
+
+    /// Exact restricted log-likelihood with a polynomial trend, the oracle for
+    /// the full-conditioning Vecchia REML.
+    fn exact_reml(data: &PointSet, model: &VariogramModel, degree: u8) -> f64 {
+        let n = data.len();
+        let coords = data.coords();
+        let z = data.values();
+        let f = super::poly_basis(coords, degree);
+        let p = f[0].len();
+        // Sigma and its factorization.
+        let mut cov = vec![0.0; n * n];
+        for a in 0..n {
+            for b in 0..n {
+                cov[a * n + b] = model.covariance_dh(sep(&coords[a], &coords[b]));
+            }
+        }
+        let lu_s = crate::linalg::lu_factor(Array2::from_shape_vec((n, n), cov).unwrap()).unwrap();
+        // Sigma^{-1} z and Sigma^{-1} F.
+        let siz = lu_s.solve(z.to_vec());
+        let sif: Vec<Vec<f64>> = (0..p)
+            .map(|c| lu_s.solve((0..n).map(|r| f[r][c]).collect()))
+            .collect();
+        let mut amat = vec![0.0; p * p];
+        let mut cvec = vec![0.0; p];
+        for a in 0..p {
+            cvec[a] = (0..n).map(|r| f[r][a] * siz[r]).sum();
+            for b in 0..p {
+                amat[a * p + b] = (0..n).map(|r| f[r][a] * sif[b][r]).sum();
+            }
+        }
+        let lu_a = crate::linalg::lu_factor(Array2::from_shape_vec((p, p), amat).unwrap()).unwrap();
+        let beta = lu_a.solve(cvec.clone());
+        let ztsiz: f64 = (0..n).map(|r| z[r] * siz[r]).sum();
+        let resid = ztsiz - cvec.iter().zip(&beta).map(|(&c, &b)| c * b).sum::<f64>();
+        -0.5 * ((n - p) as f64 * (2.0 * PI).ln() + lu_s.ln_det_abs() + lu_a.ln_det_abs() + resid)
+    }
+
+    #[test]
+    fn reml_full_conditioning_equals_exact() {
+        let data = field(16, 4);
+        let model =
+            VariogramModel::new(0.05, vec![Structure::new(ModelKind::Exponential, 1.0, 35.0)])
+                .unwrap();
+        let plan = vecchia_plan(data.coords(), data.len() - 1, None).unwrap();
+        let basis = super::poly_basis(data.coords(), 1);
+        let v = super::reml_loglik_with_plan(&data, &model, &plan, &basis).unwrap();
+        let exact = exact_reml(&data, &model, 1);
+        assert!((v - exact).abs() < 1e-7, "vecchia REML {v} vs exact {exact}");
+    }
+
+    /// Lower Cholesky factor of an SPD matrix (row-major), for drawing a GP.
+    fn cholesky(n: usize, a: &[f64]) -> Vec<f64> {
+        let mut l = vec![0.0; n * n];
+        for j in 0..n {
+            let mut d = a[j * n + j];
+            for k in 0..j {
+                d -= l[j * n + k] * l[j * n + k];
+            }
+            l[j * n + j] = d.max(1e-12).sqrt();
+            for i in (j + 1)..n {
+                let mut s = a[i * n + j];
+                for k in 0..j {
+                    s -= l[i * n + k] * l[j * n + k];
+                }
+                l[i * n + j] = s / l[j * n + j];
+            }
+        }
+        l
+    }
+
+    #[test]
+    fn reml_tames_the_range_under_a_trend() {
+        // Draw a genuine short-range Gaussian field (range 10) from its exact
+        // covariance, add a strong linear trend. Constant-mean ML absorbs the
+        // trend as long-range correlation; REML(degree 1) removes it and
+        // recovers a range near the truth, well below the ML range.
+        let mut rng = Rng::new(20);
+        let n = 90;
+        let coords: Vec<[f64; 2]> = (0..n)
+            .map(|_| [rng.uniform() * 60.0, rng.uniform() * 60.0])
+            .collect();
+        let truth =
+            VariogramModel::new(0.05, vec![Structure::new(ModelKind::Exponential, 1.0, 10.0)])
+                .unwrap();
+        let mut cov = vec![0.0; n * n];
+        for a in 0..n {
+            for b in 0..n {
+                cov[a * n + b] = truth.covariance_dh(sep(&coords[a], &coords[b]));
+            }
+        }
+        let l = cholesky(n, &cov);
+        let eps: Vec<f64> = (0..n).map(|_| rng.normal()).collect();
+        let mut values = vec![0.0; n];
+        for i in 0..n {
+            let gp: f64 = (0..=i).map(|k| l[i * n + k] * eps[k]).sum();
+            values[i] = 0.3 * coords[i][0] - 0.2 * coords[i][1] + gp; // trend + GP
+        }
+        let data = PointSet::new(coords, values).unwrap();
+        let ml = vecchia_mle(&data, ModelKind::Exponential, 8, None).unwrap();
+        let reml = vecchia_reml(&data, ModelKind::Exponential, 8, 1, None).unwrap();
+        let ml_r = ml.model.structures[0].range;
+        let reml_r = reml.model.structures[0].range;
+        assert!(
+            reml_r < ml_r,
+            "REML range {reml_r} should be below constant-mean ML range {ml_r}"
+        );
+        assert!(reml_r < 40.0, "REML range {reml_r} should be near the truth (10)");
+    }
+
+    #[test]
+    fn reml_rejects_too_few_points() {
+        let data = field(4, 1);
+        // Degree 2 in 2-D needs 6 basis columns -> >7 points required.
+        assert!(vecchia_reml(&data, ModelKind::Exponential, 3, 2, None).is_err());
     }
 }

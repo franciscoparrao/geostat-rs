@@ -249,6 +249,29 @@ fn vecchia_mle(
     Ok(VariogramModel { inner: fit.model })
 }
 
+/// Fits a single-structure model by Vecchia restricted/trend maximum
+/// likelihood: the mean is a polynomial trend of `drift_degree` (0 = constant,
+/// 1 = linear, 2 = quadratic) estimated by GLS, and the covariance is fit to the
+/// error contrasts. Use when the field has a spatial trend (unlike
+/// `vecchia_mle`, a trend does not inflate the fitted range).
+#[pyfunction]
+#[pyo3(signature = (x, y, values, kind = "exponential", m = 20, drift_degree = 1))]
+fn vecchia_reml(
+    x: Vec<f64>,
+    y: Vec<f64>,
+    values: Vec<f64>,
+    kind: &str,
+    m: usize,
+    drift_degree: u8,
+) -> PyResult<VariogramModel> {
+    let data = point_set(x, y, values)?;
+    let k = *parse_kinds(kind)?
+        .first()
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("no model kind given"))?;
+    let fit = core::vecchia_reml(&data, k, m, drift_degree, None).map_err(err)?;
+    Ok(VariogramModel { inner: fit.model })
+}
+
 /// Vecchia-approximated Gaussian log-likelihood of the data under `model`, with
 /// conditioning size `m` (exact when `m >= n-1`).
 #[pyfunction]
@@ -1069,6 +1092,7 @@ fn geostat_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fit_variogram, m)?)?;
     m.add_function(wrap_pyfunction!(fit_anisotropic, m)?)?;
     m.add_function(wrap_pyfunction!(vecchia_mle, m)?)?;
+    m.add_function(wrap_pyfunction!(vecchia_reml, m)?)?;
     m.add_function(wrap_pyfunction!(vecchia_loglik, m)?)?;
     m.add_function(wrap_pyfunction!(krige, m)?)?;
     m.add_function(wrap_pyfunction!(krige_grid, m)?)?;

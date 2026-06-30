@@ -13,6 +13,7 @@ use geostat_core::{
     experimental_cross_variogram, experimental_variogram, fit_anisotropic, fit_best, fit_lmc,
     indicator_kriging, k_fold, leave_one_out, leave_one_out_with_drift,
     sequential_gaussian_simulation, sequential_indicator_simulation, variogram_map, vecchia_mle,
+    vecchia_reml,
 };
 
 #[derive(Parser)]
@@ -247,6 +248,11 @@ struct VariogramCmd {
     /// Vecchia conditioning size for --mle
     #[arg(long, default_value_t = 20)]
     cond: usize,
+    /// With --mle, fit by restricted/trend ML (REML) with a polynomial mean of
+    /// this degree (0 = constant, 1 = linear, 2 = quadratic) instead of a
+    /// constant plug-in mean. Use when the field has a spatial trend.
+    #[arg(long)]
+    trend: Option<u8>,
     /// Write experimental variogram bins to a CSV file
     #[arg(short, long)]
     output: Option<PathBuf>,
@@ -959,6 +965,9 @@ fn run_variogram(cmd: VariogramCmd) -> Result<()> {
     if cmd.anisotropic && cmd.mle {
         bail!("--mle and --anisotropic cannot be combined yet");
     }
+    if cmd.trend.is_some() && !cmd.mle {
+        bail!("--trend requires --mle (it selects REML/trend maximum likelihood)");
+    }
     if cmd.input.z_col.is_some() {
         if cmd.anisotropic {
             bail!("--anisotropic is 2-D only (drop --z-col)");
@@ -1048,8 +1057,17 @@ fn variogram_report<const D: usize>(data: &PointSet<D>, cmd: &VariogramCmd) -> R
             Some(spec) => parse_kinds(spec)?[0],
             None => ModelKind::Exponential,
         };
-        let fit = vecchia_mle(data, kind, cmd.cond, None)?;
-        println!("\nVecchia ML fit (m = {}): {}", cmd.cond, fit.model);
+        let (fit, label) = match cmd.trend {
+            Some(deg) => (
+                vecchia_reml(data, kind, cmd.cond, deg, None)?,
+                format!("Vecchia REML fit (m = {}, trend degree {deg})", cmd.cond),
+            ),
+            None => (
+                vecchia_mle(data, kind, cmd.cond, None)?,
+                format!("Vecchia ML fit (m = {})", cmd.cond),
+            ),
+        };
+        println!("\n{label}: {}", fit.model);
         println!("Log-likelihood: {:.4}", fit.loglik);
         if let Some(path) = &cmd.model_out {
             io_utils::write_model(path, &fit.model)?;
