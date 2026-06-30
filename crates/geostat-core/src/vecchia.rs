@@ -578,6 +578,92 @@ fn reml_fit_with_basis<const D: usize>(
     })
 }
 
+/// Asymptotic standard errors of a single-structure model's covariance
+/// parameters `(nugget, partial sill, range)`, from the observed Fisher
+/// information of the constant-mean Vecchia log-likelihood at `model`.
+///
+/// The information matrix is the numerical Hessian of the negative
+/// log-likelihood; the standard errors are the square roots of the diagonal of
+/// its inverse. A parameter sitting on a boundary (e.g.\ a zero nugget) or a
+/// non-positive-definite Hessian yields `NaN` for that entry --- the asymptotic
+/// theory does not apply there. This is inference the variogram-WLS path cannot
+/// provide.
+pub fn vecchia_param_se<const D: usize>(
+    data: &PointSet<D>,
+    model: &VariogramModel,
+    m: usize,
+    order: Option<&[usize]>,
+) -> Result<[f64; 3]> {
+    if model.structures.len() != 1 {
+        return Err(GeostatError::InvalidParameter(
+            "standard errors are defined for a single-structure model".into(),
+        ));
+    }
+    let plan = vecchia_plan(data.coords(), m, order)?;
+    let kind = model.structures[0].kind;
+    let theta = [model.nugget, model.structures[0].sill, model.structures[0].range];
+
+    // Negative log-likelihood at a parameter vector (reusing the plan).
+    let nll = |p: &[f64; 3]| -> f64 {
+        if p[1] <= 0.0 || p[2] <= 0.0 || p[0] < 0.0 {
+            return f64::INFINITY;
+        }
+        let model = VariogramModel {
+            nugget: p[0],
+            structures: vec![Structure::new(kind, p[1], p[2])],
+        };
+        match loglik_with_plan(data, &model, &plan) {
+            Ok(ll) if ll.is_finite() => -ll,
+            _ => f64::INFINITY,
+        }
+    };
+
+    // Relative finite-difference steps.
+    let h: [f64; 3] = std::array::from_fn(|i| (theta[i].abs() * 1e-3).max(1e-5));
+    let f0 = nll(&theta);
+    let mut hess = [[0.0; 3]; 3];
+    for i in 0..3 {
+        let mut tp = theta;
+        let mut tm = theta;
+        tp[i] += h[i];
+        tm[i] -= h[i];
+        hess[i][i] = (nll(&tp) - 2.0 * f0 + nll(&tm)) / (h[i] * h[i]);
+        for j in (i + 1)..3 {
+            let mut tpp = theta;
+            let mut tpm = theta;
+            let mut tmp = theta;
+            let mut tmm = theta;
+            tpp[i] += h[i];
+            tpp[j] += h[j];
+            tpm[i] += h[i];
+            tpm[j] -= h[j];
+            tmp[i] -= h[i];
+            tmp[j] += h[j];
+            tmm[i] -= h[i];
+            tmm[j] -= h[j];
+            let v = (nll(&tpp) - nll(&tpm) - nll(&tmp) + nll(&tmm)) / (4.0 * h[i] * h[j]);
+            hess[i][j] = v;
+            hess[j][i] = v;
+        }
+    }
+
+    // Invert the 3x3 information matrix; SE_i = sqrt((H^{-1})_ii).
+    let flat: Vec<f64> = hess.iter().flatten().copied().collect();
+    let arr = Array2::from_shape_vec((3, 3), flat).expect("3x3");
+    let lu = match lu_factor(arr) {
+        Ok(lu) => lu,
+        Err(_) => return Ok([f64::NAN; 3]), // singular information
+    };
+    let mut se = [f64::NAN; 3];
+    for i in 0..3 {
+        let mut e = vec![0.0; 3];
+        e[i] = 1.0;
+        let col = lu.solve(e);
+        se[i] = if col[i] > 0.0 { col[i].sqrt() } else { f64::NAN };
+    }
+    Ok(se)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -873,6 +959,57 @@ mod tests {
         // No covariate columns.
         let empty: Vec<Vec<f64>> = (0..20).map(|_| Vec::new()).collect();
         assert!(vecchia_reml_drift(&data, ModelKind::Exponential, 5, &empty, None).is_err());
+    }
+
+    #[test]
+    fn param_se_are_finite_and_informative() {
+        // Draw a GP from a known model; the fitted parameters' standard errors
+        // should be finite, positive, and smaller than the estimates (i.e. the
+        // parameters are identified).
+        let mut rng = Rng::new(31);
+        let n = 140;
+        let coords: Vec<[f64; 2]> = (0..n)
+            .map(|_| [rng.uniform() * 60.0, rng.uniform() * 60.0])
+            .collect();
+        let truth =
+            VariogramModel::new(0.2, vec![Structure::new(ModelKind::Exponential, 1.0, 12.0)])
+                .unwrap();
+        let mut sig = vec![0.0; n * n];
+        for a in 0..n {
+            for b in 0..n {
+                sig[a * n + b] = truth.covariance_dh(sep(&coords[a], &coords[b]));
+            }
+        }
+        let l = cholesky(n, &sig);
+        let eps: Vec<f64> = (0..n).map(|_| rng.normal()).collect();
+        let values: Vec<f64> = (0..n)
+            .map(|i| (0..=i).map(|k| l[i * n + k] * eps[k]).sum())
+            .collect();
+        let data = PointSet::new(coords, values).unwrap();
+
+        let fit = vecchia_mle(&data, ModelKind::Exponential, 12, None).unwrap();
+        let se = vecchia_param_se(&data, &fit.model, 12, None).unwrap();
+        assert!(se[1].is_finite() && se[1] > 0.0, "sill SE {}", se[1]);
+        assert!(se[2].is_finite() && se[2] > 0.0, "range SE {}", se[2]);
+        assert!(
+            se[2] < fit.model.structures[0].range,
+            "range SE {} should be below the range estimate",
+            se[2]
+        );
+    }
+
+    #[test]
+    fn param_se_rejects_multi_structure() {
+        let data = field(20, 1);
+        let model = VariogramModel::new(
+            0.1,
+            vec![
+                Structure::new(ModelKind::Spherical, 0.5, 10.0),
+                Structure::new(ModelKind::Exponential, 0.5, 30.0),
+            ],
+        )
+        .unwrap();
+        assert!(vecchia_param_se(&data, &model, 5, None).is_err());
     }
 
     #[test]

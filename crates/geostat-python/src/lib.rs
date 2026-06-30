@@ -295,6 +295,24 @@ fn vecchia_reml_drift(
     Ok(VariogramModel { inner: fit.model })
 }
 
+/// Asymptotic standard errors `(se_nugget, se_sill, se_range)` of a
+/// single-structure model's covariance parameters, from the observed Fisher
+/// information of the constant-mean Vecchia log-likelihood. A boundary parameter
+/// (e.g. zero nugget) or a non-positive-definite information yields NaN.
+#[pyfunction]
+#[pyo3(signature = (x, y, values, model, m = 20))]
+fn vecchia_param_se(
+    x: Vec<f64>,
+    y: Vec<f64>,
+    values: Vec<f64>,
+    model: &VariogramModel,
+    m: usize,
+) -> PyResult<(f64, f64, f64)> {
+    let data = point_set(x, y, values)?;
+    let se = core::vecchia_param_se(&data, &model.inner, m, None).map_err(err)?;
+    Ok((se[0], se[1], se[2]))
+}
+
 /// Vecchia-approximated Gaussian log-likelihood of the data under `model`, with
 /// conditioning size `m` (exact when `m >= n-1`).
 #[pyfunction]
@@ -1117,6 +1135,7 @@ fn geostat_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(vecchia_mle, m)?)?;
     m.add_function(wrap_pyfunction!(vecchia_reml, m)?)?;
     m.add_function(wrap_pyfunction!(vecchia_reml_drift, m)?)?;
+    m.add_function(wrap_pyfunction!(vecchia_param_se, m)?)?;
     m.add_function(wrap_pyfunction!(vecchia_loglik, m)?)?;
     m.add_function(wrap_pyfunction!(krige, m)?)?;
     m.add_function(wrap_pyfunction!(krige_grid, m)?)?;
