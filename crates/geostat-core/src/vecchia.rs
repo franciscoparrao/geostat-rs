@@ -450,10 +450,67 @@ pub fn vecchia_reml<const D: usize>(
 ) -> Result<VecchiaFit> {
     let plan = vecchia_plan(data.coords(), m, order)?;
     let basis = poly_basis(data.coords(), drift_degree);
+    reml_fit_with_basis(data, kind, &plan, &basis)
+}
+
+/// Restricted/trend ML with **external covariates**: the mean is
+/// `beta_0 + sum_j beta_j x_j` over the supplied covariate columns
+/// (`drift[i]` holds the covariates at point `i`), fit by GLS while the
+/// covariance is fit to the error contrasts. This is kriging-with-external-drift
+/// estimated by maximum likelihood --- the remedy when a non-stationary mean is
+/// driven by a measured covariate (e.g.\ distance to a feature) rather than a
+/// smooth polynomial.
+pub fn vecchia_reml_drift<const D: usize>(
+    data: &PointSet<D>,
+    kind: ModelKind,
+    m: usize,
+    drift: &[Vec<f64>],
+    order: Option<&[usize]>,
+) -> Result<VecchiaFit> {
+    let n = data.len();
+    if drift.len() != n {
+        return Err(GeostatError::DimensionMismatch(format!(
+            "{} drift rows vs {n} data points",
+            drift.len()
+        )));
+    }
+    let ncov = drift.first().map(Vec::len).unwrap_or(0);
+    if ncov == 0 {
+        return Err(GeostatError::InvalidParameter(
+            "external-drift REML needs at least one covariate column".into(),
+        ));
+    }
+    if drift.iter().any(|r| r.len() != ncov) {
+        return Err(GeostatError::DimensionMismatch(
+            "all drift rows must have the same number of covariates".into(),
+        ));
+    }
+    // Basis = intercept + covariate columns.
+    let basis: Vec<Vec<f64>> = drift
+        .iter()
+        .map(|row| {
+            let mut b = Vec::with_capacity(ncov + 1);
+            b.push(1.0);
+            b.extend_from_slice(row);
+            b
+        })
+        .collect();
+    let plan = vecchia_plan(data.coords(), m, order)?;
+    reml_fit_with_basis(data, kind, &plan, &basis)
+}
+
+/// Shared REML optimizer: fits (nugget, sill, range) for `kind` by maximizing
+/// the Vecchia REML likelihood under an arbitrary trend basis.
+fn reml_fit_with_basis<const D: usize>(
+    data: &PointSet<D>,
+    kind: ModelKind,
+    plan: &VecchiaPlan,
+    basis: &[Vec<f64>],
+) -> Result<VecchiaFit> {
     let p = basis[0].len();
     if data.len() <= p + 1 {
         return Err(GeostatError::InsufficientData(format!(
-            "REML with degree {drift_degree} needs more than {} points",
+            "REML with {p} trend terms needs more than {} points",
             p + 1
         )));
     }
@@ -503,7 +560,7 @@ pub fn vecchia_reml<const D: usize>(
             nugget,
             structures: vec![Structure::new(kind, psill, range)],
         };
-        match reml_loglik_with_plan(data, &model, &plan, &basis) {
+        match reml_loglik_with_plan(data, &model, plan, basis) {
             Ok(ll) if ll.is_finite() => -ll + 1e6 * reg,
             _ => 1e12,
         }
@@ -769,6 +826,53 @@ mod tests {
             "REML range {reml_r} should be below constant-mean ML range {ml_r}"
         );
         assert!(reml_r < 40.0, "REML range {reml_r} should be near the truth (10)");
+    }
+
+    #[test]
+    fn reml_drift_recovers_range_with_a_covariate() {
+        // Mean driven by a NON-polynomial covariate (a Gaussian bump in space)
+        // plus a genuine short-range GP. A polynomial trend cannot absorb the
+        // covariate, but external-drift REML can -- and recovers the range.
+        let mut rng = Rng::new(21);
+        let n = 90;
+        let coords: Vec<[f64; 2]> = (0..n)
+            .map(|_| [rng.uniform() * 60.0, rng.uniform() * 60.0])
+            .collect();
+        // Covariate: distance-to-centre style feature (non-polynomial effect).
+        let cov: Vec<f64> = coords
+            .iter()
+            .map(|p| (-((p[0] - 30.0).powi(2) + (p[1] - 30.0).powi(2)) / 200.0).exp())
+            .collect();
+        let truth =
+            VariogramModel::new(0.05, vec![Structure::new(ModelKind::Exponential, 1.0, 10.0)])
+                .unwrap();
+        let mut sig = vec![0.0; n * n];
+        for a in 0..n {
+            for b in 0..n {
+                sig[a * n + b] = truth.covariance_dh(sep(&coords[a], &coords[b]));
+            }
+        }
+        let l = cholesky(n, &sig);
+        let eps: Vec<f64> = (0..n).map(|_| rng.normal()).collect();
+        let values: Vec<f64> = (0..n)
+            .map(|i| 8.0 * cov[i] + (0..=i).map(|k| l[i * n + k] * eps[k]).sum::<f64>())
+            .collect();
+        let data = PointSet::new(coords, values).unwrap();
+
+        let drift: Vec<Vec<f64>> = cov.iter().map(|&c| vec![c]).collect();
+        let fit = vecchia_reml_drift(&data, ModelKind::Exponential, 8, &drift, None).unwrap();
+        let r = fit.model.structures[0].range;
+        assert!(r < 40.0, "covariate-REML range {r} should be near the truth (10)");
+    }
+
+    #[test]
+    fn reml_drift_rejects_bad_covariates() {
+        let data = field(20, 1);
+        // Wrong number of drift rows.
+        assert!(vecchia_reml_drift(&data, ModelKind::Exponential, 5, &[vec![1.0]], None).is_err());
+        // No covariate columns.
+        let empty: Vec<Vec<f64>> = (0..20).map(|_| Vec::new()).collect();
+        assert!(vecchia_reml_drift(&data, ModelKind::Exponential, 5, &empty, None).is_err());
     }
 
     #[test]

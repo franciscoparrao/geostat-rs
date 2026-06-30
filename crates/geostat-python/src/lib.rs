@@ -272,6 +272,29 @@ fn vecchia_reml(
     Ok(VariogramModel { inner: fit.model })
 }
 
+/// Fits a single-structure model by Vecchia external-drift REML: the mean is
+/// `beta_0 + sum_j beta_j x_j` over the `covariates` columns (a list of rows,
+/// one per point), estimated by GLS while the covariance is fit to the error
+/// contrasts. This is kriging-with-external-drift by maximum likelihood --- use
+/// when a measured covariate (e.g. distance to a feature) drives the trend.
+#[pyfunction]
+#[pyo3(signature = (x, y, values, covariates, kind = "exponential", m = 20))]
+fn vecchia_reml_drift(
+    x: Vec<f64>,
+    y: Vec<f64>,
+    values: Vec<f64>,
+    covariates: Vec<Vec<f64>>,
+    kind: &str,
+    m: usize,
+) -> PyResult<VariogramModel> {
+    let data = point_set(x, y, values)?;
+    let k = *parse_kinds(kind)?
+        .first()
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("no model kind given"))?;
+    let fit = core::vecchia_reml_drift(&data, k, m, &covariates, None).map_err(err)?;
+    Ok(VariogramModel { inner: fit.model })
+}
+
 /// Vecchia-approximated Gaussian log-likelihood of the data under `model`, with
 /// conditioning size `m` (exact when `m >= n-1`).
 #[pyfunction]
@@ -1093,6 +1116,7 @@ fn geostat_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fit_anisotropic, m)?)?;
     m.add_function(wrap_pyfunction!(vecchia_mle, m)?)?;
     m.add_function(wrap_pyfunction!(vecchia_reml, m)?)?;
+    m.add_function(wrap_pyfunction!(vecchia_reml_drift, m)?)?;
     m.add_function(wrap_pyfunction!(vecchia_loglik, m)?)?;
     m.add_function(wrap_pyfunction!(krige, m)?)?;
     m.add_function(wrap_pyfunction!(krige_grid, m)?)?;
