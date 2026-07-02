@@ -63,6 +63,7 @@ fn bench_sgs(c: &mut Criterion) {
         seed: 42,
         max_neighbors: 16,
         search_radius: None,
+        ..Default::default()
     };
     let mut group = c.benchmark_group("sgs");
     group.sample_size(10);

@@ -10,6 +10,7 @@ use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
 use crate::search::KdTree;
 use crate::sis::{indicator_sk, order_corrections};
+use crate::tails::TailModel;
 use crate::variogram::VariogramModel;
 
 /// Configuration for indicator kriging.
@@ -27,6 +28,12 @@ pub struct IkConfig {
     pub tail_min: Option<f64>,
     /// Upper tail bound (default: data maximum).
     pub tail_max: Option<f64>,
+    /// Lower-tail interpolation between `tail_min` and the first cutoff
+    /// (GSLIB `ltail`; `Linear` is the GSLIB and pre-v0.7 default).
+    pub lower_tail: TailModel,
+    /// Upper-tail interpolation between the last cutoff and `tail_max`
+    /// (GSLIB `utail`; hyperbolic tails are capped at `tail_max`).
+    pub upper_tail: TailModel,
 }
 
 /// Local ccdf estimate at one target.
@@ -104,6 +111,7 @@ pub fn indicator_kriging<const D: usize>(
             "tail bounds must bracket the cutoffs".into(),
         ));
     }
+    validate_ccdf_tails(cfg.lower_tail, cfg.upper_tail, cfg.cutoffs[nc - 1])?;
 
     let local = cfg.max_neighbors.is_some() || cfg.search_radius.is_some();
     let tree = local.then(|| KdTree::build(data.coords()));
@@ -136,7 +144,14 @@ pub fn indicator_kriging<const D: usize>(
             }
             order_corrections(&mut ccdf);
         }
-        let (e_type, cond_var) = ccdf_moments(&ccdf, &cfg.cutoffs, tail_min, tail_max);
+        let (e_type, cond_var) = ccdf_moments(
+            &ccdf,
+            &cfg.cutoffs,
+            tail_min,
+            tail_max,
+            cfg.lower_tail,
+            cfg.upper_tail,
+        );
         Ok(CcdfEstimate {
             ccdf,
             e_type,
@@ -145,30 +160,66 @@ pub fn indicator_kriging<const D: usize>(
     })
 }
 
-/// Mean and variance of the ccdf assuming intra-class uniformity, with
-/// linear tails to `[tail_min, tail_max]`.
-fn ccdf_moments(ccdf: &[f64], cutoffs: &[f64], tail_min: f64, tail_max: f64) -> (f64, f64) {
+/// Validates ccdf tail models: `None` is not a distribution here, and a
+/// hyperbolic upper tail needs a positive last cutoff (Pareto support).
+pub(crate) fn validate_ccdf_tails(
+    lower: TailModel,
+    upper: TailModel,
+    last_cutoff: f64,
+) -> Result<()> {
+    lower.validate_lower()?;
+    upper.validate_upper()?;
+    if lower == TailModel::None || upper == TailModel::None {
+        return Err(GeostatError::InvalidParameter(
+            "ccdf tails need an interpolation model (linear, power or hyperbolic)".into(),
+        ));
+    }
+    if matches!(upper, TailModel::Hyperbolic(_)) && !(last_cutoff > 0.0) {
+        return Err(GeostatError::InvalidParameter(
+            "hyperbolic upper tail requires a positive last cutoff".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Mean and variance of the ccdf assuming intra-class uniformity, with the
+/// configured tail models on `[tail_min, c_1]` and `[c_K, tail_max]`.
+pub(crate) fn ccdf_moments(
+    ccdf: &[f64],
+    cutoffs: &[f64],
+    tail_min: f64,
+    tail_max: f64,
+    lower_tail: TailModel,
+    upper_tail: TailModel,
+) -> (f64, f64) {
     let mut mean = 0.0;
     let mut m2 = 0.0;
     let mut f_lo = 0.0;
     let mut z_lo = tail_min;
     let nc = ccdf.len();
     for k in 0..=nc {
-        let (f_hi, z_hi) = if k < nc {
-            (ccdf[k], cutoffs[k])
-        } else {
-            (1.0, tail_max)
-        };
+        let f_hi = if k < nc { ccdf[k] } else { 1.0 };
         let p = (f_hi - f_lo).max(0.0);
         if p > 0.0 {
-            // Uniform within the class [z_lo, z_hi].
-            let mid = 0.5 * (z_lo + z_hi);
-            mean += p * mid;
-            // E[Z^2] of a uniform on [a, b]: (a^2 + ab + b^2) / 3.
-            m2 += p * (z_lo * z_lo + z_lo * z_hi + z_hi * z_hi) / 3.0;
+            let (ez, ez2) = if k == 0 {
+                crate::tails::lower_moments(lower_tail, tail_min, cutoffs[0])
+            } else if k == nc {
+                crate::tails::upper_moments(upper_tail, cutoffs[nc - 1], tail_max)
+            } else {
+                // Uniform within the class [z_lo, z_hi].
+                let z_hi = cutoffs[k];
+                (
+                    0.5 * (z_lo + z_hi),
+                    (z_lo * z_lo + z_lo * z_hi + z_hi * z_hi) / 3.0,
+                )
+            };
+            mean += p * ez;
+            m2 += p * ez2;
         }
         f_lo = f_hi;
-        z_lo = z_hi;
+        if k < nc {
+            z_lo = cutoffs[k];
+        }
     }
     (mean, (m2 - mean * mean).max(0.0))
 }
@@ -211,6 +262,8 @@ mod tests {
             search_radius: None,
             tail_min: None,
             tail_max: None,
+            lower_tail: TailModel::Linear,
+            upper_tail: TailModel::Linear,
         };
         (data, cfg)
     }
@@ -282,6 +335,46 @@ mod tests {
         }
         let corr = cov / (vo.sqrt() * ve.sqrt());
         assert!(corr > 0.85, "E-type vs data correlation {corr}");
+    }
+
+    #[test]
+    fn tail_models_shift_the_ccdf_moments() {
+        let ccdf = [0.3, 0.6, 0.85];
+        let cutoffs = [1.0, 2.0, 3.0];
+        // Power(1) tails reproduce the linear (pre-v0.7) moments exactly.
+        let lin = ccdf_moments(
+            &ccdf,
+            &cutoffs,
+            0.0,
+            5.0,
+            TailModel::Linear,
+            TailModel::Linear,
+        );
+        let pow1 = ccdf_moments(
+            &ccdf,
+            &cutoffs,
+            0.0,
+            5.0,
+            TailModel::Power(1.0),
+            TailModel::Power(1.0),
+        );
+        assert!((lin.0 - pow1.0).abs() < 1e-12 && (lin.1 - pow1.1).abs() < 1e-12);
+        // A hyperbolic upper tail (capped well above) pushes the E-type and
+        // the conditional variance up relative to the linear tail.
+        let hyp = ccdf_moments(
+            &ccdf,
+            &cutoffs,
+            0.0,
+            50.0,
+            TailModel::Linear,
+            TailModel::Hyperbolic(1.5),
+        );
+        assert!(hyp.0 > lin.0, "e-type {} vs {}", hyp.0, lin.0);
+        assert!(hyp.1 > lin.1, "cond var {} vs {}", hyp.1, lin.1);
+        // Tail models must be actual distributions for IK.
+        assert!(validate_ccdf_tails(TailModel::None, TailModel::Linear, 3.0).is_err());
+        assert!(validate_ccdf_tails(TailModel::Linear, TailModel::Hyperbolic(1.5), -1.0).is_err());
+        assert!(validate_ccdf_tails(TailModel::Linear, TailModel::Hyperbolic(1.5), 3.0).is_ok());
     }
 
     #[test]

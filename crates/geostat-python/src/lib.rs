@@ -870,13 +870,26 @@ fn tune_kriging_neighbors(
     Ok(out.into())
 }
 
+/// Parses a GSLIB-style tail spec ("none", "linear", "power:<w>",
+/// "hyper:<w>") into a core TailModel.
+fn parse_tail(spec: &str) -> PyResult<core::TailModel> {
+    spec.parse::<core::TailModel>().map_err(err)
+}
+
 /// Conditional sequential Gaussian simulation. `model_ns` is a model fitted
 /// to the normal scores (fit one with `fit_variogram` on transformed data,
 /// or let the CLI auto-fit). Returns one list per realization, in grid
 /// storage order.
+///
+/// By default realizations are clamped to the data range; `lower_tail` /
+/// `upper_tail` ("linear", "power:<w>", "hyper:<w>", GSLIB ltail/utail)
+/// with `zmin`/`zmax` extrapolate the back-transform beyond the data
+/// extremes — without them the simulated variance and extreme quantiles
+/// are systematically truncated.
 #[pyfunction]
 #[pyo3(signature = (x, y, values, model_ns, bbox, nx, ny, n_realizations = 10,
-    seed = 42, max_neighbors = 16, radius = None))]
+    seed = 42, max_neighbors = 16, radius = None,
+    lower_tail = "none", upper_tail = "none", zmin = None, zmax = None))]
 #[allow(clippy::too_many_arguments)]
 fn sgs(
     x: Vec<f64>,
@@ -890,6 +903,10 @@ fn sgs(
     seed: u64,
     max_neighbors: usize,
     radius: Option<f64>,
+    lower_tail: &str,
+    upper_tail: &str,
+    zmin: Option<f64>,
+    zmax: Option<f64>,
 ) -> PyResult<Vec<Vec<f64>>> {
     let data = point_set(x, y, values)?;
     let grid = Grid2D::from_bbox([bbox.0, bbox.1], [bbox.2, bbox.3], nx, ny).map_err(err)?;
@@ -898,6 +915,12 @@ fn sgs(
         seed,
         max_neighbors,
         search_radius: radius,
+        tails: core::Tails {
+            lower: parse_tail(lower_tail)?,
+            upper: parse_tail(upper_tail)?,
+            lower_bound: zmin,
+            upper_bound: zmax,
+        },
     };
     let res =
         core::sequential_gaussian_simulation(&data, &model_ns.inner, &grid, &cfg).map_err(err)?;
@@ -906,9 +929,13 @@ fn sgs(
 
 /// Conditional sequential indicator simulation. Indicator variogram models
 /// are fitted automatically at each cutoff (spherical/exponential).
+/// `ltail`/`utail` ("linear", "power:<w>", "hyper:<w>") set the GSLIB tail
+/// interpolation between `tail_min`/`tail_max` (default: data extremes) and
+/// the extreme cutoffs; hyperbolic upper tails are capped at `tail_max`.
 #[pyfunction]
 #[pyo3(signature = (x, y, values, cutoffs, bbox, nx, ny, n_realizations = 10,
-    seed = 42, max_neighbors = 16, radius = None, n_lags = 15, max_dist = None))]
+    seed = 42, max_neighbors = 16, radius = None, n_lags = 15, max_dist = None,
+    ltail = "linear", utail = "linear", tail_min = None, tail_max = None))]
 #[allow(clippy::too_many_arguments)]
 fn sis(
     x: Vec<f64>,
@@ -924,6 +951,10 @@ fn sis(
     radius: Option<f64>,
     n_lags: usize,
     max_dist: Option<f64>,
+    ltail: &str,
+    utail: &str,
+    tail_min: Option<f64>,
+    tail_max: Option<f64>,
 ) -> PyResult<Vec<Vec<f64>>> {
     let data = point_set(x, y, values)?;
     let grid = Grid2D::from_bbox([bbox.0, bbox.1], [bbox.2, bbox.3], nx, ny).map_err(err)?;
@@ -937,8 +968,10 @@ fn sis(
         seed,
         max_neighbors,
         search_radius: radius,
-        tail_min: None,
-        tail_max: None,
+        tail_min,
+        tail_max,
+        lower_tail: parse_tail(ltail)?,
+        upper_tail: parse_tail(utail)?,
     };
     let res = core::sequential_indicator_simulation(&data, &grid, &cfg).map_err(err)?;
     Ok(res.realizations)
@@ -1054,9 +1087,12 @@ fn krige_3d(
 /// Indicator kriging at arbitrary target locations. Returns a dict with
 /// `ccdf` (list of per-target ccdf lists), `e_type` and `cond_var`.
 /// Indicator variogram models are fitted automatically per cutoff.
+/// `ltail`/`utail` ("linear", "power:<w>", "hyper:<w>") set the GSLIB tail
+/// interpolation used for the E-type and conditional-variance integrals.
 #[pyfunction]
 #[pyo3(signature = (x, y, values, cutoffs, target_x, target_y,
-    max_neighbors = None, radius = None, n_lags = 15, max_dist = None))]
+    max_neighbors = None, radius = None, n_lags = 15, max_dist = None,
+    ltail = "linear", utail = "linear", tail_min = None, tail_max = None))]
 #[allow(clippy::too_many_arguments)]
 fn indicator_kriging(
     py: Python<'_>,
@@ -1070,6 +1106,10 @@ fn indicator_kriging(
     radius: Option<f64>,
     n_lags: usize,
     max_dist: Option<f64>,
+    ltail: &str,
+    utail: &str,
+    tail_min: Option<f64>,
+    tail_max: Option<f64>,
 ) -> PyResult<Py<PyDict>> {
     if target_x.len() != target_y.len() {
         return Err(PyValueError::new_err(
@@ -1085,8 +1125,10 @@ fn indicator_kriging(
         models,
         max_neighbors,
         search_radius: radius,
-        tail_min: None,
-        tail_max: None,
+        tail_min,
+        tail_max,
+        lower_tail: parse_tail(ltail)?,
+        upper_tail: parse_tail(utail)?,
     };
     let targets: Vec<[f64; 2]> = target_x
         .into_iter()

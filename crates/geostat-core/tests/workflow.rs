@@ -78,6 +78,7 @@ fn full_workflow_on_synthetic_field() {
         seed: 99,
         max_neighbors: 16,
         search_radius: None,
+        ..Default::default()
     };
     let sim = sequential_gaussian_simulation(&data, model, &grid, &sgs_cfg).unwrap();
     assert_eq!(sim.realizations.len(), 5);

@@ -149,6 +149,7 @@ fn sgs_3d_reproducible_and_bounded() {
         seed: 31,
         max_neighbors: 12,
         search_radius: None,
+        ..Default::default()
     };
     let a = sgs_at(&data, &model, &grid.centers(), &cfg).unwrap();
     let b = sgs_at(&data, &model, &grid.centers(), &cfg).unwrap();

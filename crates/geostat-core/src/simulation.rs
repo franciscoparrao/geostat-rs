@@ -20,7 +20,7 @@ use crate::grid::Grid2D;
 use crate::linalg::solve;
 use crate::rng::{Rng, splitmix64};
 use crate::search::BucketGrid;
-use crate::transform::NormalScore;
+use crate::transform::{NormalScore, Tails};
 use crate::variogram::VariogramModel;
 
 /// Configuration for sequential Gaussian simulation.
@@ -34,6 +34,10 @@ pub struct SgsConfig {
     pub max_neighbors: usize,
     /// Optional search radius for conditioning points.
     pub search_radius: Option<f64>,
+    /// GSLIB-style tail extrapolation for the back-transform. The default
+    /// clamps realizations to the data range; set tail models and bounds to
+    /// let extremes exceed the observed extremes.
+    pub tails: Tails,
 }
 
 impl Default for SgsConfig {
@@ -43,6 +47,7 @@ impl Default for SgsConfig {
             seed: 42,
             max_neighbors: 16,
             search_radius: None,
+            tails: Tails::default(),
         }
     }
 }
@@ -115,7 +120,7 @@ pub fn sgs_at<const D: usize>(
             "no simulation nodes given".into(),
         ));
     }
-    let ns = NormalScore::fit(data.values())?;
+    let ns = NormalScore::fit_with_tails(data.values(), cfg.tails)?;
     let data_scores: Vec<f64> = data.values().iter().map(|&v| ns.transform(v)).collect();
 
     crate::parallel::par_try_map(cfg.n_realizations, |r| {
@@ -269,6 +274,43 @@ mod tests {
         let cfg2 = SgsConfig { seed: 124, ..cfg };
         let c = sequential_gaussian_simulation(&data, &model, &grid, &cfg2).unwrap();
         assert_ne!(a.realizations[0], c.realizations[0]);
+    }
+
+    #[test]
+    fn tails_let_realizations_exceed_the_data_range() {
+        let (data, model, grid) = setup();
+        let (lo, hi) = data
+            .values()
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), &v| {
+                (l.min(v), h.max(v))
+            });
+        let cfg = SgsConfig {
+            n_realizations: 20,
+            seed: 7,
+            max_neighbors: 12,
+            search_radius: None,
+            tails: crate::transform::Tails {
+                lower: crate::tails::TailModel::Linear,
+                upper: crate::tails::TailModel::Linear,
+                lower_bound: Some(lo - 2.0),
+                upper_bound: Some(hi + 2.0),
+            },
+        };
+        let res = sequential_gaussian_simulation(&data, &model, &grid, &cfg).unwrap();
+        let mut exceeds = false;
+        for r in &res.realizations {
+            for &v in r {
+                assert!(v >= lo - 2.0 - 1e-9 && v <= hi + 2.0 + 1e-9);
+                if v > hi || v < lo {
+                    exceeds = true;
+                }
+            }
+        }
+        assert!(
+            exceeds,
+            "with tails enabled some values should leave the data range"
+        );
     }
 
     #[test]

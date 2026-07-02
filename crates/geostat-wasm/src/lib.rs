@@ -128,6 +128,7 @@ pub fn sgs_grid(
         seed,
         max_neighbors: max_neighbors.max(1),
         search_radius: None,
+        ..Default::default()
     };
     let res = sequential_gaussian_simulation(&data, &model, &grid, &cfg).map_err(err)?;
     Ok(res.realizations.into_iter().flatten().collect())

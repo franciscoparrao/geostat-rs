@@ -1,6 +1,42 @@
 //! Normal score transform and inverse normal CDF.
 
 use crate::error::{GeostatError, Result};
+use crate::tails::{self, TailModel};
+
+/// Standard normal CDF (Abramowitz & Stegun 26.2.19, the same approximation
+/// as GSLIB's `gcum`; absolute error < 7.5e-8).
+pub fn norm_cdf(z: f64) -> f64 {
+    const B: [f64; 5] = [
+        0.319_381_530,
+        -0.356_563_782,
+        1.781_477_937,
+        -1.821_255_978,
+        1.330_274_429,
+    ];
+    const P: f64 = 0.231_641_9;
+    let x = z.abs();
+    let t = 1.0 / (1.0 + P * x);
+    let pdf = (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt();
+    let poly = t * (B[0] + t * (B[1] + t * (B[2] + t * (B[3] + t * B[4]))));
+    let upper = 1.0 - pdf * poly;
+    if z >= 0.0 { upper } else { 1.0 - upper }
+}
+
+/// Tail options for the normal-score back-transform (GSLIB `ltail`/`utail`
+/// with `zmin`/`zmax`). The default extrapolates nothing (clamps at the data
+/// extremes, the pre-v0.7 behavior).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Tails {
+    /// Lower-tail model (`Hyperbolic` is invalid here).
+    pub lower: TailModel,
+    /// Upper-tail model.
+    pub upper: TailModel,
+    /// Lower bound `zmin` (required unless `lower` is `None`).
+    pub lower_bound: Option<f64>,
+    /// Upper bound `zmax` (required unless `upper` is `None`; caps the
+    /// hyperbolic tail).
+    pub upper_bound: Option<f64>,
+}
 
 /// Inverse standard normal CDF (Acklam's rational approximation,
 /// absolute error < 1.15e-9). Input is clamped to the open unit interval.
@@ -59,17 +95,27 @@ pub fn inv_norm_cdf(p: f64) -> f64 {
 /// Rank-based normal score transform with linear interpolation between
 /// quantile knots. Ties are assigned the mean score of their rank group.
 ///
-/// Back-transformed values are clamped to the observed data range
-/// (no tail extrapolation in this MVP).
+/// By default back-transformed values are clamped to the observed data
+/// range; [`NormalScore::fit_with_tails`] enables GSLIB-style tail
+/// extrapolation beyond the extremes.
 #[derive(Debug, Clone)]
 pub struct NormalScore {
     knots_v: Vec<f64>,
     knots_s: Vec<f64>,
+    tails: Tails,
 }
 
 impl NormalScore {
     /// Fits the transform to a sample. Requires at least two distinct values.
+    /// Back-transformed values are clamped to the data range (no tails).
     pub fn fit(values: &[f64]) -> Result<Self> {
+        Self::fit_with_tails(values, Tails::default())
+    }
+
+    /// Fits the transform with GSLIB-style tail extrapolation for the
+    /// back-transform. `tails.lower_bound`/`upper_bound` must bracket the
+    /// data range when the corresponding tail model is not `None`.
+    pub fn fit_with_tails(values: &[f64], tails: Tails) -> Result<Self> {
         if values.len() < 2 {
             return Err(GeostatError::InsufficientData(
                 "normal score transform requires at least 2 values".into(),
@@ -105,7 +151,41 @@ impl NormalScore {
                 "all values are identical; cannot build a normal score transform".into(),
             ));
         }
-        Ok(Self { knots_v, knots_s })
+
+        tails.lower.validate_lower()?;
+        tails.upper.validate_upper()?;
+        if tails.lower != TailModel::None {
+            let zmin = tails.lower_bound.ok_or_else(|| {
+                GeostatError::InvalidParameter("lower tail requires a lower bound (zmin)".into())
+            })?;
+            if !(zmin <= knots_v[0]) {
+                return Err(GeostatError::InvalidParameter(format!(
+                    "zmin ({zmin}) must not exceed the data minimum ({})",
+                    knots_v[0]
+                )));
+            }
+        }
+        if tails.upper != TailModel::None {
+            let zmax = tails.upper_bound.ok_or_else(|| {
+                GeostatError::InvalidParameter("upper tail requires an upper bound (zmax)".into())
+            })?;
+            let vmax = *knots_v.last().expect("at least two knots");
+            if !(zmax >= vmax) {
+                return Err(GeostatError::InvalidParameter(format!(
+                    "zmax ({zmax}) must not be below the data maximum ({vmax})"
+                )));
+            }
+            if matches!(tails.upper, TailModel::Hyperbolic(_)) && !(vmax > 0.0) {
+                return Err(GeostatError::InvalidParameter(
+                    "hyperbolic upper tail requires a positive data maximum".into(),
+                ));
+            }
+        }
+        Ok(Self {
+            knots_v,
+            knots_s,
+            tails,
+        })
     }
 
     /// Maps a data value to its normal score.
@@ -113,8 +193,30 @@ impl NormalScore {
         interp(&self.knots_v, &self.knots_s, v)
     }
 
-    /// Maps a normal score back to data units (clamped to the data range).
+    /// Maps a normal score back to data units. Scores beyond the table are
+    /// extrapolated with the configured tail models (clamped to the data
+    /// range by default).
     pub fn back_transform(&self, s: f64) -> f64 {
+        let last = self.knots_s.len() - 1;
+        if s < self.knots_s[0] && self.tails.lower != TailModel::None {
+            // Relative cdf position within the lower-tail class [0, F1].
+            let f1 = norm_cdf(self.knots_s[0]);
+            let t = if f1 > 0.0 { norm_cdf(s) / f1 } else { 0.0 };
+            let zmin = self.tails.lower_bound.expect("validated at fit");
+            return tails::draw_lower(self.tails.lower, zmin, self.knots_v[0], t);
+        }
+        if s > self.knots_s[last] && self.tails.upper != TailModel::None {
+            // Relative cdf position within the upper-tail class [Fk, 1].
+            let fk = norm_cdf(self.knots_s[last]);
+            let span = 1.0 - fk;
+            let t = if span > 0.0 {
+                (norm_cdf(s) - fk) / span
+            } else {
+                1.0
+            };
+            let zmax = self.tails.upper_bound.expect("validated at fit");
+            return tails::draw_upper(self.tails.upper, self.knots_v[last], zmax, t);
+        }
         interp(&self.knots_s, &self.knots_v, s)
     }
 }
@@ -165,6 +267,92 @@ mod tests {
         assert!(ns.transform(50.0).abs() < 1e-9);
         // Monotone.
         assert!(ns.transform(10.0) < ns.transform(90.0));
+    }
+
+    #[test]
+    fn norm_cdf_matches_inverse() {
+        assert!((norm_cdf(0.0) - 0.5).abs() < 1e-9);
+        assert!((norm_cdf(1.959_964) - 0.975).abs() < 1e-7);
+        assert!((norm_cdf(-1.959_964) - 0.025).abs() < 1e-7);
+        for p in [0.01, 0.2, 0.5, 0.8, 0.99] {
+            assert!((norm_cdf(inv_norm_cdf(p)) - p).abs() < 1e-6, "p = {p}");
+        }
+    }
+
+    #[test]
+    fn tail_extrapolation_extends_beyond_data_range() {
+        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let tails = Tails {
+            lower: TailModel::Linear,
+            upper: TailModel::Power(2.0),
+            lower_bound: Some(0.0),
+            upper_bound: Some(20.0),
+        };
+        let ns = NormalScore::fit_with_tails(&values, tails).unwrap();
+        // Beyond the last knot the back-transform now exceeds the data max
+        // (the clamped default would return 8.0) but respects zmax.
+        let hi = ns.back_transform(3.5);
+        assert!(hi > 8.0 && hi <= 20.0, "upper tail value {hi}");
+        let lo = ns.back_transform(-3.5);
+        assert!((0.0..1.0).contains(&lo), "lower tail value {lo}");
+        // Monotone through the tail regions.
+        assert!(ns.back_transform(-4.0) <= ns.back_transform(-3.0));
+        assert!(ns.back_transform(3.0) <= ns.back_transform(4.0));
+        // Continuous at the table edge (power tails have a vertical tangent
+        // there, so approach is sqrt-slow in the score offset).
+        let s_last = ns.transform(8.0);
+        assert!((ns.back_transform(s_last + 1e-9) - 8.0).abs() < 1e-2);
+        assert!((ns.back_transform(s_last + 1e-13) - 8.0).abs() < 1e-4);
+        // Interior behavior unchanged.
+        for &v in &values {
+            assert!((ns.back_transform(ns.transform(v)) - v).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn hyperbolic_upper_tail_caps_at_zmax() {
+        let values = vec![1.0, 2.0, 3.0, 5.0, 9.0];
+        let tails = Tails {
+            lower: TailModel::None,
+            upper: TailModel::Hyperbolic(1.5),
+            lower_bound: None,
+            upper_bound: Some(100.0),
+        };
+        let ns = NormalScore::fit_with_tails(&values, tails).unwrap();
+        let z = ns.back_transform(5.0);
+        assert!(z > 9.0 && z <= 100.0, "hyperbolic tail value {z}");
+    }
+
+    #[test]
+    fn tail_validation_rejects_bad_configs() {
+        let values = vec![1.0, 2.0, 3.0];
+        // Missing bounds.
+        let t = Tails {
+            lower: TailModel::Linear,
+            ..Default::default()
+        };
+        assert!(NormalScore::fit_with_tails(&values, t).is_err());
+        // Bound inside the data range.
+        let t = Tails {
+            upper: TailModel::Linear,
+            upper_bound: Some(2.5),
+            ..Default::default()
+        };
+        assert!(NormalScore::fit_with_tails(&values, t).is_err());
+        // Hyperbolic lower tail.
+        let t = Tails {
+            lower: TailModel::Hyperbolic(1.5),
+            lower_bound: Some(0.0),
+            ..Default::default()
+        };
+        assert!(NormalScore::fit_with_tails(&values, t).is_err());
+        // Hyperbolic with non-positive data maximum.
+        let t = Tails {
+            upper: TailModel::Hyperbolic(1.5),
+            upper_bound: Some(1.0),
+            ..Default::default()
+        };
+        assert!(NormalScore::fit_with_tails(&[-3.0, -2.0, -1.0], t).is_err());
     }
 
     #[test]

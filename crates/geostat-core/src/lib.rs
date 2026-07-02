@@ -58,6 +58,7 @@ pub mod rng;
 mod search;
 pub mod simulation;
 pub mod sis;
+pub mod tails;
 pub mod trans;
 pub mod transform;
 pub mod tuning;
@@ -78,8 +79,9 @@ pub use simulation::{
     SgsConfig, SgsResult, sequential_gaussian_simulation, sequential_gaussian_simulation_3d, sgs_at,
 };
 pub use sis::{SisConfig, sequential_indicator_simulation, sis_at};
+pub use tails::TailModel;
 pub use trans::{LognormalEstimate, lognormal_kriging};
-pub use transform::NormalScore;
+pub use transform::{NormalScore, Tails, norm_cdf};
 pub use tuning::{TuneResult, tune_idw_power, tune_knn_k, tune_kriging_neighbors};
 pub use validation::{CvResult, k_fold, leave_one_out, leave_one_out_with_drift};
 pub use variogram::{

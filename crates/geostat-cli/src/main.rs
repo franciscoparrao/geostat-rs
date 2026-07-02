@@ -9,9 +9,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use geostat_core::{
     CoKriging, CoKrigingConfig, DirectionConfig, Grid2D, IkConfig, Kriging, KrigingConfig,
-    KrigingMethod, ModelKind, PointSet, SgsConfig, SisConfig, VariogramConfig, VariogramModel,
-    detrend_external, detrend_polynomial, experimental_variogram, fit_anisotropic, fit_best,
-    fit_indicator_models, fit_lmc_collocated, indicator_kriging, k_fold, leave_one_out,
+    KrigingMethod, ModelKind, PointSet, SgsConfig, SisConfig, Tails, VariogramConfig,
+    VariogramModel, detrend_external, detrend_polynomial, experimental_variogram, fit_anisotropic,
+    fit_best, fit_indicator_models, fit_lmc_collocated, indicator_kriging, k_fold, leave_one_out,
     leave_one_out_with_drift, sequential_gaussian_simulation, sequential_indicator_simulation,
     variogram_map, vecchia_mle, vecchia_reml,
 };
@@ -402,6 +402,20 @@ struct SgsCmd {
     /// Search radius for conditioning points
     #[arg(long)]
     radius: Option<f64>,
+    /// Lower-tail extrapolation of the back-transform: none, linear or
+    /// power:<w> (GSLIB ltail; requires --zmin)
+    #[arg(long, default_value = "none")]
+    ltail: String,
+    /// Upper-tail extrapolation: none, linear, power:<w> or hyper:<w>
+    /// (GSLIB utail; requires --zmax)
+    #[arg(long, default_value = "none")]
+    utail: String,
+    /// Minimum attainable value for the lower tail (GSLIB zmin)
+    #[arg(long)]
+    zmin: Option<f64>,
+    /// Maximum attainable value for the upper tail (GSLIB zmax)
+    #[arg(long)]
+    zmax: Option<f64>,
     /// Output CSV file (x,y,sim1..simN)
     #[arg(short, long)]
     output: PathBuf,
@@ -442,6 +456,13 @@ struct SisCmd {
     /// Upper tail bound (default: data maximum)
     #[arg(long)]
     tail_max: Option<f64>,
+    /// Lower-tail interpolation: linear or power:<w> (GSLIB ltail)
+    #[arg(long, default_value = "linear")]
+    ltail: String,
+    /// Upper-tail interpolation: linear, power:<w> or hyper:<w> (GSLIB
+    /// utail; hyperbolic is capped at --tail-max)
+    #[arg(long, default_value = "linear")]
+    utail: String,
     /// Output CSV file (x,y,sim1..simN)
     #[arg(short, long)]
     output: PathBuf,
@@ -476,6 +497,13 @@ struct IkCmd {
     /// Upper tail bound (default: data maximum)
     #[arg(long)]
     tail_max: Option<f64>,
+    /// Lower-tail interpolation: linear or power:<w> (GSLIB ltail)
+    #[arg(long, default_value = "linear")]
+    ltail: String,
+    /// Upper-tail interpolation: linear, power:<w> or hyper:<w> (GSLIB
+    /// utail; hyperbolic is capped at --tail-max)
+    #[arg(long, default_value = "linear")]
+    utail: String,
     /// Output CSV file (x,y,F1..FK,e_type,cond_var)
     #[arg(short, long)]
     output: PathBuf,
@@ -1505,6 +1533,12 @@ fn run_sgs(cmd: SgsCmd) -> Result<()> {
         seed: cmd.seed,
         max_neighbors: cmd.max_neighbors,
         search_radius: cmd.radius,
+        tails: Tails {
+            lower: cmd.ltail.parse()?,
+            upper: cmd.utail.parse()?,
+            lower_bound: cmd.zmin,
+            upper_bound: cmd.zmax,
+        },
     };
     let res = sequential_gaussian_simulation(&data, &model_ns, &grid, &cfg)?;
 
@@ -1574,6 +1608,8 @@ fn run_sis(cmd: SisCmd) -> Result<()> {
         search_radius: cmd.radius,
         tail_min: cmd.tail_min,
         tail_max: cmd.tail_max,
+        lower_tail: cmd.ltail.parse()?,
+        upper_tail: cmd.utail.parse()?,
     };
     let res = sequential_indicator_simulation(&data, &grid, &cfg)?;
 
@@ -1655,6 +1691,8 @@ fn run_ik(cmd: IkCmd) -> Result<()> {
         search_radius: cmd.neighbors.radius,
         tail_min: cmd.tail_min,
         tail_max: cmd.tail_max,
+        lower_tail: cmd.ltail.parse()?,
+        upper_tail: cmd.utail.parse()?,
     };
     let centers = grid.centers();
     let ests = indicator_kriging(&data, &centers, &cfg)?;

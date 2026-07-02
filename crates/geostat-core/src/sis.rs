@@ -16,6 +16,7 @@ use crate::linalg::solve;
 use crate::rng::{Rng, splitmix64};
 use crate::search::BucketGrid;
 use crate::simulation::SgsResult;
+use crate::tails::{self, TailModel};
 use crate::variogram::VariogramModel;
 
 /// Configuration for sequential indicator simulation.
@@ -37,6 +38,12 @@ pub struct SisConfig {
     pub tail_min: Option<f64>,
     /// Upper tail bound (default: data maximum).
     pub tail_max: Option<f64>,
+    /// Lower-tail interpolation between `tail_min` and the first cutoff
+    /// (GSLIB `ltail`; `Linear` is the GSLIB and pre-v0.7 default).
+    pub lower_tail: TailModel,
+    /// Upper-tail interpolation between the last cutoff and `tail_max`
+    /// (GSLIB `utail`; hyperbolic tails are capped at `tail_max`).
+    pub upper_tail: TailModel,
 }
 
 impl Default for SisConfig {
@@ -50,6 +57,8 @@ impl Default for SisConfig {
             search_radius: None,
             tail_min: None,
             tail_max: None,
+            lower_tail: TailModel::Linear,
+            upper_tail: TailModel::Linear,
         }
     }
 }
@@ -131,6 +140,7 @@ pub fn sis_at<const D: usize>(
             "tail bounds must bracket the cutoffs".into(),
         ));
     }
+    crate::ik::validate_ccdf_tails(cfg.lower_tail, cfg.upper_tail, cfg.cutoffs[nc - 1])?;
 
     if nodes.is_empty() {
         return Err(GeostatError::InvalidParameter(
@@ -201,7 +211,15 @@ fn simulate_one<const D: usize>(
             order_corrections(&mut ccdf);
         }
 
-        let z = sample_ccdf(&ccdf, &cfg.cutoffs, tail_min, tail_max, rng.uniform());
+        let z = sample_ccdf(
+            &ccdf,
+            &cfg.cutoffs,
+            tail_min,
+            tail_max,
+            cfg.lower_tail,
+            cfg.upper_tail,
+            rng.uniform(),
+        );
         sim[cell] = z;
         search.insert(target);
         cond_coords.push(target);
@@ -272,8 +290,17 @@ pub(crate) fn order_corrections(ccdf: &mut [f64]) {
 }
 
 /// Draws a value from the corrected ccdf with intra-class linear
-/// interpolation and linear tails.
-fn sample_ccdf(ccdf: &[f64], cutoffs: &[f64], tail_min: f64, tail_max: f64, u: f64) -> f64 {
+/// interpolation and the configured tail models.
+#[allow(clippy::too_many_arguments)]
+fn sample_ccdf(
+    ccdf: &[f64],
+    cutoffs: &[f64],
+    tail_min: f64,
+    tail_max: f64,
+    lower_tail: TailModel,
+    upper_tail: TailModel,
+    u: f64,
+) -> f64 {
     let nc = ccdf.len();
     let mut f_lo = 0.0;
     let mut z_lo = tail_min;
@@ -281,6 +308,9 @@ fn sample_ccdf(ccdf: &[f64], cutoffs: &[f64], tail_min: f64, tail_max: f64, u: f
         if u <= ccdf[k] {
             let span = ccdf[k] - f_lo;
             let t = if span > 1e-12 { (u - f_lo) / span } else { 0.5 };
+            if k == 0 {
+                return tails::draw_lower(lower_tail, tail_min, cutoffs[0], t);
+            }
             return z_lo + t * (cutoffs[k] - z_lo);
         }
         f_lo = ccdf[k];
@@ -289,7 +319,7 @@ fn sample_ccdf(ccdf: &[f64], cutoffs: &[f64], tail_min: f64, tail_max: f64, u: f
     // Upper tail.
     let span = 1.0 - f_lo;
     let t = if span > 1e-12 { (u - f_lo) / span } else { 0.5 };
-    z_lo + t * (tail_max - z_lo)
+    tails::draw_upper(upper_tail, z_lo, tail_max, t)
 }
 
 #[cfg(test)]
