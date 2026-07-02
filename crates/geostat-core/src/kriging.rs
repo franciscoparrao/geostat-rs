@@ -118,6 +118,9 @@ pub struct Kriging<'a, const D: usize = 2> {
     drift_data: Vec<Vec<f64>>,
     drift_mean: Vec<f64>,
     drift_scale: Vec<f64>,
+    // Per-datum measurement-error variance added to the data-data diagonal
+    // (empty = error-free data). See `with_measurement_error`.
+    measurement_error: Vec<f64>,
     // For a global neighbourhood the kriging-system matrix is the same for
     // every target, so it is factored once here and only back-substituted per
     // target. `None` for moving neighbourhoods (a different matrix per target)
@@ -137,7 +140,39 @@ impl<'a, const D: usize> Kriging<'a, D> {
                 "external drift kriging requires Kriging::with_external_drift".into(),
             ));
         }
-        Self::build(data, model, config, Vec::new())
+        Self::build(data, model, config, Vec::new(), Vec::new())
+    }
+
+    /// Builds a predictor for data observed with measurement error
+    /// (gstat's `Err` component): `errors[i]` is the error *variance* of
+    /// datum `i`, added to the data-data diagonal only. Kriging then
+    /// predicts the underlying signal — it is no longer an exact
+    /// interpolator where the error is positive, and the observations are
+    /// smoothed instead of honored.
+    pub fn with_measurement_error(
+        data: &'a PointSet<D>,
+        model: &'a VariogramModel,
+        config: KrigingConfig,
+        errors: Vec<f64>,
+    ) -> Result<Self> {
+        if matches!(config.method, KrigingMethod::ExternalDrift { .. }) {
+            return Err(GeostatError::InvalidParameter(
+                "measurement error with external drift is not supported yet".into(),
+            ));
+        }
+        if errors.len() != data.len() {
+            return Err(GeostatError::DimensionMismatch(format!(
+                "{} error variances vs {} data points",
+                errors.len(),
+                data.len()
+            )));
+        }
+        if errors.iter().any(|e| !(e.is_finite() && *e >= 0.0)) {
+            return Err(GeostatError::InvalidParameter(
+                "measurement-error variances must be finite and non-negative".into(),
+            ));
+        }
+        Self::build(data, model, config, Vec::new(), errors)
     }
 
     /// Builds an external-drift kriging predictor. `drift_data[i]` holds the
@@ -179,7 +214,7 @@ impl<'a, const D: usize> Kriging<'a, D> {
                 )));
             }
         }
-        Self::build(data, model, config, drift_data)
+        Self::build(data, model, config, drift_data, Vec::new())
     }
 
     fn build(
@@ -187,6 +222,7 @@ impl<'a, const D: usize> Kriging<'a, D> {
         model: &'a VariogramModel,
         config: KrigingConfig,
         drift_data: Vec<Vec<f64>>,
+        measurement_error: Vec<f64>,
     ) -> Result<Self> {
         if let KrigingMethod::Universal { degree } = config.method
             && !(1..=2).contains(&degree)
@@ -277,6 +313,7 @@ impl<'a, const D: usize> Kriging<'a, D> {
             drift_data,
             drift_mean,
             drift_scale,
+            measurement_error,
             global_lu: None,
         };
         // Global neighbourhood: factor the (target-independent) system once.
@@ -409,7 +446,7 @@ impl<'a, const D: usize> Kriging<'a, D> {
         let mut f = vec![0.0; m];
         for (ii, &i) in nb.iter().enumerate() {
             let pi = self.data.coord(i);
-            a[[ii, ii]] = c0;
+            a[[ii, ii]] = c0 + self.measurement_error.get(i).copied().unwrap_or(0.0);
             for (jj, &j) in nb.iter().enumerate().skip(ii + 1) {
                 let pj = self.data.coord(j);
                 let c = self.model.covariance_dh(sep(pi, pj));
@@ -550,7 +587,7 @@ impl<'a, const D: usize> Kriging<'a, D> {
         let mut b = vec![0.0; dim];
         for (ii, &i) in nb.iter().enumerate() {
             let pi = self.data.coord(i);
-            a[[ii, ii]] = c0;
+            a[[ii, ii]] = c0 + self.measurement_error.get(i).copied().unwrap_or(0.0);
             for (jj, &j) in nb.iter().enumerate().skip(ii + 1) {
                 let pj = self.data.coord(j);
                 let c = self.model.covariance_dh(sep(pi, pj));
@@ -692,6 +729,61 @@ mod tests {
 
     fn model() -> VariogramModel {
         VariogramModel::new(0.05, vec![Structure::new(ModelKind::Spherical, 0.95, 2.0)]).unwrap()
+    }
+
+    #[test]
+    fn measurement_error_smooths_instead_of_honoring() {
+        let data = sample_data();
+        let m = model();
+        let exact = Kriging::new(&data, &m, KrigingConfig::default()).unwrap();
+        let noisy = Kriging::with_measurement_error(
+            &data,
+            &m,
+            KrigingConfig::default(),
+            vec![0.5; data.len()],
+        )
+        .unwrap();
+        for i in 0..data.len() {
+            let e = exact.predict(data.coord(i)).unwrap();
+            let n = noisy.predict(data.coord(i)).unwrap();
+            // Exact kriging honors the datum; with error the estimate is
+            // smoothed toward the neighbors and the variance is positive.
+            assert!((e.value - data.value(i)).abs() < 1e-8);
+            assert!(
+                (n.value - data.value(i)).abs() > 1e-3,
+                "datum {i} still honored: {} vs {}",
+                n.value,
+                data.value(i)
+            );
+            assert!(n.variance > 1e-3, "variance {}", n.variance);
+        }
+        // Zero error variances reproduce the exact predictor.
+        let zero = Kriging::with_measurement_error(
+            &data,
+            &m,
+            KrigingConfig::default(),
+            vec![0.0; data.len()],
+        )
+        .unwrap();
+        let t = [0.3, 0.7];
+        let a = exact.predict(t).unwrap();
+        let b = zero.predict(t).unwrap();
+        assert!((a.value - b.value).abs() < 1e-14);
+        assert!((a.variance - b.variance).abs() < 1e-14);
+        // Validation.
+        assert!(
+            Kriging::with_measurement_error(&data, &m, KrigingConfig::default(), vec![0.1; 2])
+                .is_err()
+        );
+        assert!(
+            Kriging::with_measurement_error(
+                &data,
+                &m,
+                KrigingConfig::default(),
+                vec![-0.1; data.len()]
+            )
+            .is_err()
+        );
     }
 
     #[test]

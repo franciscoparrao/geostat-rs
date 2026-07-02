@@ -5,6 +5,9 @@ gstat computes formula-based variograms on OLS residuals; this compares
   1. log(zinc) ~ sqrt(dist)  (external-drift residuals, --detrend-cols sdist)
   2. log(zinc) ~ x + y       (coordinate-trend residuals, --detrend 1)
 
+Also compares ordinary kriging with a constant measurement-error variance
+(gstat's `Err` component vs `krige --error`).
+
 Run after `Rscript validation/v07_gstat.R` and:
   BIN=target/release/geostat
   $BIN variogram -i validation/out/meuse_multi.csv --value-col lzinc \
@@ -13,6 +16,10 @@ Run after `Rscript validation/v07_gstat.R` and:
   $BIN variogram -i validation/out/meuse_multi.csv --value-col lzinc \
       --detrend 1 --n-lags 15 --max-dist 1500 \
       -o validation/out/rust_resid_poly_vario.csv
+  $BIN krige -i validation/out/meuse_lzinc.csv --value-col lzinc \
+      -m validation/out/gstat_model.json --error 0.05 \
+      --bbox 178440,329600,181560,333760 --nx 78 --ny 104 \
+      -o validation/out/rust_err_krige.csv
 
 Exits non-zero if any tolerance is violated.
 """
@@ -53,6 +60,23 @@ def compare(tag, gstat_name, rust_name):
     check("gamma, max rel diff", dg, 1e-10)
 
 
+def compare_err_kriging():
+    print("3. Ordinary kriging with measurement error (gstat Err = 0.05)")
+    rust = {
+        (round(float(r["x"]), 3), round(float(r["y"]), 3)): r
+        for r in read_csv("rust_err_krige.csv")
+    }
+    pred_diff = var_diff = 0.0
+    for g in read_csv("gstat_err_krige.csv"):
+        key = (round(float(g["x"]), 3), round(float(g["y"]), 3))
+        r = rust.get(key)
+        assert r is not None, f"grid cell {key} missing in rust output"
+        pred_diff = max(pred_diff, abs(float(g["pred"]) - float(r["prediction"])))
+        var_diff = max(var_diff, abs(float(g["var"]) - float(r["variance"])))
+    check("predictions, max abs diff", pred_diff, 1e-6)
+    check("kriging variances, max abs diff", var_diff, 1e-6)
+
+
 def main():
     compare(
         "1. Residual variogram, external drift lzinc ~ sdist",
@@ -64,6 +88,7 @@ def main():
         "gstat_resid_poly_vario.csv",
         "rust_resid_poly_vario.csv",
     )
+    compare_err_kriging()
     if FAILURES:
         print(f"\nPARITY FAILED: {len(FAILURES)} check(s)")
         sys.exit(1)

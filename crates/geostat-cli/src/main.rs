@@ -304,6 +304,14 @@ struct KrigeCmd {
     /// predictions are back-transformed to original units
     #[arg(long)]
     lognormal: bool,
+    /// Constant measurement-error variance added to the data-data diagonal
+    /// (gstat Err): kriging predicts the signal and no longer honors the
+    /// observations exactly
+    #[arg(long)]
+    error: Option<f64>,
+    /// Column with a per-datum measurement-error variance (overrides --error)
+    #[arg(long)]
+    error_col: Option<String>,
     #[command(flatten)]
     grid: GridOpts,
     #[command(flatten)]
@@ -1221,6 +1229,10 @@ fn variogram_report<const D: usize>(data: &PointSet<D>, cmd: &VariogramCmd) -> R
 
 fn run_krige(cmd: KrigeCmd) -> Result<()> {
     let model = io_utils::read_model(&cmd.model)?;
+    let has_error = cmd.error.is_some() || cmd.error_col.is_some();
+    if has_error && (cmd.drift_cols.is_some() || cmd.lognormal || cmd.input.z_col.is_some()) {
+        bail!("--error/--error-col support plain 2-D (block) kriging only for now");
+    }
 
     if let Some(z_col) = &cmd.input.z_col {
         // 3-D kriging at explicit targets.
@@ -1295,7 +1307,15 @@ fn run_krige(cmd: KrigeCmd) -> Result<()> {
         return Ok(());
     }
 
-    let data = cmd.input.read()?;
+    let (data, errors) = if let Some(col) = &cmd.error_col {
+        let (data, extras) = cmd.input.read_with_extras(std::slice::from_ref(col))?;
+        let errors: Vec<f64> = extras.into_iter().map(|row| row[0]).collect();
+        (data, Some(errors))
+    } else {
+        let data = cmd.input.read()?;
+        let errors = cmd.error.map(|e| vec![e; data.len()]);
+        (data, errors)
+    };
     println!("Loaded {} points; model: {model}", data.len());
 
     let grid = cmd.grid.build(&data)?;
@@ -1324,7 +1344,13 @@ fn run_krige(cmd: KrigeCmd) -> Result<()> {
         return Ok(());
     }
 
-    let kriging = Kriging::new(&data, &model, config)?;
+    let kriging = match errors {
+        Some(errors) => {
+            println!("Measurement error active: kriging predicts the signal (not exact)");
+            Kriging::with_measurement_error(&data, &model, config, errors)?
+        }
+        None => Kriging::new(&data, &model, config)?,
+    };
     let (values, variances) = match &cmd.block {
         Some(spec) => {
             let size = parse_floats(spec)?;

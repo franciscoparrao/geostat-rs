@@ -259,7 +259,7 @@ $BIN cokrige -i validation/out/meuse_multi2.csv --value-col lzinc \
 python3 validation/compare_v05.py
 ```
 
-## v0.7 results (residual variograms for UK/KED variography)
+## v0.7 results (residual variograms; measurement error)
 
 gstat computes formula-based variograms on OLS residuals; geostat-rs
 matches with `--detrend-cols` (external drift) and `--detrend` (polynomial
@@ -269,6 +269,13 @@ coordinate trend). Same meuse_multi.csv on both sides:
 |---|---|---|
 | `lzinc ~ sdist` vs `--detrend-cols sdist` | 0 | 3.3e-15 |
 | `lzinc ~ x + y` vs `--detrend 1` | 0 | 6.7e-12 |
+
+Measurement error (gstat `Err` component vs `krige --error`), OK on
+meuse.grid with the v0.1 fitted model + Err = 0.05:
+
+| Check | Predictions | Variances |
+|---|---|---|
+| OK with constant measurement-error variance | 2.5e-14 | 1.2e-15 |
 
 Reproduce:
 
@@ -281,6 +288,10 @@ $BIN variogram -i validation/out/meuse_multi.csv --value-col lzinc \
 $BIN variogram -i validation/out/meuse_multi.csv --value-col lzinc \
     --detrend 1 --n-lags 15 --max-dist 1500 \
     -o validation/out/rust_resid_poly_vario.csv
+$BIN krige -i validation/out/meuse_lzinc.csv --value-col lzinc \
+    -m validation/out/gstat_model.json --error 0.05 \
+    --bbox 178440,329600,181560,333760 --nx 78 --ny 104 \
+    -o validation/out/rust_err_krige.csv
 python3 validation/compare_v07.py
 ```
 

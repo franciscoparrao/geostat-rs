@@ -361,7 +361,7 @@ fn vecchia_loglik(
 #[pyfunction]
 #[pyo3(signature = (x, y, values, model, target_x, target_y, method = "ordinary",
     mean = None, degree = 1, max_neighbors = None, radius = None,
-    min_neighbors = None, octant = None))]
+    min_neighbors = None, octant = None, measurement_error = None))]
 #[allow(clippy::too_many_arguments)]
 fn krige(
     x: Vec<f64>,
@@ -377,6 +377,7 @@ fn krige(
     radius: Option<f64>,
     min_neighbors: Option<usize>,
     octant: Option<usize>,
+    measurement_error: Option<Vec<f64>>,
 ) -> PyResult<(Vec<f64>, Vec<f64>)> {
     if target_x.len() != target_y.len() {
         return Err(PyValueError::new_err(
@@ -391,7 +392,12 @@ fn krige(
         min_neighbors,
         max_per_octant: octant,
     };
-    let kriging = Kriging::new(&data, &model.inner, config).map_err(err)?;
+    let kriging = match measurement_error {
+        Some(errors) => {
+            Kriging::with_measurement_error(&data, &model.inner, config, errors).map_err(err)?
+        }
+        None => Kriging::new(&data, &model.inner, config).map_err(err)?,
+    };
     let targets: Vec<[f64; 2]> = target_x
         .into_iter()
         .zip(target_y)
