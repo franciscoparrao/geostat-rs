@@ -112,10 +112,25 @@ impl NormalScore {
         Self::fit_with_tails(values, Tails::default())
     }
 
+    /// Fits the transform with declustering weights: the reference cdf uses
+    /// weighted plotting positions (GSLIB `nscore` with a weight column), so
+    /// preferentially clustered samples do not bias the target distribution.
+    /// Weights must be positive; with equal weights this is exactly
+    /// [`NormalScore::fit`].
+    pub fn fit_weighted(values: &[f64], weights: &[f64]) -> Result<Self> {
+        Self::fit_weighted_with_tails(values, weights, Tails::default())
+    }
+
     /// Fits the transform with GSLIB-style tail extrapolation for the
     /// back-transform. `tails.lower_bound`/`upper_bound` must bracket the
     /// data range when the corresponding tail model is not `None`.
     pub fn fit_with_tails(values: &[f64], tails: Tails) -> Result<Self> {
+        Self::fit_weighted_with_tails(values, &vec![1.0; values.len()], tails)
+    }
+
+    /// Weighted fit with tail extrapolation; see [`NormalScore::fit_weighted`]
+    /// and [`NormalScore::fit_with_tails`].
+    pub fn fit_weighted_with_tails(values: &[f64], weights: &[f64], tails: Tails) -> Result<Self> {
         if values.len() < 2 {
             return Err(GeostatError::InsufficientData(
                 "normal score transform requires at least 2 values".into(),
@@ -124,26 +139,52 @@ impl NormalScore {
         if values.iter().any(|v| !v.is_finite()) {
             return Err(GeostatError::InvalidParameter("non-finite value".into()));
         }
+        if weights.len() != values.len() {
+            return Err(GeostatError::DimensionMismatch(format!(
+                "{} weights vs {} values",
+                weights.len(),
+                values.len()
+            )));
+        }
+        if weights.iter().any(|w| !(w.is_finite() && *w > 0.0)) {
+            return Err(GeostatError::InvalidParameter(
+                "declustering weights must be finite and positive".into(),
+            ));
+        }
         let n = values.len();
-        let mut sorted = values.to_vec();
-        sorted.sort_by(f64::total_cmp);
-        let scores: Vec<f64> = (0..n)
-            .map(|i| inv_norm_cdf((i as f64 + 0.5) / n as f64))
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| values[a].total_cmp(&values[b]));
+        let total: f64 = weights.iter().sum();
+
+        // Weighted plotting positions p_i = (cum_{i-1} + w_i / 2) / W; with
+        // equal weights this reduces to the (i + 0.5) / n convention.
+        let mut cum = 0.0;
+        let scores: Vec<f64> = order
+            .iter()
+            .map(|&i| {
+                let p = (cum + 0.5 * weights[i]) / total;
+                cum += weights[i];
+                inv_norm_cdf(p)
+            })
             .collect();
 
-        // Collapse ties into single knots with the mean score of the group.
+        // Collapse ties into single knots with the weighted mean score of
+        // the group.
         let mut knots_v = Vec::new();
         let mut knots_s = Vec::new();
         let mut i = 0;
         while i < n {
+            let vi = values[order[i]];
             let mut j = i;
             let mut sum = 0.0;
-            while j < n && sorted[j] == sorted[i] {
-                sum += scores[j];
+            let mut wsum = 0.0;
+            while j < n && values[order[j]] == vi {
+                sum += weights[order[j]] * scores[j];
+                wsum += weights[order[j]];
                 j += 1;
             }
-            knots_v.push(sorted[i]);
-            knots_s.push(sum / (j - i) as f64);
+            knots_v.push(vi);
+            knots_s.push(sum / wsum);
             i = j;
         }
         if knots_v.len() < 2 {
@@ -267,6 +308,43 @@ mod tests {
         assert!(ns.transform(50.0).abs() < 1e-9);
         // Monotone.
         assert!(ns.transform(10.0) < ns.transform(90.0));
+    }
+
+    #[test]
+    fn weighted_fit_with_equal_weights_matches_unweighted() {
+        let values = vec![3.1, 0.2, 7.5, 1.1, 4.4, 2.2, 9.9, 0.5, 1.1];
+        let a = NormalScore::fit(&values).unwrap();
+        // Unit weights reproduce the plotting positions bit for bit.
+        let b = NormalScore::fit_weighted(&values, &vec![1.0; values.len()]).unwrap();
+        for &v in &values {
+            assert_eq!(a.transform(v), b.transform(v), "score differs at {v}");
+        }
+        // Any other constant weight is the same distribution (up to
+        // floating-point accumulation).
+        let c = NormalScore::fit_weighted(&values, &vec![2.5; values.len()]).unwrap();
+        for &v in &values {
+            assert!((a.transform(v) - c.transform(v)).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn weights_shift_the_reference_distribution() {
+        // Upweighting the isolated low value gives it more cdf mass: its
+        // own score moves toward the center and every value above it is
+        // pushed further up the cdf.
+        let values = vec![1.0, 5.0, 5.5, 6.0, 6.5, 7.0];
+        let equal = NormalScore::fit(&values).unwrap();
+        let mut weights = vec![0.2; values.len()];
+        weights[0] = 2.0;
+        let weighted = NormalScore::fit_weighted(&values, &weights).unwrap();
+        assert!(weighted.transform(1.0) > equal.transform(1.0));
+        assert!(weighted.transform(5.0) > equal.transform(5.0));
+        assert!(weighted.transform(7.0) > equal.transform(7.0));
+        // Invalid weights rejected.
+        assert!(NormalScore::fit_weighted(&values, &[1.0; 3]).is_err());
+        let mut bad = vec![1.0; values.len()];
+        bad[2] = 0.0;
+        assert!(NormalScore::fit_weighted(&values, &bad).is_err());
     }
 
     #[test]

@@ -38,6 +38,11 @@ pub struct SgsConfig {
     /// clamps realizations to the data range; set tail models and bounds to
     /// let extremes exceed the observed extremes.
     pub tails: Tails,
+    /// Optional declustering weights (one positive weight per data point,
+    /// e.g. from [`crate::declustering::cell_declustering_weights`]): the
+    /// normal-score reference distribution is fitted with them so
+    /// preferential sampling does not bias the simulated histogram.
+    pub decluster_weights: Option<Vec<f64>>,
 }
 
 impl Default for SgsConfig {
@@ -48,6 +53,7 @@ impl Default for SgsConfig {
             max_neighbors: 16,
             search_radius: None,
             tails: Tails::default(),
+            decluster_weights: None,
         }
     }
 }
@@ -120,7 +126,19 @@ pub fn sgs_at<const D: usize>(
             "no simulation nodes given".into(),
         ));
     }
-    let ns = NormalScore::fit_with_tails(data.values(), cfg.tails)?;
+    let ns = match &cfg.decluster_weights {
+        Some(w) => {
+            if w.len() != data.len() {
+                return Err(GeostatError::DimensionMismatch(format!(
+                    "{} declustering weights vs {} data points",
+                    w.len(),
+                    data.len()
+                )));
+            }
+            NormalScore::fit_weighted_with_tails(data.values(), w, cfg.tails)?
+        }
+        None => NormalScore::fit_with_tails(data.values(), cfg.tails)?,
+    };
     let data_scores: Vec<f64> = data.values().iter().map(|&v| ns.transform(v)).collect();
 
     crate::parallel::par_try_map(cfg.n_realizations, |r| {
@@ -296,6 +314,7 @@ mod tests {
                 lower_bound: Some(lo - 2.0),
                 upper_bound: Some(hi + 2.0),
             },
+            ..Default::default()
         };
         let res = sequential_gaussian_simulation(&data, &model, &grid, &cfg).unwrap();
         let mut exceeds = false;

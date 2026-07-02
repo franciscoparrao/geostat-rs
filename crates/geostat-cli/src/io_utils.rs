@@ -202,6 +202,16 @@ pub fn write_variogram_csv(path: &Path, ev: &ExperimentalVariogram) -> Result<()
     Ok(())
 }
 
+/// Writes declustering weights as CSV (`x,y,value,weight`).
+pub fn write_weights_csv(path: &Path, data: &PointSet, weights: &[f64]) -> Result<()> {
+    let mut w = writer(path)?;
+    writeln!(w, "x,y,value,weight")?;
+    for (i, c) in data.coords().iter().enumerate() {
+        writeln!(w, "{},{},{},{}", c[0], c[1], data.value(i), weights[i])?;
+    }
+    Ok(())
+}
+
 /// Writes gridded predictions as CSV (`x,y,prediction,variance`).
 pub fn write_grid_csv(path: &Path, grid: &Grid2D, values: &[f64], variances: &[f64]) -> Result<()> {
     let mut w = writer(path)?;

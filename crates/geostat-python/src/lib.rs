@@ -876,6 +876,61 @@ fn parse_tail(spec: &str) -> PyResult<core::TailModel> {
     spec.parse::<core::TailModel>().map_err(err)
 }
 
+/// Cell-declustering weights (GSLIB declus) for preferentially sampled
+/// data. With `cell_size` computes the weights directly; otherwise scans
+/// `n_sizes` sizes between `min_size`/`max_size` (default: bbox diagonal /
+/// 50 to / 5) and keeps the size that minimizes the declustered mean (set
+/// `minimize=False` for data clustered in low values). Returns a dict with
+/// `weights` (sum to n), `cell_size`, `declustered_mean` and the scan
+/// `trace` as a list of `(size, mean)` pairs.
+#[pyfunction]
+#[pyo3(signature = (x, y, values, cell_size = None, min_size = None, max_size = None,
+    n_sizes = 20, n_offsets = 4, minimize = true))]
+#[allow(clippy::too_many_arguments)]
+fn decluster_weights(
+    py: Python<'_>,
+    x: Vec<f64>,
+    y: Vec<f64>,
+    values: Vec<f64>,
+    cell_size: Option<f64>,
+    min_size: Option<f64>,
+    max_size: Option<f64>,
+    n_sizes: usize,
+    n_offsets: usize,
+    minimize: bool,
+) -> PyResult<Py<PyDict>> {
+    let data = point_set(x, y, values)?;
+    let out = PyDict::new(py);
+    match cell_size {
+        Some(size) => {
+            let w = core::cell_declustering_weights(&data, size, n_offsets).map_err(err)?;
+            let mean = w
+                .iter()
+                .zip(data.values())
+                .map(|(&wi, &v)| wi * v)
+                .sum::<f64>()
+                / data.len() as f64;
+            out.set_item("weights", w)?;
+            out.set_item("cell_size", size)?;
+            out.set_item("declustered_mean", mean)?;
+            out.set_item("trace", Vec::<(f64, f64)>::new())?;
+        }
+        None => {
+            let (min, max) = data.bbox();
+            let diag = ((max[0] - min[0]).powi(2) + (max[1] - min[1]).powi(2)).sqrt();
+            let lo = min_size.unwrap_or(diag / 50.0);
+            let hi = max_size.unwrap_or(diag / 5.0);
+            let scan =
+                core::decluster_scan(&data, lo, hi, n_sizes, n_offsets, minimize).map_err(err)?;
+            out.set_item("weights", scan.weights)?;
+            out.set_item("cell_size", scan.best_size)?;
+            out.set_item("declustered_mean", scan.best_mean)?;
+            out.set_item("trace", scan.trace)?;
+        }
+    }
+    Ok(out.into())
+}
+
 /// Conditional sequential Gaussian simulation. `model_ns` is a model fitted
 /// to the normal scores (fit one with `fit_variogram` on transformed data,
 /// or let the CLI auto-fit). Returns one list per realization, in grid
@@ -889,7 +944,8 @@ fn parse_tail(spec: &str) -> PyResult<core::TailModel> {
 #[pyfunction]
 #[pyo3(signature = (x, y, values, model_ns, bbox, nx, ny, n_realizations = 10,
     seed = 42, max_neighbors = 16, radius = None,
-    lower_tail = "none", upper_tail = "none", zmin = None, zmax = None))]
+    lower_tail = "none", upper_tail = "none", zmin = None, zmax = None,
+    decluster_cell = None))]
 #[allow(clippy::too_many_arguments)]
 fn sgs(
     x: Vec<f64>,
@@ -907,9 +963,14 @@ fn sgs(
     upper_tail: &str,
     zmin: Option<f64>,
     zmax: Option<f64>,
+    decluster_cell: Option<f64>,
 ) -> PyResult<Vec<Vec<f64>>> {
     let data = point_set(x, y, values)?;
     let grid = Grid2D::from_bbox([bbox.0, bbox.1], [bbox.2, bbox.3], nx, ny).map_err(err)?;
+    let decluster_weights = match decluster_cell {
+        Some(size) => Some(core::cell_declustering_weights(&data, size, 4).map_err(err)?),
+        None => None,
+    };
     let cfg = SgsConfig {
         n_realizations,
         seed,
@@ -921,6 +982,7 @@ fn sgs(
             lower_bound: zmin,
             upper_bound: zmax,
         },
+        decluster_weights,
     };
     let res =
         core::sequential_gaussian_simulation(&data, &model_ns.inner, &grid, &cfg).map_err(err)?;
@@ -1169,6 +1231,7 @@ fn geostat_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tune_knn_k, m)?)?;
     m.add_function(wrap_pyfunction!(tune_kriging_neighbors, m)?)?;
     m.add_function(wrap_pyfunction!(sgs, m)?)?;
+    m.add_function(wrap_pyfunction!(decluster_weights, m)?)?;
     m.add_function(wrap_pyfunction!(sis, m)?)?;
     m.add_function(wrap_pyfunction!(experimental_variogram_3d, m)?)?;
     m.add_function(wrap_pyfunction!(fit_variogram_3d, m)?)?;

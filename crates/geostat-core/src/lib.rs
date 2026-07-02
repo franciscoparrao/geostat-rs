@@ -45,6 +45,7 @@
 
 pub mod cokriging;
 pub mod data;
+pub mod declustering;
 pub mod error;
 pub mod grid;
 pub mod ik;
@@ -68,6 +69,7 @@ pub mod vecchia;
 
 pub use cokriging::{CoKriging, CoKrigingConfig, Lmc, LmcStructure, fit_lmc, fit_lmc_collocated};
 pub use data::PointSet;
+pub use declustering::{DeclusterScan, cell_declustering_weights, decluster_scan};
 pub use error::{GeostatError, Result};
 pub use grid::{Grid2D, Grid3D};
 pub use ik::{CcdfEstimate, IkConfig, indicator_kriging};

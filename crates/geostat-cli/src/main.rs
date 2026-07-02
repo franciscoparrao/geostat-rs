@@ -10,10 +10,11 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use geostat_core::{
     CoKriging, CoKrigingConfig, DirectionConfig, Grid2D, IkConfig, Kriging, KrigingConfig,
     KrigingMethod, ModelKind, PointSet, SgsConfig, SisConfig, Tails, VariogramConfig,
-    VariogramModel, detrend_external, detrend_polynomial, experimental_variogram, fit_anisotropic,
-    fit_best, fit_indicator_models, fit_lmc_collocated, indicator_kriging, k_fold, leave_one_out,
-    leave_one_out_with_drift, sequential_gaussian_simulation, sequential_indicator_simulation,
-    variogram_map, vecchia_mle, vecchia_reml,
+    VariogramModel, cell_declustering_weights, decluster_scan, detrend_external,
+    detrend_polynomial, experimental_variogram, fit_anisotropic, fit_best, fit_indicator_models,
+    fit_lmc_collocated, indicator_kriging, k_fold, leave_one_out, leave_one_out_with_drift,
+    sequential_gaussian_simulation, sequential_indicator_simulation, variogram_map, vecchia_mle,
+    vecchia_reml,
 };
 
 #[derive(Parser)]
@@ -41,6 +42,9 @@ enum Command {
     Cv(CvCmd),
     /// Conditional sequential Gaussian simulation
     Sgs(SgsCmd),
+    /// Cell-declustering weights (GSLIB declus): scan cell sizes and export
+    /// weights for preferentially sampled data
+    Declus(DeclusCmd),
     /// Conditional sequential indicator simulation
     Sis(SisCmd),
     /// Indicator kriging: local ccdf, E-type estimate and conditional variance
@@ -416,7 +420,40 @@ struct SgsCmd {
     /// Maximum attainable value for the upper tail (GSLIB zmax)
     #[arg(long)]
     zmax: Option<f64>,
+    /// Cell-declustering cell size: fit the normal-score reference
+    /// distribution with declustering weights (see the `declus` subcommand
+    /// to choose a size)
+    #[arg(long)]
+    declus: Option<f64>,
     /// Output CSV file (x,y,sim1..simN)
+    #[arg(short, long)]
+    output: PathBuf,
+}
+
+#[derive(Args)]
+struct DeclusCmd {
+    #[command(flatten)]
+    input: InputOpts,
+    /// Single cell size (skips the scan)
+    #[arg(long)]
+    cell_size: Option<f64>,
+    /// Smallest scanned cell size (default: bbox diagonal / 50)
+    #[arg(long)]
+    min_size: Option<f64>,
+    /// Largest scanned cell size (default: bbox diagonal / 5)
+    #[arg(long)]
+    max_size: Option<f64>,
+    /// Number of cell sizes to scan
+    #[arg(long, default_value_t = 20)]
+    n_sizes: usize,
+    /// Grid-origin offsets averaged per size
+    #[arg(long, default_value_t = 4)]
+    offsets: usize,
+    /// Keep the size that maximizes the declustered mean (default:
+    /// minimize, for data preferentially clustered in high values)
+    #[arg(long)]
+    maximize: bool,
+    /// Output CSV file (x,y,value,weight)
     #[arg(short, long)]
     output: PathBuf,
 }
@@ -517,6 +554,7 @@ fn main() -> Result<()> {
         Command::Cokrige(cmd) => run_cokrige(cmd),
         Command::Cv(cmd) => run_cv(cmd),
         Command::Sgs(cmd) => run_sgs(cmd),
+        Command::Declus(cmd) => run_declus(cmd),
         Command::Sis(cmd) => run_sis(cmd),
         Command::Ik(cmd) => run_ik(cmd),
         Command::Rk(cmd) => run_rk(cmd),
@@ -1527,6 +1565,23 @@ fn run_sgs(cmd: SgsCmd) -> Result<()> {
         }
     };
 
+    let decluster_weights = match cmd.declus {
+        Some(size) => {
+            let w = cell_declustering_weights(&data, size, 4)?;
+            let mean = w
+                .iter()
+                .zip(data.values())
+                .map(|(&wi, &v)| wi * v)
+                .sum::<f64>()
+                / data.len() as f64;
+            println!(
+                "Declustering (cell {size}): naive mean {:.4}, declustered mean {mean:.4}",
+                data.mean()
+            );
+            Some(w)
+        }
+        None => None,
+    };
     let grid = cmd.grid.build(&data)?;
     let cfg = SgsConfig {
         n_realizations: cmd.realizations,
@@ -1539,6 +1594,7 @@ fn run_sgs(cmd: SgsCmd) -> Result<()> {
             lower_bound: cmd.zmin,
             upper_bound: cmd.zmax,
         },
+        decluster_weights,
     };
     let res = sequential_gaussian_simulation(&data, &model_ns, &grid, &cfg)?;
 
@@ -1552,6 +1608,48 @@ fn run_sgs(cmd: SgsCmd) -> Result<()> {
     );
     io_utils::write_sims_csv(&cmd.output, &grid, &res.realizations)?;
     println!("Output written to {}", cmd.output.display());
+    Ok(())
+}
+
+fn run_declus(cmd: DeclusCmd) -> Result<()> {
+    let data = cmd.input.read()?;
+    println!(
+        "Loaded {} points from {}",
+        data.len(),
+        cmd.input.input.display()
+    );
+    let naive = data.mean();
+    let (weights, size, mean) = match cmd.cell_size {
+        Some(size) => {
+            let w = cell_declustering_weights(&data, size, cmd.offsets)?;
+            let mean = w
+                .iter()
+                .zip(data.values())
+                .map(|(&wi, &v)| wi * v)
+                .sum::<f64>()
+                / data.len() as f64;
+            (w, size, mean)
+        }
+        None => {
+            let (min, max) = data.bbox();
+            let diag = ((max[0] - min[0]).powi(2) + (max[1] - min[1]).powi(2)).sqrt();
+            let lo = cmd.min_size.unwrap_or(diag / 50.0);
+            let hi = cmd.max_size.unwrap_or(diag / 5.0);
+            let scan = decluster_scan(&data, lo, hi, cmd.n_sizes, cmd.offsets, !cmd.maximize)?;
+            println!(
+                "Scanned {} sizes in [{lo:.3}, {hi:.3}] ({} origin offsets):",
+                cmd.n_sizes, cmd.offsets
+            );
+            for (s, m) in &scan.trace {
+                println!("  cell {s:>10.3} -> declustered mean {m:.5}");
+            }
+            (scan.weights, scan.best_size, scan.best_mean)
+        }
+    };
+    println!("Naive mean:       {naive:.5}");
+    println!("Declustered mean: {mean:.5} (cell size {size:.3})");
+    io_utils::write_weights_csv(&cmd.output, &data, &weights)?;
+    println!("Weights written to {}", cmd.output.display());
     Ok(())
 }
 
