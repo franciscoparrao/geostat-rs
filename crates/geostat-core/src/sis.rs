@@ -254,11 +254,11 @@ pub(crate) fn indicator_sk<const D: usize>(
         let pi = coords[i];
         a[[ii, ii]] = c0 + stabilizer;
         for (jj, &j) in nb.iter().enumerate().skip(ii + 1) {
-            let c = model.covariance_dh(sep(pi, coords[j]));
+            let c = c0 - model.gamma_dh(sep(pi, coords[j]));
             a[[ii, jj]] = c;
             a[[jj, ii]] = c;
         }
-        b[ii] = model.covariance_dh(sep(pi, target));
+        b[ii] = c0 - model.gamma_dh(sep(pi, target));
     }
     let w = solve(a, b)?;
     let mut est = p;

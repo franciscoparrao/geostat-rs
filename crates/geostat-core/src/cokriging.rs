@@ -149,18 +149,16 @@ impl Lmc {
         }
         let mut g = self.nugget[u][v];
         for st in &self.structures {
-            // Reuse the single-variable structure math for the shape.
+            // Reuse the single-variable structure math for the shape,
+            // without allocating a throwaway `VariogramModel`/`Vec` per pair
+            // (this runs inside the O(k^2) cokriging system loop).
             let shape = crate::variogram::Structure {
                 kind: st.kind,
                 sill: 1.0,
                 range: st.range,
                 anis: st.anis,
             };
-            let m = VariogramModel {
-                nugget: 0.0,
-                structures: vec![shape],
-            };
-            g += st.sills[u][v] * m.gamma_dh(dh);
+            g += st.sills[u][v] * st.kind.g(shape.effective_h(dh), st.range);
         }
         g
     }

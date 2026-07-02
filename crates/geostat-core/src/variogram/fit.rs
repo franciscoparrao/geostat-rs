@@ -5,7 +5,7 @@
 
 use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
-use crate::optim::nelder_mead;
+use crate::optim::nelder_mead_multistart;
 use crate::variogram::experimental::{
     DirectionConfig, ExperimentalVariogram, VariogramConfig, experimental_variogram,
 };
@@ -48,25 +48,16 @@ pub fn fit_model(exp_v: &ExperimentalVariogram, kind: ModelKind) -> Result<FitRe
         .unwrap_or(0.5 * max_h)
         .max(1e-12 * max_h.max(1.0));
     let nugget0 = pts[0].1.min(0.5 * sill0).max(0.0);
+    let psill0 = (sill0 - nugget0).max(1e-9 * sill0);
 
-    // Parameters are optimized as multipliers of (sill0, sill0, range0).
+    // `nugget = x[0]^2` (smooth, non-negative, hits exact 0 at x[0]=0); psill
+    // and range are log-parametrized (strictly positive, span orders of
+    // magnitude) so the domain is intrinsic and no boundary penalty is
+    // needed — see AUDIT-2026-07.md §2.6.
     let objective = |x: &[f64]| -> f64 {
-        let nugget = x[0] * sill0;
-        let psill = x[1] * sill0;
-        let range = x[2] * range0;
-        let mut pen = 0.0;
-        if nugget < 0.0 {
-            pen += nugget * nugget;
-        }
-        if psill < 0.0 {
-            pen += psill * psill;
-        }
-        if range <= 0.0 {
-            pen += 1.0 + range * range;
-        }
-        if pen > 0.0 {
-            return 1e12 * (1.0 + pen);
-        }
+        let nugget = x[0] * x[0];
+        let psill = x[1].exp();
+        let range = x[2].exp();
         let model = VariogramModel {
             nugget,
             structures: vec![Structure::new(kind, psill, range)],
@@ -79,17 +70,16 @@ pub fn fit_model(exp_v: &ExperimentalVariogram, kind: ModelKind) -> Result<FitRe
             .sum()
     };
 
-    let x0 = [nugget0 / sill0, ((sill0 - nugget0).max(1e-9)) / sill0, 1.0];
-    let (xb, wsse) = nelder_mead(objective, &x0, 0.25, 1000);
+    // Range is the classic multimodal parameter (short- vs long-range local
+    // optima); multi-start around the empirical guess.
+    let ln_range0 = range0.ln();
+    let starts: Vec<Vec<f64>> = [0.3_f64, 1.0, 3.0]
+        .into_iter()
+        .map(|f| vec![nugget0.sqrt(), psill0.ln(), ln_range0 + f.ln()])
+        .collect();
+    let (xb, wsse) = nelder_mead_multistart(objective, &starts, 0.25, 1000);
 
-    let model = VariogramModel::new(
-        (xb[0] * sill0).max(0.0),
-        vec![Structure::new(
-            kind,
-            (xb[1] * sill0).max(0.0),
-            (xb[2] * range0).max(1e-12),
-        )],
-    )?;
+    let model = VariogramModel::new(xb[0] * xb[0], vec![Structure::new(kind, xb[1].exp(), xb[2].exp())])?;
     Ok(FitResult { model, wsse })
 }
 
@@ -199,25 +189,15 @@ fn fit_anisotropic_kind(
     range0: f64,
 ) -> Result<FitResult> {
     let objective = |x: &[f64]| -> f64 {
-        let nugget = x[0] * sill0;
-        let psill = x[1] * sill0;
-        let range = x[2] * range0;
-        // ratio in (0, 1) via a smooth transform: no boundary for Nelder-Mead.
+        // Nugget is squared (smooth, non-negative, hits exact 0); psill and
+        // range are log-parametrized (strictly positive); ratio in (0, 1)
+        // via a smooth tanh transform. No boundary for Nelder-Mead, so no
+        // penalty branch is needed (AUDIT-2026-07.md §2.6).
+        let nugget = x[0] * x[0];
+        let psill = x[1].exp();
+        let range = x[2].exp();
         let ratio = 0.5 * (1.0 + x[3].tanh());
         let az = x[4];
-        let mut pen = 0.0;
-        if nugget < 0.0 {
-            pen += nugget * nugget;
-        }
-        if psill < 0.0 {
-            pen += psill * psill;
-        }
-        if range <= 0.0 {
-            pen += 1.0 + range * range;
-        }
-        if pen > 0.0 {
-            return 1e12 * (1.0 + pen);
-        }
         let model = VariogramModel {
             nugget,
             structures: vec![Structure {
@@ -241,31 +221,24 @@ fn fit_anisotropic_kind(
     };
 
     // Azimuth is the multimodal parameter; start the simplex from four seeds.
-    let mut best: Option<(Vec<f64>, f64)> = None;
-    for az0 in [0.0, 45.0, 90.0, 135.0] {
-        let x0 = [
-            0.25,
-            ((sill0 - 0.25 * sill0).max(1e-9)) / sill0,
-            1.0,
-            0.0, // ratio = 0.5
-            az0,
-        ];
-        let (xb, wsse) = nelder_mead(objective, &x0, 0.3, 2000);
-        if best.as_ref().is_none_or(|(_, b)| wsse < *b) {
-            best = Some((xb, wsse));
-        }
-    }
-    let (xb, wsse) = best.expect("at least one start");
+    let nugget0_sqrt = (0.25 * sill0).sqrt();
+    let ln_psill0 = ((sill0 - 0.25 * sill0).max(1e-9 * sill0)).ln();
+    let ln_range0 = range0.ln();
+    let starts: Vec<Vec<f64>> = [0.0, 45.0, 90.0, 135.0]
+        .into_iter()
+        .map(|az0| vec![nugget0_sqrt, ln_psill0, ln_range0, 0.0, az0]) // ratio = 0.5
+        .collect();
+    let (xb, wsse) = nelder_mead_multistart(objective, &starts, 0.3, 2000);
 
     let ratio = 0.5 * (1.0 + xb[3].tanh());
     // Normalize azimuth to [0, 180): the major axis is sign- and π-agnostic.
     let az = xb[4].rem_euclid(180.0);
     let model = VariogramModel::new(
-        (xb[0] * sill0).max(0.0),
+        xb[0] * xb[0],
         vec![Structure::with_anisotropy(
             kind,
-            (xb[1] * sill0).max(0.0),
-            (xb[2] * range0).max(1e-12),
+            xb[1].exp(),
+            xb[2].exp(),
             az,
             ratio.clamp(1e-6, 1.0),
         )],

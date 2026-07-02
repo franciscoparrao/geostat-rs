@@ -111,22 +111,20 @@ impl Lu {
     }
 }
 
-/// Solves the symmetric positive-definite system `A x = b` in place:
-/// `a` holds the row-major `n x n` matrix (only the lower triangle is read;
-/// it is overwritten with the Cholesky factor) and `b` is overwritten with
-/// the solution.
+/// Cholesky-factorizes the symmetric positive-definite `n x n` matrix `a`
+/// (row-major, only the lower triangle is read) in place: on success, `a`'s
+/// lower triangle (including the diagonal) holds `L` such that `A = L Lᵀ`.
 ///
-/// Built for hot loops: both buffers are caller-owned and reusable across
-/// calls, and the unpivoted Cholesky factorization costs half the flops of
-/// the LU path (covariance blocks in Vecchia and sequential simulation are
-/// SPD, so no pivoting is needed). Fails with `SingularSystem` when a pivot
-/// is not meaningfully positive.
-pub fn cholesky_solve_in_place(a: &mut [f64], n: usize, b: &mut [f64]) -> Result<()> {
-    if a.len() != n * n || b.len() != n {
+/// Split out from [`cholesky_solve_in_place`] so callers that need the factor
+/// itself (e.g.\ grouped Vecchia likelihoods, which read off `L`'s diagonal
+/// and forward-solve several right-hand sides against one factorization) do
+/// not pay for a back-substitution they do not need. Fails with
+/// `SingularSystem` when a pivot is not meaningfully positive.
+pub fn cholesky_factor_in_place(a: &mut [f64], n: usize) -> Result<()> {
+    if a.len() != n * n {
         return Err(GeostatError::DimensionMismatch(format!(
-            "A has {} entries and b {}, expected {} and {n}",
+            "A has {} entries, expected {}",
             a.len(),
-            b.len(),
             n * n
         )));
     }
@@ -154,7 +152,12 @@ pub fn cholesky_solve_in_place(a: &mut [f64], n: usize, b: &mut [f64]) -> Result
             a[i * n + k] = s / d;
         }
     }
-    // Forward substitution L y = b.
+    Ok(())
+}
+
+/// Forward substitution `L y = b` against a factor from
+/// [`cholesky_factor_in_place`]; overwrites `b` with `y`.
+pub fn cholesky_forward_solve(a: &[f64], n: usize, b: &mut [f64]) {
     for i in 0..n {
         let mut s = b[i];
         for j in 0..i {
@@ -162,7 +165,11 @@ pub fn cholesky_solve_in_place(a: &mut [f64], n: usize, b: &mut [f64]) -> Result
         }
         b[i] = s / a[i * n + i];
     }
-    // Back substitution L^T x = y.
+}
+
+/// Back substitution `Lᵀ x = y` against a factor from
+/// [`cholesky_factor_in_place`]; overwrites `b` (holding `y`) with `x`.
+pub fn cholesky_back_solve(a: &[f64], n: usize, b: &mut [f64]) {
     for i in (0..n).rev() {
         let mut s = b[i];
         for j in (i + 1)..n {
@@ -170,6 +177,28 @@ pub fn cholesky_solve_in_place(a: &mut [f64], n: usize, b: &mut [f64]) -> Result
         }
         b[i] = s / a[i * n + i];
     }
+}
+
+/// Solves the symmetric positive-definite system `A x = b` in place:
+/// `a` holds the row-major `n x n` matrix (only the lower triangle is read;
+/// it is overwritten with the Cholesky factor) and `b` is overwritten with
+/// the solution.
+///
+/// Built for hot loops: both buffers are caller-owned and reusable across
+/// calls, and the unpivoted Cholesky factorization costs half the flops of
+/// the LU path (covariance blocks in Vecchia and sequential simulation are
+/// SPD, so no pivoting is needed). Fails with `SingularSystem` when a pivot
+/// is not meaningfully positive.
+pub fn cholesky_solve_in_place(a: &mut [f64], n: usize, b: &mut [f64]) -> Result<()> {
+    if b.len() != n {
+        return Err(GeostatError::DimensionMismatch(format!(
+            "b has {} entries, expected {n}",
+            b.len()
+        )));
+    }
+    cholesky_factor_in_place(a, n)?;
+    cholesky_forward_solve(a, n, b);
+    cholesky_back_solve(a, n, b);
     Ok(())
 }
 

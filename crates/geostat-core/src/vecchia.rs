@@ -25,8 +25,10 @@ use ndarray::Array2;
 
 use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
-use crate::linalg::{cholesky_solve_in_place, lu_factor};
-use crate::optim::nelder_mead;
+use crate::linalg::{
+    cholesky_factor_in_place, cholesky_forward_solve, cholesky_solve_in_place, lu_factor,
+};
+use crate::optim::nelder_mead_multistart;
 use crate::search::BucketGrid;
 use crate::variogram::{ModelKind, Structure, VariogramModel};
 
@@ -252,9 +254,12 @@ fn loglik_with_plan<const D: usize>(
             ki.clear();
             ki.resize(s, 0.0);
             for a in 0..s {
-                ki[a] = model.covariance_dh(sep(&coords[i], &coords[nb[a]]));
+                // `sill - gamma_dh(..)` instead of `covariance_dh(..)`: the
+                // latter recomputes `total_sill()` (a sum over structures)
+                // on every pair; the caller already has it cached.
+                ki[a] = sill - model.gamma_dh(sep(&coords[i], &coords[nb[a]]));
                 for b in a..s {
-                    let c = model.covariance_dh(sep(&coords[nb[a]], &coords[nb[b]]));
+                    let c = sill - model.gamma_dh(sep(&coords[nb[a]], &coords[nb[b]]));
                     kss[a * s + b] = c;
                     kss[b * s + a] = c;
                 }
@@ -269,6 +274,157 @@ fn loglik_with_plan<const D: usize>(
         };
         let r = z[i] - mu;
         loglik += -0.5 * ((2.0 * PI).ln() + var.ln() + r * r / var);
+    }
+    Ok(loglik)
+}
+
+/// Fraction of a candidate point's own `m` neighbours that may be new to a
+/// growing Guinness block before the block is closed. Max-min ordering
+/// spreads early selections across the whole domain (near-zero neighbour
+/// overlap between consecutive points there), but late in the ordering,
+/// once the domain has filled in, consecutive selections are often local
+/// refinements whose neighbour sets do overlap heavily. This threshold lets
+/// blocks form only where that overlap is real, so grouping never costs
+/// more than the ungrouped path: a block that cannot grow past size 1
+/// degenerates to exactly one factorization per point, same as unrouped.
+const GUINNESS_MERGE_NEW_FRAC: f64 = 0.34;
+
+/// Greedily partitions `plan.order` into Guinness blocks: geometry-only (no
+/// covariance model needed), so it can be computed once per `(plan,
+/// group_size)` and reused across every likelihood evaluation in an
+/// optimizer's hot loop. Each block starts at the next unassigned position
+/// and grows while the next candidate's own neighbour set is mostly already
+/// covered by the block's accumulated predecessor set (see
+/// [`GUINNESS_MERGE_NEW_FRAC`]), capped at `group_size`.
+fn guinness_blocks(plan: &VecchiaPlan, group_size: usize) -> Vec<(usize, usize)> {
+    let n = plan.order.len();
+    let mut blocks = Vec::new();
+    let mut v_ids: Vec<usize> = Vec::new();
+    let mut k0 = 0;
+    while k0 < n {
+        v_ids.clear();
+        v_ids.extend_from_slice(&plan.neighbours[k0]);
+        let mut k1 = k0 + 1;
+        while k1 < n && (k1 - k0) < group_size {
+            let nb = &plan.neighbours[k1];
+            let m = nb.len().max(1);
+            let in_block = |j: &usize| plan.order[k0..k1].contains(j);
+            let new_count = nb.iter().filter(|j| !v_ids.contains(j) && !in_block(j)).count();
+            if new_count as f64 > GUINNESS_MERGE_NEW_FRAC * m as f64 {
+                break;
+            }
+            for &j in nb {
+                if !v_ids.contains(&j) && !in_block(&j) {
+                    v_ids.push(j);
+                }
+            }
+            k1 += 1;
+        }
+        blocks.push((k0, k1));
+        k0 = k1;
+    }
+    blocks
+}
+
+/// Vecchia log-likelihood for a precomputed [`VecchiaPlan`], grouping
+/// points into blocks (see [`guinness_blocks`]) that share **one** joint
+/// Cholesky factorization (Guinness 2018).
+///
+/// A block's combined conditioning set `V = S ∪ block` (`S` = the union of
+/// the block members' own nearest-predecessor sets, `block` = the block
+/// members themselves) is, by construction of [`guinness_blocks`], close to
+/// one member's own `m` neighbours, so factoring it once amortizes the
+/// O(|V|^3) cost across the whole block instead of paying O(m^3) per point.
+/// Per-point conditional means/variances then come from the *same*
+/// whitening identity the unrouped path uses (`w = L^{-1}(z - mean)`;
+/// `Var[z_t|z_{<t}] = L_tt^2`, `E[z_t|z_{<t}] = z_t - L_tt w_t`), which holds
+/// for *any* valid ordering of `V`'s predecessors — so grouping several
+/// members behind one factorization does not change the per-point
+/// conditional mean/variance formula, only how it is computed. Each block
+/// member's effective conditioning set becomes `S ∪ {earlier block
+/// members}`, a superset of its own `m` nearest neighbours (by construction,
+/// since `S` is their union) — a strictly richer approximation, never a
+/// degraded one.
+///
+/// `group_size <= 1` is exactly [`loglik_with_plan`] (delegated to directly,
+/// so the ungrouped path is untouched bit-for-bit). With full conditioning
+/// (`m >= n-1`) grouping does not change the mathematical result: every
+/// block member's true neighbour set is already `{0,...,k-1}` in order
+/// position, which any block covering it reproduces exactly regardless of
+/// `group_size`.
+fn loglik_with_plan_grouped<const D: usize>(
+    data: &PointSet<D>,
+    model: &VariogramModel,
+    plan: &VecchiaPlan,
+    group_size: usize,
+) -> Result<f64> {
+    if group_size <= 1 {
+        return loglik_with_plan(data, model, plan);
+    }
+    loglik_with_blocks(data, model, plan, &guinness_blocks(plan, group_size))
+}
+
+/// Core of [`loglik_with_plan_grouped`], taking a precomputed block
+/// partition. `guinness_blocks` depends only on plan geometry (not the
+/// covariance model), so an optimizer's hot loop computes it **once** and
+/// reuses it across every likelihood evaluation instead of recomputing it
+/// per iteration.
+fn loglik_with_blocks<const D: usize>(
+    data: &PointSet<D>,
+    model: &VariogramModel,
+    plan: &VecchiaPlan,
+    blocks: &[(usize, usize)],
+) -> Result<f64> {
+    let coords = data.coords();
+    let mean = data.mean();
+    let z: Vec<f64> = data.values().iter().map(|v| v - mean).collect();
+    let sill = model.total_sill();
+
+    // Reused across every block.
+    let mut v_ids: Vec<usize> = Vec::new();
+    let mut kvv: Vec<f64> = Vec::new();
+    let mut w: Vec<f64> = Vec::new();
+
+    let mut loglik = 0.0;
+    for &(k0, k1) in blocks {
+        let block_ids = &plan.order[k0..k1];
+
+        // S = union of the block members' own predecessor sets, excluding
+        // members of this same block (those are appended below, in order,
+        // and picked up by the sequential whitening recursion instead).
+        v_ids.clear();
+        for k in k0..k1 {
+            for &j in &plan.neighbours[k] {
+                if !block_ids.contains(&j) && !v_ids.contains(&j) {
+                    v_ids.push(j);
+                }
+            }
+        }
+        let s_len = v_ids.len();
+        v_ids.extend_from_slice(block_ids);
+        let vn = v_ids.len();
+
+        kvv.clear();
+        kvv.resize(vn * vn, 0.0);
+        for a in 0..vn {
+            kvv[a * vn + a] = sill; // covariance_dh(0) == total_sill for any stationary model
+            for b in (a + 1)..vn {
+                let c = sill - model.gamma_dh(sep(&coords[v_ids[a]], &coords[v_ids[b]]));
+                kvv[a * vn + b] = c;
+                kvv[b * vn + a] = c;
+            }
+        }
+        cholesky_factor_in_place(&mut kvv, vn)?;
+        w.clear();
+        w.extend(v_ids.iter().map(|&id| z[id]));
+        cholesky_forward_solve(&kvv, vn, &mut w);
+
+        for t in s_len..vn {
+            let l_tt = kvv[t * vn + t];
+            let var = l_tt * l_tt;
+            let wt = w[t];
+            loglik += -0.5 * ((2.0 * PI).ln() + var.ln() + wt * wt);
+        }
     }
     Ok(loglik)
 }
@@ -369,9 +525,9 @@ pub fn vecchia_predict<const D: usize>(
             ki.clear();
             ki.resize(s, 0.0);
             for a in 0..s {
-                ki[a] = model.covariance_dh(sep(&target, &store_coords[nb[a]]));
+                ki[a] = c0 - model.gamma_dh(sep(&target, &store_coords[nb[a]]));
                 for b in a..s {
-                    let c = model.covariance_dh(sep(&store_coords[nb[a]], &store_coords[nb[b]]));
+                    let c = c0 - model.gamma_dh(sep(&store_coords[nb[a]], &store_coords[nb[b]]));
                     kss[a * s + b] = c;
                     kss[b * s + a] = c;
                 }
@@ -428,6 +584,22 @@ pub fn vecchia_loglik<const D: usize>(
     loglik_with_plan(data, model, &plan)
 }
 
+/// Like [`vecchia_loglik`], but amortizes Cholesky factorizations across
+/// blocks of `group_size` consecutive points in the ordering (Guinness 2018
+/// grouping; see [`loglik_with_plan_grouped`]). `group_size <= 1` reproduces
+/// `vecchia_loglik` exactly; larger values trade a richer (never worse)
+/// per-point conditioning set for fewer, larger factorizations.
+pub fn vecchia_loglik_grouped<const D: usize>(
+    data: &PointSet<D>,
+    model: &VariogramModel,
+    m: usize,
+    order: Option<&[usize]>,
+    group_size: usize,
+) -> Result<f64> {
+    let plan = vecchia_plan(data.coords(), m, order)?;
+    loglik_with_plan_grouped(data, model, &plan, group_size)
+}
+
 /// Result of a Vecchia maximum-likelihood fit.
 #[derive(Debug, Clone)]
 pub struct VecchiaFit {
@@ -452,7 +624,32 @@ pub fn vecchia_mle<const D: usize>(
     order: Option<&[usize]>,
 ) -> Result<VecchiaFit> {
     let plan = vecchia_plan(data.coords(), m, order)?;
+    mle_fit_with_plan(data, kind, &plan, 1)
+}
 
+/// Like [`vecchia_mle`], but every likelihood evaluation in the optimizer's
+/// hot loop uses [`loglik_with_plan_grouped`] with the given `group_size`
+/// (Guinness 2018 grouping). This is where grouping earns its keep: the
+/// optimizer calls the likelihood thousands of times, so amortizing
+/// factorizations across blocks compounds directly into faster fits.
+/// `group_size <= 1` reproduces `vecchia_mle` exactly.
+pub fn vecchia_mle_grouped<const D: usize>(
+    data: &PointSet<D>,
+    kind: ModelKind,
+    m: usize,
+    order: Option<&[usize]>,
+    group_size: usize,
+) -> Result<VecchiaFit> {
+    let plan = vecchia_plan(data.coords(), m, order)?;
+    mle_fit_with_plan(data, kind, &plan, group_size)
+}
+
+fn mle_fit_with_plan<const D: usize>(
+    data: &PointSet<D>,
+    kind: ModelKind,
+    plan: &VecchiaPlan,
+    group_size: usize,
+) -> Result<VecchiaFit> {
     // Initial scales: sample variance for the sill, a fraction of the domain
     // extent for the range.
     let mean = data.mean();
@@ -475,24 +672,19 @@ pub fn vecchia_mle<const D: usize>(
     let extent = (0..D).map(|d| (hi[d] - lo[d]).powi(2)).sum::<f64>().sqrt();
     let range0 = (extent / 3.0).max(1e-9);
 
-    // Parameters are multipliers of (var0, var0, range0); penalize invalid ones.
+    // Block geometry depends only on the plan, not the covariance model:
+    // compute it once and reuse it across every objective evaluation
+    // instead of paying for it on each of the optimizer's thousands of calls.
+    let blocks = (group_size > 1).then(|| guinness_blocks(plan, group_size));
+
+    // `nugget = x[0]^2` (smooth, non-negative, hits exact 0); psill and range
+    // are log-parametrized (strictly positive, span orders of magnitude), so
+    // the domain is intrinsic and no boundary penalty is needed
+    // (AUDIT-2026-07.md §2.6).
     let objective = |x: &[f64]| -> f64 {
-        let nugget = x[0] * var0;
-        let psill = x[1] * var0;
-        let range = x[2] * range0;
-        let mut pen = 0.0;
-        if nugget < 0.0 {
-            pen += nugget * nugget;
-        }
-        if psill <= 0.0 {
-            pen += 1.0 + psill * psill;
-        }
-        if range <= 0.0 {
-            pen += 1.0 + range * range;
-        }
-        if pen > 0.0 {
-            return 1e12 * (1.0 + pen);
-        }
+        let nugget = x[0] * x[0];
+        let psill = x[1].exp();
+        let range = x[2].exp();
         // A range far beyond the domain is unidentifiable (indistinguishable
         // from a trend); regularize it back rather than letting it run away.
         let range_max = 10.0 * extent;
@@ -506,22 +698,25 @@ pub fn vecchia_mle<const D: usize>(
             structures: vec![Structure::new(kind, psill, range)],
         };
         // Minimize the negative log-likelihood; a singular system is rejected.
-        match loglik_with_plan(data, &model, &plan) {
+        let ll = match &blocks {
+            Some(b) => loglik_with_blocks(data, &model, plan, b),
+            None => loglik_with_plan(data, &model, plan),
+        };
+        match ll {
             Ok(ll) if ll.is_finite() => -ll + 1e6 * reg,
             _ => 1e12,
         }
     };
 
-    let x0 = [0.1, 0.9, 1.0];
-    let (xb, neg_ll) = nelder_mead(objective, &x0, 0.3, 2000);
-    let model = VariogramModel::new(
-        (xb[0] * var0).max(0.0),
-        vec![Structure::new(
-            kind,
-            (xb[1] * var0).max(1e-12),
-            (xb[2] * range0).max(1e-12),
-        )],
-    )?;
+    // Range is the classic multimodal parameter for covariance MLE
+    // (short-vs-long-range local optima); multi-start around the initial guess.
+    let ln_range0 = range0.ln();
+    let starts: Vec<Vec<f64>> = [0.3_f64, 1.0, 3.0]
+        .into_iter()
+        .map(|f| vec![(0.1 * var0).sqrt(), (0.9 * var0).ln(), ln_range0 + f.ln()])
+        .collect();
+    let (xb, neg_ll) = nelder_mead_multistart(objective, &starts, 0.3, 2000);
+    let model = VariogramModel::new(xb[0] * xb[0], vec![Structure::new(kind, xb[1].exp(), xb[2].exp())])?;
     Ok(VecchiaFit {
         model,
         loglik: -neg_ll,
@@ -622,9 +817,9 @@ fn reml_loglik_with_plan<const D: usize>(
             ki.clear();
             ki.resize(s, 0.0);
             for aa in 0..s {
-                ki[aa] = model.covariance_dh(sep(&coords[i], &coords[nb[aa]]));
+                ki[aa] = sill - model.gamma_dh(sep(&coords[i], &coords[nb[aa]]));
                 for bb in aa..s {
-                    let cv = model.covariance_dh(sep(&coords[nb[aa]], &coords[nb[bb]]));
+                    let cv = sill - model.gamma_dh(sep(&coords[nb[aa]], &coords[nb[bb]]));
                     kss[aa * s + bb] = cv;
                     kss[bb * s + aa] = cv;
                 }
@@ -669,6 +864,101 @@ fn reml_loglik_with_plan<const D: usize>(
     Ok(-0.5 * (nm * (2.0 * PI).ln() + logdet + ln_det_a + resid))
 }
 
+/// Grouped counterpart of [`reml_loglik_with_plan`] (Guinness 2018 blocks,
+/// see [`loglik_with_plan_grouped`] for the algorithm): each block's shared
+/// Cholesky factor whitens `z` *and* every basis column with one extra
+/// forward-solve per column, since `uz`/`uf` are both just the factor applied
+/// to a data vector. Takes a precomputed block partition (see
+/// [`loglik_with_blocks`] for why an optimizer's hot loop computes blocks
+/// once and reuses them across every evaluation).
+fn reml_loglik_with_blocks<const D: usize>(
+    data: &PointSet<D>,
+    model: &VariogramModel,
+    plan: &VecchiaPlan,
+    basis: &[Vec<f64>],
+    blocks: &[(usize, usize)],
+) -> Result<f64> {
+    let coords = data.coords();
+    let z = data.values();
+    let p = basis[0].len();
+    let n = coords.len();
+    let sill = model.total_sill();
+
+    let mut logdet = 0.0;
+    let mut uz_uz = 0.0;
+    let mut a = vec![0.0; p * p]; // F^T Sigma^{-1} F
+    let mut c = vec![0.0; p]; // F^T Sigma^{-1} z
+
+    let mut v_ids: Vec<usize> = Vec::new();
+    let mut kvv: Vec<f64> = Vec::new();
+    let mut wz: Vec<f64> = Vec::new();
+    let mut wf: Vec<Vec<f64>> = vec![Vec::new(); p];
+
+    for &(k0, k1) in blocks {
+        let block_ids = &plan.order[k0..k1];
+
+        v_ids.clear();
+        for k in k0..k1 {
+            for &j in &plan.neighbours[k] {
+                if !block_ids.contains(&j) && !v_ids.contains(&j) {
+                    v_ids.push(j);
+                }
+            }
+        }
+        let s_len = v_ids.len();
+        v_ids.extend_from_slice(block_ids);
+        let vn = v_ids.len();
+
+        kvv.clear();
+        kvv.resize(vn * vn, 0.0);
+        for aa in 0..vn {
+            kvv[aa * vn + aa] = sill;
+            for bb in (aa + 1)..vn {
+                let cv = sill - model.gamma_dh(sep(&coords[v_ids[aa]], &coords[v_ids[bb]]));
+                kvv[aa * vn + bb] = cv;
+                kvv[bb * vn + aa] = cv;
+            }
+        }
+        cholesky_factor_in_place(&mut kvv, vn)?;
+
+        // Each right-hand side (z, then every basis column) is whitened
+        // against the *same* factor: uz/uf share the identical telescoping
+        // identity, differing only in which data vector is forward-solved.
+        wz.clear();
+        wz.extend(v_ids.iter().map(|&id| z[id]));
+        cholesky_forward_solve(&kvv, vn, &mut wz);
+        for (col, wcol) in wf.iter_mut().enumerate() {
+            wcol.clear();
+            wcol.extend(v_ids.iter().map(|&id| basis[id][col]));
+            cholesky_forward_solve(&kvv, vn, wcol);
+        }
+
+        for t in s_len..vn {
+            let l_tt = kvv[t * vn + t];
+            let d = l_tt * l_tt;
+            let uz = wz[t];
+            logdet += d.ln();
+            uz_uz += uz * uz;
+            for aa in 0..p {
+                let ufa = wf[aa][t];
+                c[aa] += ufa * uz;
+                for bb in 0..p {
+                    a[aa * p + bb] += ufa * wf[bb][t];
+                }
+            }
+        }
+    }
+
+    let a_arr = Array2::from_shape_vec((p, p), a).expect("square A");
+    let lu = lu_factor(a_arr)?;
+    let beta = lu.solve(c.clone());
+    let ln_det_a = lu.ln_det_abs();
+    let resid = uz_uz - c.iter().zip(&beta).map(|(&ci, &bi)| ci * bi).sum::<f64>();
+
+    let nm = (n - p) as f64;
+    Ok(-0.5 * (nm * (2.0 * PI).ln() + logdet + ln_det_a + resid))
+}
+
 /// Fits a single-structure model by **restricted/trend maximum likelihood**:
 /// the mean is a polynomial trend of `drift_degree` (0 = constant, 1 = linear,
 /// 2 = quadratic) estimated by GLS, and the covariance is fit to the error
@@ -684,7 +974,24 @@ pub fn vecchia_reml<const D: usize>(
 ) -> Result<VecchiaFit> {
     let plan = vecchia_plan(data.coords(), m, order)?;
     let basis = poly_basis(data.coords(), drift_degree);
-    reml_fit_with_basis(data, kind, &plan, &basis)
+    reml_fit_with_basis(data, kind, &plan, &basis, 1)
+}
+
+/// Like [`vecchia_reml`], grouping the REML likelihood's Cholesky
+/// factorizations by `group_size` (Guinness 2018; see
+/// [`reml_loglik_with_blocks`]). `group_size <= 1` reproduces
+/// `vecchia_reml` exactly.
+pub fn vecchia_reml_grouped<const D: usize>(
+    data: &PointSet<D>,
+    kind: ModelKind,
+    m: usize,
+    drift_degree: u8,
+    order: Option<&[usize]>,
+    group_size: usize,
+) -> Result<VecchiaFit> {
+    let plan = vecchia_plan(data.coords(), m, order)?;
+    let basis = poly_basis(data.coords(), drift_degree);
+    reml_fit_with_basis(data, kind, &plan, &basis, group_size)
 }
 
 /// Restricted/trend ML with **external covariates**: the mean is
@@ -730,7 +1037,50 @@ pub fn vecchia_reml_drift<const D: usize>(
         })
         .collect();
     let plan = vecchia_plan(data.coords(), m, order)?;
-    reml_fit_with_basis(data, kind, &plan, &basis)
+    reml_fit_with_basis(data, kind, &plan, &basis, 1)
+}
+
+/// Grouped counterpart of [`vecchia_reml_drift`] (see
+/// [`reml_loglik_with_blocks`]). `group_size <= 1` reproduces
+/// `vecchia_reml_drift` exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn vecchia_reml_drift_grouped<const D: usize>(
+    data: &PointSet<D>,
+    kind: ModelKind,
+    m: usize,
+    drift: &[Vec<f64>],
+    order: Option<&[usize]>,
+    group_size: usize,
+) -> Result<VecchiaFit> {
+    let n = data.len();
+    if drift.len() != n {
+        return Err(GeostatError::DimensionMismatch(format!(
+            "{} drift rows vs {n} data points",
+            drift.len()
+        )));
+    }
+    let ncov = drift.first().map(Vec::len).unwrap_or(0);
+    if ncov == 0 {
+        return Err(GeostatError::InvalidParameter(
+            "external-drift REML needs at least one covariate column".into(),
+        ));
+    }
+    if drift.iter().any(|r| r.len() != ncov) {
+        return Err(GeostatError::DimensionMismatch(
+            "all drift rows must have the same number of covariates".into(),
+        ));
+    }
+    let basis: Vec<Vec<f64>> = drift
+        .iter()
+        .map(|row| {
+            let mut b = Vec::with_capacity(ncov + 1);
+            b.push(1.0);
+            b.extend_from_slice(row);
+            b
+        })
+        .collect();
+    let plan = vecchia_plan(data.coords(), m, order)?;
+    reml_fit_with_basis(data, kind, &plan, &basis, group_size)
 }
 
 /// Shared REML optimizer: fits (nugget, sill, range) for `kind` by maximizing
@@ -740,6 +1090,7 @@ fn reml_fit_with_basis<const D: usize>(
     kind: ModelKind,
     plan: &VecchiaPlan,
     basis: &[Vec<f64>],
+    group_size: usize,
 ) -> Result<VecchiaFit> {
     let p = basis[0].len();
     if data.len() <= p + 1 {
@@ -769,23 +1120,16 @@ fn reml_fit_with_basis<const D: usize>(
     let extent = (0..D).map(|d| (hi[d] - lo[d]).powi(2)).sum::<f64>().sqrt();
     let range0 = (extent / 3.0).max(1e-9);
 
+    // See `mle_fit_with_plan`: block geometry is model-independent, so it is
+    // computed once and reused across every objective evaluation.
+    let blocks = (group_size > 1).then(|| guinness_blocks(plan, group_size));
+
+    // Same smooth non-negative/log parametrization as `vecchia_mle` (see the
+    // comment there); no boundary penalty needed.
     let objective = |x: &[f64]| -> f64 {
-        let nugget = x[0] * var0;
-        let psill = x[1] * var0;
-        let range = x[2] * range0;
-        let mut pen = 0.0;
-        if nugget < 0.0 {
-            pen += nugget * nugget;
-        }
-        if psill <= 0.0 {
-            pen += 1.0 + psill * psill;
-        }
-        if range <= 0.0 {
-            pen += 1.0 + range * range;
-        }
-        if pen > 0.0 {
-            return 1e12 * (1.0 + pen);
-        }
+        let nugget = x[0] * x[0];
+        let psill = x[1].exp();
+        let range = x[2].exp();
         // A range far beyond the domain is unidentifiable (indistinguishable
         // from a trend); regularize it back rather than letting it run away.
         let range_max = 10.0 * extent;
@@ -798,22 +1142,23 @@ fn reml_fit_with_basis<const D: usize>(
             nugget,
             structures: vec![Structure::new(kind, psill, range)],
         };
-        match reml_loglik_with_plan(data, &model, plan, basis) {
+        let ll = match &blocks {
+            Some(b) => reml_loglik_with_blocks(data, &model, plan, basis, b),
+            None => reml_loglik_with_plan(data, &model, plan, basis),
+        };
+        match ll {
             Ok(ll) if ll.is_finite() => -ll + 1e6 * reg,
             _ => 1e12,
         }
     };
 
-    let x0 = [0.1, 0.9, 1.0];
-    let (xb, neg_ll) = nelder_mead(objective, &x0, 0.3, 2000);
-    let model = VariogramModel::new(
-        (xb[0] * var0).max(0.0),
-        vec![Structure::new(
-            kind,
-            (xb[1] * var0).max(1e-12),
-            (xb[2] * range0).max(1e-12),
-        )],
-    )?;
+    let ln_range0 = range0.ln();
+    let starts: Vec<Vec<f64>> = [0.3_f64, 1.0, 3.0]
+        .into_iter()
+        .map(|f| vec![(0.1 * var0).sqrt(), (0.9 * var0).ln(), ln_range0 + f.ln()])
+        .collect();
+    let (xb, neg_ll) = nelder_mead_multistart(objective, &starts, 0.3, 2000);
+    let model = VariogramModel::new(xb[0] * xb[0], vec![Structure::new(kind, xb[1].exp(), xb[2].exp())])?;
     Ok(VecchiaFit {
         model,
         loglik: -neg_ll,
@@ -982,6 +1327,102 @@ mod tests {
         assert!(
             rel < 0.02,
             "rel err {rel}: approx {approx} vs exact {exact}"
+        );
+    }
+
+    #[test]
+    fn guinness_blocks_partition_the_order_within_group_size() {
+        let data = field(4000, 42);
+        let m = 30;
+        let plan = vecchia_plan(data.coords(), m, None).unwrap();
+        for &g in &[2usize, 4, 8, 16] {
+            let blocks = guinness_blocks(&plan, g);
+            let mut covered = 0;
+            for &(k0, k1) in &blocks {
+                assert_eq!(k0, covered, "blocks must tile 0..n with no gaps/overlap");
+                assert!(k1 > k0 && k1 - k0 <= g, "block ({k0},{k1}) exceeds group_size {g}");
+                covered = k1;
+            }
+            assert_eq!(covered, plan.order.len());
+        }
+    }
+
+    #[test]
+    fn grouped_matches_ungrouped_when_group_size_is_one() {
+        let data = field(90, 11);
+        let model = VariogramModel::new(
+            0.05,
+            vec![Structure::new(ModelKind::Exponential, 1.0, 30.0)],
+        )
+        .unwrap();
+        let ungrouped = vecchia_loglik(&data, &model, 12, None).unwrap();
+        let grouped = vecchia_loglik_grouped(&data, &model, 12, None, 1).unwrap();
+        assert!(
+            (ungrouped - grouped).abs() < 1e-12,
+            "ungrouped {ungrouped} vs group_size=1 {grouped}"
+        );
+    }
+
+    #[test]
+    fn grouped_full_conditioning_equals_exact() {
+        let data = field(20, 4);
+        let model = VariogramModel::new(
+            0.05,
+            vec![Structure::new(ModelKind::Exponential, 1.0, 40.0)],
+        )
+        .unwrap();
+        let exact = exact_loglik(&data, &model);
+        // m >= n-1 -> every block's combined conditioning set is still
+        // exactly {0,...,k-1} regardless of group_size (see the doc comment
+        // on `loglik_with_plan_grouped`).
+        for group_size in [2, 3, 5, 8] {
+            let v = vecchia_loglik_grouped(&data, &model, data.len() - 1, None, group_size)
+                .unwrap();
+            assert!(
+                (v - exact).abs() < 1e-8,
+                "group_size {group_size}: vecchia {v} vs exact {exact}"
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_approximation_is_at_least_as_close_as_ungrouped() {
+        let data = field(90, 11);
+        let model = VariogramModel::new(
+            0.05,
+            vec![Structure::new(ModelKind::Exponential, 1.0, 30.0)],
+        )
+        .unwrap();
+        let exact = exact_loglik(&data, &model);
+        let ungrouped_err = (vecchia_loglik(&data, &model, 12, None).unwrap() - exact).abs();
+        for group_size in [2, 4, 6] {
+            let grouped = vecchia_loglik_grouped(&data, &model, 12, None, group_size).unwrap();
+            let grouped_err = (grouped - exact).abs();
+            // Grouping conditions each point on a superset of its own m
+            // nearest neighbours, so the approximation should not get worse.
+            assert!(
+                grouped_err <= ungrouped_err + 1e-9,
+                "group_size {group_size}: grouped err {grouped_err} vs ungrouped err {ungrouped_err}"
+            );
+        }
+    }
+
+    #[test]
+    fn vecchia_mle_grouped_matches_ungrouped_under_full_conditioning() {
+        let data = field(16, 21);
+        let m = data.len() - 1;
+        let ungrouped = vecchia_mle(&data, ModelKind::Exponential, m, None).unwrap();
+        let grouped = vecchia_mle_grouped(&data, ModelKind::Exponential, m, None, 4).unwrap();
+        assert!(
+            (ungrouped.loglik - grouped.loglik).abs() < 1e-6,
+            "ungrouped ll {} vs grouped ll {}",
+            ungrouped.loglik,
+            grouped.loglik
+        );
+        assert!((ungrouped.model.nugget - grouped.model.nugget).abs() < 1e-4);
+        assert!((ungrouped.model.structures[0].sill - grouped.model.structures[0].sill).abs() < 1e-3);
+        assert!(
+            (ungrouped.model.structures[0].range - grouped.model.structures[0].range).abs() < 1e-2
         );
     }
 

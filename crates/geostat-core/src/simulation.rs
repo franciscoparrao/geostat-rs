@@ -373,11 +373,11 @@ fn simple_kriging_ns<const D: usize>(
         let pi = coords[i];
         ws.a[ii * n + ii] = c0 + stabilizer;
         for (jj, &j) in nb.iter().enumerate().skip(ii + 1) {
-            let c = model.covariance_dh(sep(pi, coords[j]));
+            let c = c0 - model.gamma_dh(sep(pi, coords[j]));
             ws.a[ii * n + jj] = c;
             ws.a[jj * n + ii] = c;
         }
-        ws.b[ii] = model.covariance_dh(sep(pi, target));
+        ws.b[ii] = c0 - model.gamma_dh(sep(pi, target));
     }
     ws.w.clear();
     ws.w.extend_from_slice(&ws.b);

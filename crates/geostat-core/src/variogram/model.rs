@@ -184,7 +184,7 @@ impl Structure {
     /// the horizontal components are rotated into the (major, minor) frame
     /// and the minor (and, in 3-D, vertical) components stretched by the
     /// inverse ratios.
-    fn effective_h<const D: usize>(&self, dh: [f64; D]) -> f64 {
+    pub(crate) fn effective_h<const D: usize>(&self, dh: [f64; D]) -> f64 {
         match self.anis {
             None => {
                 let mut s = 0.0;

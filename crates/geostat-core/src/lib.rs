@@ -93,6 +93,8 @@ pub use variogram::{
     variogram_map,
 };
 pub use vecchia::{
-    VecchiaEstimate, VecchiaFit, VecchiaPlan, maxmin_order, vecchia_loglik, vecchia_mle,
-    vecchia_param_se, vecchia_plan, vecchia_predict, vecchia_reml, vecchia_reml_drift,
+    VecchiaEstimate, VecchiaFit, VecchiaPlan, maxmin_order, vecchia_loglik,
+    vecchia_loglik_grouped, vecchia_mle, vecchia_mle_grouped, vecchia_param_se, vecchia_plan,
+    vecchia_predict, vecchia_reml, vecchia_reml_drift, vecchia_reml_drift_grouped,
+    vecchia_reml_grouped,
 };

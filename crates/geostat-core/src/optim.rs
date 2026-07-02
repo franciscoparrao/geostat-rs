@@ -98,6 +98,30 @@ where
     (simplex[best].clone(), fv[best])
 }
 
+/// Runs [`nelder_mead`] from each of `starts` and keeps the best optimum
+/// found. Covariance log-likelihoods and WLS variogram objectives can be
+/// multimodal (range/sill trade-offs, periodic azimuth); a single starting
+/// simplex can converge to a local optimum that a different start avoids.
+/// `starts` must be non-empty.
+pub fn nelder_mead_multistart<F>(
+    f: F,
+    starts: &[Vec<f64>],
+    step: f64,
+    max_iter: usize,
+) -> (Vec<f64>, f64)
+where
+    F: Fn(&[f64]) -> f64,
+{
+    let mut best: Option<(Vec<f64>, f64)> = None;
+    for x0 in starts {
+        let (x, fx) = nelder_mead(&f, x0, step, max_iter);
+        if best.as_ref().is_none_or(|(_, bf)| fx < *bf) {
+            best = Some((x, fx));
+        }
+    }
+    best.expect("nelder_mead_multistart: `starts` must be non-empty")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +138,23 @@ mod tests {
         assert!((x[0] - 1.0).abs() < 1e-3, "x0 = {}", x[0]);
         assert!((x[1] - 1.0).abs() < 1e-3, "x1 = {}", x[1]);
         assert!(fx < 1e-6);
+    }
+
+    #[test]
+    fn multistart_escapes_a_local_optimum() {
+        // Two wells of different depth; a start near the shallow one alone
+        // would converge to it (single-start nelder_mead does).
+        let f = |x: &[f64]| {
+            let a = x[0] + 3.0;
+            let b = x[0] - 3.0;
+            -2.0 * (-0.5 * a * a).exp() - 3.0 * (-0.5 * b * b).exp()
+        };
+        let (_, single) = nelder_mead(f, &[-3.0], 0.1, 500);
+        assert!(single > -2.5, "expected the shallow well, got {single}");
+
+        let starts = vec![vec![-3.0], vec![3.0], vec![0.0]];
+        let (x, fx) = nelder_mead_multistart(f, &starts, 0.1, 500);
+        assert!((x[0] - 3.0).abs() < 1e-2, "x0 = {}", x[0]);
+        assert!(fx < -2.9, "fx = {fx}");
     }
 }

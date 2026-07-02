@@ -110,7 +110,27 @@ Computers & Geosciences.
    condicionamiento completo; CLI `krige --vecchia`, Python
    `vecchia_krige`), SGS con cuotas ndmax/nodmax y camino multigrid
    (`--nodmax`, `--multigrid`). Walker re-validado distribucionalmente
-   (1000 realizaciones en 2.6 s). Pendiente de Fase 2: grouping de
-   Guinness, SIMD en covarianzas, log-parametrización + multi-start.
-   Sigue Fase 3 (diferenciación: Matérn ν continuo, MM1/MM2, block CV
-   espacial, rotación 3-D completa).
+   (1000 realizaciones en 2.6 s). **Fase 2 completada** (2026-07-02):
+   log-parametrización (nugget=x², sill/range=exp(x), sin penalización
+   discontinua) + multi-start en los 4 fits Nelder-Mead (`fit_model`,
+   `fit_anisotropic_kind`, `vecchia_mle`, `vecchia_reml*`) vía
+   `optim::nelder_mead_multistart`; grouping de Guinness (2018) en la
+   verosimilitud Vecchia (`vecchia_mle_grouped`, `vecchia_reml_grouped`,
+   `vecchia_reml_drift_grouped`, `vecchia_loglik_grouped` — bloques
+   adaptativos `guinness_blocks` que comparten una factorización Cholesky
+   solo cuando el solape real de vecindarios lo justifica, `group_size<=1`
+   reproduce el camino sin agrupar bit a bit, exacto bajo full conditioning
+   para cualquier `group_size`); limpieza de covarianzas en los hot loops
+   de Vecchia/kriging/SIS/SGS/co-kriging (evitar recomputar `total_sill()`
+   por par vía `sill - gamma_dh(..)`, y eliminar la asignación de
+   `VariogramModel`+`Vec` por par en `Lmc::gamma_dh`). **Nota honesta**: el
+   grouping da una mejora modesta y dependiente de los datos (~1.1–1.4×
+   típico en campos uniformes 2-D), no el 2-5× de la cita de Guinness —el
+   orden maxmin dispersa deliberadamente los puntos consecutivos por todo
+   el dominio, así que el solape real de vecindarios consecutivos suele ser
+   bajo; el diseño adaptativo garantiza que nunca sea más lento que el
+   camino sin agrupar. Paridad gstat re-validada sin regresiones (Meuse +
+   Walker Lake, incl. SGS distribucional). Pendiente (menor): SIMD
+   explícito (`std::simd`/crate vectorial) más allá de la limpieza de
+   covarianzas escalares hecha ahora. Sigue Fase 3 (diferenciación: Matérn
+   ν continuo, MM1/MM2, block CV espacial, rotación 3-D completa).

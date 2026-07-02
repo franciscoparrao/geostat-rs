@@ -449,7 +449,10 @@ impl<'a, const D: usize> Kriging<'a, D> {
             a[[ii, ii]] = c0 + self.measurement_error.get(i).copied().unwrap_or(0.0);
             for (jj, &j) in nb.iter().enumerate().skip(ii + 1) {
                 let pj = self.data.coord(j);
-                let c = self.model.covariance_dh(sep(pi, pj));
+                // `c0 - gamma_dh(..)` instead of `covariance_dh(..)`: the
+                // latter recomputes `total_sill()` on every pair; `c0` above
+                // already has it.
+                let c = c0 - self.model.gamma_dh(sep(pi, pj));
                 a[[ii, jj]] = c;
                 a[[jj, ii]] = c;
             }
@@ -484,7 +487,7 @@ impl<'a, const D: usize> Kriging<'a, D> {
         // Right-hand side: covariances to the target, then its drift basis.
         let mut b = vec![0.0; dim];
         for (ii, &i) in nb.iter().enumerate() {
-            b[ii] = self.model.covariance_dh(sep(self.data.coord(i), target));
+            b[ii] = c0 - self.model.gamma_dh(sep(self.data.coord(i), target));
         }
         let mut f = vec![0.0; m];
         self.fill_basis(target, target_drift, &mut f);
@@ -590,7 +593,7 @@ impl<'a, const D: usize> Kriging<'a, D> {
             a[[ii, ii]] = c0 + self.measurement_error.get(i).copied().unwrap_or(0.0);
             for (jj, &j) in nb.iter().enumerate().skip(ii + 1) {
                 let pj = self.data.coord(j);
-                let c = self.model.covariance_dh(sep(pi, pj));
+                let c = c0 - self.model.gamma_dh(sep(pi, pj));
                 a[[ii, jj]] = c;
                 a[[jj, ii]] = c;
             }
@@ -602,8 +605,8 @@ impl<'a, const D: usize> Kriging<'a, D> {
             b[ii] = offsets
                 .iter()
                 .map(|off| {
-                    let dh = std::array::from_fn(|k| pi[k] - (center[k] + off[k]));
-                    self.model.covariance_dh::<D>(dh)
+                    let dh: [f64; D] = std::array::from_fn(|k| pi[k] - (center[k] + off[k]));
+                    c0 - self.model.gamma_dh(dh)
                 })
                 .sum::<f64>()
                 / nu;
@@ -622,7 +625,7 @@ impl<'a, const D: usize> Kriging<'a, D> {
                 cbb += if ui == vi {
                     c0_continuous
                 } else {
-                    self.model.covariance_dh(sep(*u, *v))
+                    c0 - self.model.gamma_dh(sep(*u, *v))
                 };
             }
         }
