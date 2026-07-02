@@ -433,11 +433,19 @@ mod tests {
         let fit = fit_anisotropic_kind(&samples, ModelKind::Spherical, 1.0, 120.0).unwrap();
         let s = fit.model.structures[0];
         let a = s.anis.unwrap();
-        assert!((fit.model.nugget - 0.1).abs() < 0.05, "nugget {}", fit.model.nugget);
+        assert!(
+            (fit.model.nugget - 0.1).abs() < 0.05,
+            "nugget {}",
+            fit.model.nugget
+        );
         assert!((s.sill - 0.9).abs() < 0.1, "sill {}", s.sill);
         assert!((s.range - 120.0).abs() < 20.0, "range {}", s.range);
         assert!((a.ratio - 0.4).abs() < 0.1, "ratio {}", a.ratio);
-        assert!(az_diff(a.azimuth_deg, 40.0) < 8.0, "azimuth {}", a.azimuth_deg);
+        assert!(
+            az_diff(a.azimuth_deg, 40.0) < 8.0,
+            "azimuth {}",
+            a.azimuth_deg
+        );
     }
 
     #[test]
@@ -459,18 +467,30 @@ mod tests {
         for _ in 0..400 {
             let x = rng.uniform() * 200.0;
             let y = rng.uniform() * 200.0;
-            let v: f64 = modes.iter().map(|&(ox, oy, ph)| (ox * x + oy * y + ph).cos()).sum();
+            let v: f64 = modes
+                .iter()
+                .map(|&(ox, oy, ph)| (ox * x + oy * y + ph).cos())
+                .sum();
             coords.push([x, y]);
             values.push(v);
         }
         let data = PointSet::new(coords, values).unwrap();
-        let fit =
-            fit_anisotropic(&data, &[ModelKind::Spherical, ModelKind::Exponential], 4, 12, 120.0)
-                .unwrap();
+        let fit = fit_anisotropic(
+            &data,
+            &[ModelKind::Spherical, ModelKind::Exponential],
+            4,
+            12,
+            120.0,
+        )
+        .unwrap();
         let a = fit.model.structures[0].anis.unwrap();
         // Major axis along x = azimuth 90; clearly anisotropic.
         assert!(a.ratio < 0.85, "ratio {}", a.ratio);
-        assert!(az_diff(a.azimuth_deg, 90.0) < 25.0, "azimuth {}", a.azimuth_deg);
+        assert!(
+            az_diff(a.azimuth_deg, 90.0) < 25.0,
+            "azimuth {}",
+            a.azimuth_deg
+        );
     }
 
     #[test]

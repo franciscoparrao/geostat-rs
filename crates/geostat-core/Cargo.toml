@@ -3,11 +3,13 @@ name = "geostat-core"
 description = "Geostatistics engine: variography, kriging and sequential Gaussian simulation"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 keywords = ["geostatistics", "kriging", "variogram", "simulation", "spatial"]
 categories = ["science", "mathematics"]
+readme = "../../README.md"
 
 [features]
 default = ["parallel"]

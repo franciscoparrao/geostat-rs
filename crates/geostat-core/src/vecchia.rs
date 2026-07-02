@@ -247,7 +247,11 @@ pub fn vecchia_mle<const D: usize>(
     // Initial scales: sample variance for the sill, a fraction of the domain
     // extent for the range.
     let mean = data.mean();
-    let var0 = (data.values().iter().map(|v| (v - mean).powi(2)).sum::<f64>()
+    let var0 = (data
+        .values()
+        .iter()
+        .map(|v| (v - mean).powi(2))
+        .sum::<f64>()
         / data.len() as f64)
         .max(1e-12);
     let coords = data.coords();
@@ -303,7 +307,11 @@ pub fn vecchia_mle<const D: usize>(
     let (xb, neg_ll) = nelder_mead(objective, &x0, 0.3, 2000);
     let model = VariogramModel::new(
         (xb[0] * var0).max(0.0),
-        vec![Structure::new(kind, (xb[1] * var0).max(1e-12), (xb[2] * range0).max(1e-12))],
+        vec![Structure::new(
+            kind,
+            (xb[1] * var0).max(1e-12),
+            (xb[2] * range0).max(1e-12),
+        )],
     )?;
     Ok(VecchiaFit {
         model,
@@ -411,7 +419,11 @@ fn reml_loglik_with_plan<const D: usize>(
             let uz = (z[i] - w.iter().zip(nb).map(|(&wj, &j)| wj * z[j]).sum::<f64>()) / sd;
             let uf: Vec<f64> = (0..p)
                 .map(|col| {
-                    (basis[i][col] - w.iter().zip(nb).map(|(&wj, &j)| wj * basis[j][col]).sum::<f64>())
+                    (basis[i][col]
+                        - w.iter()
+                            .zip(nb)
+                            .map(|(&wj, &j)| wj * basis[j][col])
+                            .sum::<f64>())
                         / sd
                 })
                 .collect();
@@ -520,7 +532,11 @@ fn reml_fit_with_basis<const D: usize>(
 
     // Initial scales from the GLS-residual variance about the trend.
     let mean = data.mean();
-    let var0 = (data.values().iter().map(|v| (v - mean).powi(2)).sum::<f64>()
+    let var0 = (data
+        .values()
+        .iter()
+        .map(|v| (v - mean).powi(2))
+        .sum::<f64>()
         / data.len() as f64)
         .max(1e-12);
     let coords = data.coords();
@@ -573,7 +589,11 @@ fn reml_fit_with_basis<const D: usize>(
     let (xb, neg_ll) = nelder_mead(objective, &x0, 0.3, 2000);
     let model = VariogramModel::new(
         (xb[0] * var0).max(0.0),
-        vec![Structure::new(kind, (xb[1] * var0).max(1e-12), (xb[2] * range0).max(1e-12))],
+        vec![Structure::new(
+            kind,
+            (xb[1] * var0).max(1e-12),
+            (xb[2] * range0).max(1e-12),
+        )],
     )?;
     Ok(VecchiaFit {
         model,
@@ -604,7 +624,11 @@ pub fn vecchia_param_se<const D: usize>(
     }
     let plan = vecchia_plan(data.coords(), m, order)?;
     let kind = model.structures[0].kind;
-    let theta = [model.nugget, model.structures[0].sill, model.structures[0].range];
+    let theta = [
+        model.nugget,
+        model.structures[0].sill,
+        model.structures[0].range,
+    ];
 
     // Negative log-likelihood at a parameter vector (reusing the plan).
     let nll = |p: &[f64; 3]| -> f64 {
@@ -662,7 +686,11 @@ pub fn vecchia_param_se<const D: usize>(
         let mut e = vec![0.0; 3];
         e[i] = 1.0;
         let col = lu.solve(e);
-        se[i] = if col[i] > 0.0 { col[i].sqrt() } else { f64::NAN };
+        se[i] = if col[i] > 0.0 {
+            col[i].sqrt()
+        } else {
+            f64::NAN
+        };
     }
     Ok(se)
 }
@@ -709,9 +737,11 @@ mod tests {
     #[test]
     fn full_conditioning_equals_exact() {
         let data = field(14, 3);
-        let model =
-            VariogramModel::new(0.05, vec![Structure::new(ModelKind::Exponential, 1.0, 40.0)])
-                .unwrap();
+        let model = VariogramModel::new(
+            0.05,
+            vec![Structure::new(ModelKind::Exponential, 1.0, 40.0)],
+        )
+        .unwrap();
         let exact = exact_loglik(&data, &model);
         // m >= n-1 -> every point conditions on all predecessors -> exact.
         let v = vecchia_loglik(&data, &model, data.len() - 1, None).unwrap();
@@ -721,14 +751,19 @@ mod tests {
     #[test]
     fn approximation_is_close_with_maxmin() {
         let data = field(90, 11);
-        let model =
-            VariogramModel::new(0.05, vec![Structure::new(ModelKind::Exponential, 1.0, 30.0)])
-                .unwrap();
+        let model = VariogramModel::new(
+            0.05,
+            vec![Structure::new(ModelKind::Exponential, 1.0, 30.0)],
+        )
+        .unwrap();
         let exact = exact_loglik(&data, &model);
         let approx = vecchia_loglik(&data, &model, 12, None).unwrap();
         // A modest conditioning size already tracks the exact log-likelihood.
         let rel = (approx - exact).abs() / exact.abs();
-        assert!(rel < 0.02, "rel err {rel}: approx {approx} vs exact {exact}");
+        assert!(
+            rel < 0.02,
+            "rel err {rel}: approx {approx} vs exact {exact}"
+        );
     }
 
     #[test]
@@ -744,8 +779,8 @@ mod tests {
     #[test]
     fn rejects_bad_args() {
         let data = field(10, 1);
-        let model =
-            VariogramModel::new(0.1, vec![Structure::new(ModelKind::Spherical, 1.0, 20.0)]).unwrap();
+        let model = VariogramModel::new(0.1, vec![Structure::new(ModelKind::Spherical, 1.0, 20.0)])
+            .unwrap();
         assert!(vecchia_loglik(&data, &model, 0, None).is_err());
     }
 
@@ -848,14 +883,19 @@ mod tests {
     #[test]
     fn reml_full_conditioning_equals_exact() {
         let data = field(16, 4);
-        let model =
-            VariogramModel::new(0.05, vec![Structure::new(ModelKind::Exponential, 1.0, 35.0)])
-                .unwrap();
+        let model = VariogramModel::new(
+            0.05,
+            vec![Structure::new(ModelKind::Exponential, 1.0, 35.0)],
+        )
+        .unwrap();
         let plan = vecchia_plan(data.coords(), data.len() - 1, None).unwrap();
         let basis = super::poly_basis(data.coords(), 1);
         let v = super::reml_loglik_with_plan(&data, &model, &plan, &basis).unwrap();
         let exact = exact_reml(&data, &model, 1);
-        assert!((v - exact).abs() < 1e-7, "vecchia REML {v} vs exact {exact}");
+        assert!(
+            (v - exact).abs() < 1e-7,
+            "vecchia REML {v} vs exact {exact}"
+        );
     }
 
     /// Lower Cholesky factor of an SPD matrix (row-major), for drawing a GP.
@@ -889,9 +929,11 @@ mod tests {
         let coords: Vec<[f64; 2]> = (0..n)
             .map(|_| [rng.uniform() * 60.0, rng.uniform() * 60.0])
             .collect();
-        let truth =
-            VariogramModel::new(0.05, vec![Structure::new(ModelKind::Exponential, 1.0, 10.0)])
-                .unwrap();
+        let truth = VariogramModel::new(
+            0.05,
+            vec![Structure::new(ModelKind::Exponential, 1.0, 10.0)],
+        )
+        .unwrap();
         let mut cov = vec![0.0; n * n];
         for a in 0..n {
             for b in 0..n {
@@ -914,7 +956,10 @@ mod tests {
             reml_r < ml_r,
             "REML range {reml_r} should be below constant-mean ML range {ml_r}"
         );
-        assert!(reml_r < 40.0, "REML range {reml_r} should be near the truth (10)");
+        assert!(
+            reml_r < 40.0,
+            "REML range {reml_r} should be near the truth (10)"
+        );
     }
 
     #[test]
@@ -932,9 +977,11 @@ mod tests {
             .iter()
             .map(|p| (-((p[0] - 30.0).powi(2) + (p[1] - 30.0).powi(2)) / 200.0).exp())
             .collect();
-        let truth =
-            VariogramModel::new(0.05, vec![Structure::new(ModelKind::Exponential, 1.0, 10.0)])
-                .unwrap();
+        let truth = VariogramModel::new(
+            0.05,
+            vec![Structure::new(ModelKind::Exponential, 1.0, 10.0)],
+        )
+        .unwrap();
         let mut sig = vec![0.0; n * n];
         for a in 0..n {
             for b in 0..n {
@@ -951,7 +998,10 @@ mod tests {
         let drift: Vec<Vec<f64>> = cov.iter().map(|&c| vec![c]).collect();
         let fit = vecchia_reml_drift(&data, ModelKind::Exponential, 8, &drift, None).unwrap();
         let r = fit.model.structures[0].range;
-        assert!(r < 40.0, "covariate-REML range {r} should be near the truth (10)");
+        assert!(
+            r < 40.0,
+            "covariate-REML range {r} should be near the truth (10)"
+        );
     }
 
     #[test]

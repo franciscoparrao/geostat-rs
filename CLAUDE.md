@@ -47,10 +47,12 @@ bindings modernos). No hay un motor geoestadístico Rust con WASM/Python.
       estimador GLS distinto — ver notas). Lognormal expuesto en PyO3.
 - [x] (v0.6) **Puente con TGPY**: kriging con transporte (warped kriging) — núcleo
       marginal de Transport Gaussian Processes (Rios & Tobar). Transportes
-      marginales aprendibles (Box-Cox, Yeo-Johnson, sinh-arcsinh) ajustados por ML
-      (módulo `tgp`); kriging latente + back-transform Monte Carlo → E-type + std +
-      cuantiles. Anclado al lognormal analítico (gstat-validado) a <1%. CLI `tgp`,
-      Python `warped_kriging`. Nelder-Mead extraído a `optim`.
+      marginales aprendibles (Box-Cox, Yeo-Johnson, sinh-arcsinh) ajustados por ML;
+      kriging latente + back-transform Monte Carlo → E-type + std + cuantiles.
+      Anclado al lognormal analítico (gstat-validado) a <1%. Nelder-Mead extraído
+      a `optim`. **NOTA (2026-06):** el módulo `tgp`, el CLI `tgp` y
+      `warped_kriging` fueron **extraídos a un crate privado separado**
+      (commit `88ed567`); en este repo solo queda `optim` como legado de v0.6.
 - [ ] (futuro) Draft paper; transportes compuestos/SVGD; GeoPackage I/O para SurtGIS;
       aplicar warped kriging a los datos de relaves de TGPY (Dulcinea, El Mauro).
 
@@ -93,3 +95,6 @@ Computers & Geosciences.
    × (Meuse + Walker Lake + sintético 3-D), benchmark 7× vs gstat en SGS,
    reproducibilidad determinista cross-platform, bindings Python/WASM, 2-D y
    3-D desde un solo motor const-genérico.
+9. Auditoría técnica completa (2026-07-02): `docs/AUDIT-2026-07.md` — roadmap
+   en 4 fases hacia estado del arte. Fase 0 ejecutada: fix block kriging 3-D,
+   detección de duplicados, metadata/CI, unificación ridge + helpers al core.

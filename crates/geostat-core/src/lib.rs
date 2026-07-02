@@ -82,12 +82,12 @@ pub use trans::{LognormalEstimate, lognormal_kriging};
 pub use transform::NormalScore;
 pub use tuning::{TuneResult, tune_idw_power, tune_knn_k, tune_kriging_neighbors};
 pub use validation::{CvResult, k_fold, leave_one_out, leave_one_out_with_drift};
-pub use vecchia::{
-    VecchiaFit, VecchiaPlan, maxmin_order, vecchia_loglik, vecchia_mle, vecchia_param_se,
-    vecchia_plan, vecchia_reml, vecchia_reml_drift,
-};
 pub use variogram::{
     Anisotropy, DirectionConfig, ExperimentalVariogram, FitResult, LagBin, ModelKind, Structure,
     VariogramConfig, VariogramMap, VariogramModel, experimental_cross_variogram,
     experimental_variogram, fit_anisotropic, fit_best, fit_model, variogram_map,
+};
+pub use vecchia::{
+    VecchiaFit, VecchiaPlan, maxmin_order, vecchia_loglik, vecchia_mle, vecchia_param_se,
+    vecchia_plan, vecchia_reml, vecchia_reml_drift,
 };

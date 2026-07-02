@@ -9,11 +9,11 @@
 
 use std::time::Instant;
 
+use geostat_core::PointSet;
 use geostat_core::linalg::lu_factor;
 use geostat_core::rng::Rng;
 use geostat_core::variogram::{ModelKind, Structure, VariogramModel};
 use geostat_core::vecchia::{vecchia_loglik, vecchia_mle};
-use geostat_core::PointSet;
 
 fn exact_loglik(data: &PointSet, model: &VariogramModel) -> f64 {
     let n = data.len();
@@ -48,11 +48,17 @@ fn field(n: usize) -> PointSet {
 }
 
 fn main() {
-    let model =
-        VariogramModel::new(0.05, vec![Structure::new(ModelKind::Exponential, 1.0, 200.0)]).unwrap();
+    let model = VariogramModel::new(
+        0.05,
+        vec![Structure::new(ModelKind::Exponential, 1.0, 200.0)],
+    )
+    .unwrap();
     let m = 20;
     println!("Vecchia (m={m}) vs exact Gaussian log-likelihood\n");
-    println!("{:>7}  {:>12}  {:>12}  {:>10}", "n", "vecchia (ms)", "exact (ms)", "rel.err");
+    println!(
+        "{:>7}  {:>12}  {:>12}  {:>10}",
+        "n", "vecchia (ms)", "exact (ms)", "rel.err"
+    );
     for &n in &[500usize, 1000, 2000, 4000, 8000] {
         let data = field(n);
 

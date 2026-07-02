@@ -12,7 +12,8 @@ version = "0.6.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Francisco Parra-O."]
-repository = "https://github.com/fparrao/geostat-rs"
+repository = "https://github.com/franciscoparrao/geostat-rs"
+rust-version = "1.88"
 
 [workspace.dependencies]
 ndarray = "0.16"

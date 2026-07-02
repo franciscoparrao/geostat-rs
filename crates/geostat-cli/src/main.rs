@@ -636,7 +636,10 @@ fn run_gpkg_info(cmd: GpkgInfoCmd) -> Result<()> {
         }
     }
     if !rasters.is_empty() {
-        println!("Raster (2D gridded coverage) layers in {}:", cmd.input.display());
+        println!(
+            "Raster (2D gridded coverage) layers in {}:",
+            cmd.input.display()
+        );
         println!("  {:<24}{:<14}{:>10}", "layer", "size", "srs_id");
         for name in &rasters {
             match gpkg::read_raster(&cmd.input, Some(name)) {
@@ -951,7 +954,11 @@ fn run_vmap(cmd: VmapCmd) -> Result<()> {
             let (hx, hy) = m.lag(ix, iy);
             let g = m.gamma_at(ix, iy);
             let np = m.n_pairs[iy * m.size + ix];
-            let gstr = if g.is_finite() { g.to_string() } else { String::new() };
+            let gstr = if g.is_finite() {
+                g.to_string()
+            } else {
+                String::new()
+            };
             out.push_str(&format!("{hx},{hy},{gstr},{np}\n"));
         }
     }
@@ -1020,7 +1027,10 @@ fn anisotropic_report(data: &PointSet<2>, cmd: &VariogramCmd) -> Result<()> {
     println!("  partial sill:    {:.4}", s.sill);
     println!("  major range:     {:.4}", s.range);
     println!("  minor range:     {:.4}", s.range * a.ratio);
-    println!("  major azimuth:   {:.2} deg (clockwise from north)", a.azimuth_deg);
+    println!(
+        "  major azimuth:   {:.2} deg (clockwise from north)",
+        a.azimuth_deg
+    );
     println!("  ratio (min/maj): {:.4}", a.ratio);
     println!("  weighted SSE:    {:.6e}", fit.wsse);
     if a.ratio > 0.95 {

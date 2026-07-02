@@ -190,8 +190,12 @@ fn block_kriging_3d_uses_z_separation() {
 
     // A vertical discretization must feed z into the point-to-block
     // covariances: spreading the block along z changes the estimate.
-    let degenerate = k.predict_block(center, &[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]).unwrap();
-    let vertical = k.predict_block(center, &[[0.0, 0.0, -5.0], [0.0, 0.0, 5.0]]).unwrap();
+    let degenerate = k
+        .predict_block(center, &[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+        .unwrap();
+    let vertical = k
+        .predict_block(center, &[[0.0, 0.0, -5.0], [0.0, 0.0, 5.0]])
+        .unwrap();
     assert!(
         (vertical.value - degenerate.value).abs() > 1e-6,
         "z offsets ignored: {} == {}",

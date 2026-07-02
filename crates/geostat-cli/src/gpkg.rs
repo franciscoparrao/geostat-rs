@@ -721,9 +721,7 @@ fn decode_png_u16(blob: &[u8], tw: usize, th: usize) -> Result<Vec<u16>> {
     let info = reader
         .next_frame(&mut buf)
         .map_err(|e| anyhow::anyhow!("PNG data: {e}"))?;
-    if info.bit_depth != png::BitDepth::Sixteen
-        || info.color_type != png::ColorType::Grayscale
-    {
+    if info.bit_depth != png::BitDepth::Sixteen || info.color_type != png::ColorType::Grayscale {
         bail!(
             "tile is {:?}/{:?}; expected 16-bit grayscale",
             info.bit_depth,
@@ -943,13 +941,25 @@ mod tests {
 
         // 16-bit quantisation: reconstructed values within one scale step, and
         // the no-data cell stays NaN.
-        let span = (values.iter().copied().filter(|v| v.is_finite()).fold(f64::NEG_INFINITY, f64::max)
-            - values.iter().copied().filter(|v| v.is_finite()).fold(f64::INFINITY, f64::min))
-            .max(f64::MIN_POSITIVE);
+        let span = (values
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(f64::NEG_INFINITY, f64::max)
+            - values
+                .iter()
+                .copied()
+                .filter(|v| v.is_finite())
+                .fold(f64::INFINITY, f64::min))
+        .max(f64::MIN_POSITIVE);
         let step = span / 65534.0;
         for (i, &v) in values.iter().enumerate() {
             if v.is_finite() {
-                assert!((g.values[i] - v).abs() <= step + 1e-9, "cell {i}: {} vs {v}", g.values[i]);
+                assert!(
+                    (g.values[i] - v).abs() <= step + 1e-9,
+                    "cell {i}: {} vs {v}",
+                    g.values[i]
+                );
             } else {
                 assert!(g.values[i].is_nan(), "cell {i} should be NaN");
             }

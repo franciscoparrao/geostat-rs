@@ -241,10 +241,14 @@ pub fn k_fold<const D: usize>(
 
     // Each fold trains on all points outside it and predicts its own members.
     let per_fold: Vec<Vec<(usize, f64, f64)>> = par_try_map(k, |f| {
-        let train_coords: Vec<[f64; D]> =
-            (0..n).filter(|&i| fold_of[i] != f).map(|i| data.coord(i)).collect();
-        let train_vals: Vec<f64> =
-            (0..n).filter(|&i| fold_of[i] != f).map(|i| data.value(i)).collect();
+        let train_coords: Vec<[f64; D]> = (0..n)
+            .filter(|&i| fold_of[i] != f)
+            .map(|i| data.coord(i))
+            .collect();
+        let train_vals: Vec<f64> = (0..n)
+            .filter(|&i| fold_of[i] != f)
+            .map(|i| data.value(i))
+            .collect();
         let train = PointSet::new(train_coords, train_vals)?;
         let kriging = Kriging::new(&train, model, config.clone())?;
         let mut out = Vec::with_capacity(members[f].len());
