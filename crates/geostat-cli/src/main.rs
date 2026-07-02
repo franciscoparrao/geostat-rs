@@ -446,6 +446,16 @@ struct SgsCmd {
     /// to choose a size)
     #[arg(long)]
     declus: Option<f64>,
+    /// Separate quota for previously simulated nodes (GSLIB nodmax): each
+    /// neighborhood takes up to --max-neighbors data plus this many nodes,
+    /// so simulated nodes cannot crowd out the hard data
+    #[arg(long)]
+    nodmax: Option<usize>,
+    /// Multiple-grid simulation levels (GSLIB nmult): coarsest sub-grid
+    /// (stride 2^levels) first, then refinements; improves long-range
+    /// variogram reproduction on dense grids
+    #[arg(long, default_value_t = 0)]
+    multigrid: u8,
     /// Output CSV file (x,y,sim1..simN)
     #[arg(short, long)]
     output: PathBuf,
@@ -1676,6 +1686,8 @@ fn run_sgs(cmd: SgsCmd) -> Result<()> {
             upper_bound: cmd.zmax,
         },
         decluster_weights,
+        max_node_neighbors: cmd.nodmax,
+        multigrid: cmd.multigrid,
     };
     let res = sequential_gaussian_simulation(&data, &model_ns, &grid, &cfg)?;
 

@@ -1004,7 +1004,7 @@ fn decluster_weights(
 #[pyo3(signature = (x, y, values, model_ns, bbox, nx, ny, n_realizations = 10,
     seed = 42, max_neighbors = 16, radius = None,
     lower_tail = "none", upper_tail = "none", zmin = None, zmax = None,
-    decluster_cell = None))]
+    decluster_cell = None, max_node_neighbors = None, multigrid = 0))]
 #[allow(clippy::too_many_arguments)]
 fn sgs(
     x: Vec<f64>,
@@ -1023,6 +1023,8 @@ fn sgs(
     zmin: Option<f64>,
     zmax: Option<f64>,
     decluster_cell: Option<f64>,
+    max_node_neighbors: Option<usize>,
+    multigrid: u8,
 ) -> PyResult<Vec<Vec<f64>>> {
     let data = point_set(x, y, values)?;
     let grid = Grid2D::from_bbox([bbox.0, bbox.1], [bbox.2, bbox.3], nx, ny).map_err(err)?;
@@ -1042,6 +1044,8 @@ fn sgs(
             upper_bound: zmax,
         },
         decluster_weights,
+        max_node_neighbors,
+        multigrid,
     };
     let res =
         core::sequential_gaussian_simulation(&data, &model_ns.inner, &grid, &cfg).map_err(err)?;

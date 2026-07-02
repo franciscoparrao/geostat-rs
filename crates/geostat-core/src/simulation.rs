@@ -41,6 +41,19 @@ pub struct SgsConfig {
     /// normal-score reference distribution is fitted with them so
     /// preferential sampling does not bias the simulated histogram.
     pub decluster_weights: Option<Vec<f64>>,
+    /// Separate quota for previously simulated nodes (GSLIB `nodmax`).
+    /// When set, each neighborhood takes up to `max_neighbors` original
+    /// data **plus** up to this many simulated nodes, so dense simulated
+    /// nodes cannot crowd the hard data out of the conditioning set. The
+    /// default `None` keeps a single shared pool of `max_neighbors`
+    /// (data and nodes competing by distance).
+    pub max_node_neighbors: Option<usize>,
+    /// Multiple-grid simulation levels (GSLIB `nmult`; grid entry points
+    /// only): nodes on the coarsest sub-grid (stride `2^multigrid`) are
+    /// simulated first, then each refinement, random within a level. This
+    /// improves long-range variogram reproduction on dense grids. `0`
+    /// (default) keeps a fully random path.
+    pub multigrid: u8,
 }
 
 impl Default for SgsConfig {
@@ -52,6 +65,8 @@ impl Default for SgsConfig {
             search_radius: None,
             tails: Tails::default(),
             decluster_weights: None,
+            max_node_neighbors: None,
+            multigrid: 0,
         }
     }
 }
@@ -75,7 +90,12 @@ pub fn sequential_gaussian_simulation(
     grid: &Grid2D,
     cfg: &SgsConfig,
 ) -> Result<SgsResult> {
-    let realizations = sgs_at(data, model_ns, &grid.centers(), cfg)?;
+    let levels = (cfg.multigrid > 0).then(|| {
+        (0..grid.n_cells())
+            .map(|i| grid_level(&[i % grid.nx, i / grid.nx], cfg.multigrid))
+            .collect::<Vec<u8>>()
+    });
+    let realizations = sgs_at_with_levels(data, model_ns, &grid.centers(), levels.as_deref(), cfg)?;
     Ok(SgsResult {
         grid: grid.clone(),
         realizations,
@@ -90,15 +110,45 @@ pub fn sequential_gaussian_simulation_3d(
     grid: &crate::grid::Grid3D,
     cfg: &SgsConfig,
 ) -> Result<Vec<Vec<f64>>> {
-    sgs_at(data, model_ns, &grid.centers(), cfg)
+    let levels = (cfg.multigrid > 0).then(|| {
+        (0..grid.n_cells())
+            .map(|i| {
+                let ix = i % grid.nx;
+                let iy = (i / grid.nx) % grid.ny;
+                let iz = i / (grid.nx * grid.ny);
+                grid_level(&[ix, iy, iz], cfg.multigrid)
+            })
+            .collect::<Vec<u8>>()
+    });
+    sgs_at_with_levels(data, model_ns, &grid.centers(), levels.as_deref(), cfg)
+}
+
+/// Multigrid level of a grid cell: the largest `g <= max_level` such that
+/// every index is a multiple of `2^g` (coarser sub-grids get higher levels).
+fn grid_level(idx: &[usize], max_level: u8) -> u8 {
+    (0..=max_level)
+        .rev()
+        .find(|&g| idx.iter().all(|&i| i % (1usize << g) == 0))
+        .unwrap_or(0)
 }
 
 /// SGS at an arbitrary set of simulation nodes (sequential path over the
-/// node list).
+/// node list). `multigrid` is ignored here (it needs grid topology); use
+/// the grid entry points for multiple-grid simulation.
 pub fn sgs_at<const D: usize>(
     data: &PointSet<D>,
     model_ns: &VariogramModel,
     nodes: &[[f64; D]],
+    cfg: &SgsConfig,
+) -> Result<Vec<Vec<f64>>> {
+    sgs_at_with_levels(data, model_ns, nodes, None, cfg)
+}
+
+fn sgs_at_with_levels<const D: usize>(
+    data: &PointSet<D>,
+    model_ns: &VariogramModel,
+    nodes: &[[f64; D]],
+    levels: Option<&[u8]>,
     cfg: &SgsConfig,
 ) -> Result<Vec<Vec<f64>>> {
     if cfg.n_realizations == 0 {
@@ -139,56 +189,126 @@ pub fn sgs_at<const D: usize>(
     };
     let data_scores: Vec<f64> = data.values().iter().map(|&v| ns.transform(v)).collect();
 
-    crate::parallel::par_try_map(cfg.n_realizations, |r| {
-        let mut seed_state = cfg.seed ^ (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let seed_r = splitmix64(&mut seed_state);
-        simulate_one(data, &data_scores, &ns, model_ns, nodes, cfg, seed_r)
-    })
-}
-
-fn simulate_one<const D: usize>(
-    data: &PointSet<D>,
-    data_scores: &[f64],
-    ns: &NormalScore,
-    model: &VariogramModel,
-    centers: &[[f64; D]],
-    cfg: &SgsConfig,
-    seed: u64,
-) -> Result<Vec<f64>> {
-    let mut rng = Rng::new(seed);
-    let n_cells = centers.len();
-    let c0 = model.covariance_dh([0.0; D]);
-    // Tiny diagonal stabilizer: previously simulated nodes can sit arbitrarily
-    // close to data points, which makes exact systems near-singular.
-    let stabilizer = c0 * 1e-9;
-
-    let mut path: Vec<usize> = (0..n_cells).collect();
-    rng.shuffle(&mut path);
-
-    // Conditioning store: bucket grid covering data and simulation extents.
+    // Extents covering data and nodes, shared by both search structures.
     let (dmin, dmax) = data.bbox();
     let mut min = dmin;
     let mut max = dmax;
-    for c in centers {
+    for c in nodes {
         for d in 0..D {
             min[d] = min[d].min(c[d]);
             max[d] = max[d].max(c[d]);
         }
     }
-    let mut search = BucketGrid::new(min, max, data.len() + n_cells);
+    // Static store of the original data, built once and shared across
+    // realizations (only simulated nodes change per realization).
+    let mut data_grid = BucketGrid::new(min, max, data.len());
+    for &p in data.coords() {
+        data_grid.insert(p);
+    }
+
+    crate::parallel::par_try_map(cfg.n_realizations, |r| {
+        let mut seed_state = cfg.seed ^ (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let seed_r = splitmix64(&mut seed_state);
+        simulate_one(
+            data,
+            &data_scores,
+            &data_grid,
+            &ns,
+            model_ns,
+            nodes,
+            levels,
+            (min, max),
+            cfg,
+            seed_r,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn simulate_one<const D: usize>(
+    data: &PointSet<D>,
+    data_scores: &[f64],
+    data_grid: &BucketGrid<D>,
+    ns: &NormalScore,
+    model: &VariogramModel,
+    centers: &[[f64; D]],
+    levels: Option<&[u8]>,
+    extents: ([f64; D], [f64; D]),
+    cfg: &SgsConfig,
+    seed: u64,
+) -> Result<Vec<f64>> {
+    let mut rng = Rng::new(seed);
+    let n_cells = centers.len();
+    let n_data = data.len();
+    let c0 = model.covariance_dh([0.0; D]);
+    // Tiny diagonal stabilizer: previously simulated nodes can sit arbitrarily
+    // close to data points, which makes exact systems near-singular.
+    let stabilizer = c0 * 1e-9;
+
+    // Random path; with multigrid levels, coarse levels first (stable sort
+    // keeps the shuffle within each level).
+    let mut path: Vec<usize> = (0..n_cells).collect();
+    rng.shuffle(&mut path);
+    if let Some(levels) = levels {
+        path.sort_by_key(|&i| std::cmp::Reverse(levels[i]));
+    }
+
+    // Simulated nodes get their own store; the data store is shared.
+    let (min, max) = extents;
+    let mut node_grid = BucketGrid::new(min, max, n_cells);
     let mut cond_coords: Vec<[f64; D]> = data.coords().to_vec();
     let mut cond_vals: Vec<f64> = data_scores.to_vec();
-    for &p in data.coords() {
-        search.insert(p);
-    }
+
+    // Quotas: `max_neighbors` original data plus `nodmax` simulated nodes
+    // (GSLIB ndmax/nodmax). Without an explicit nodmax the two candidate
+    // lists are merged by distance and truncated to `max_neighbors`,
+    // reproducing the previous single-pool behavior.
+    let nodmax = cfg.max_node_neighbors.unwrap_or(cfg.max_neighbors);
+    let single_pool = cfg.max_node_neighbors.is_none();
+
     let mut sim_ns = vec![0.0_f64; n_cells];
     // Workspaces reused across the whole realization: this is the engine's
     // hottest loop, and per-node allocation dominated it.
     let mut ws = SkWorkspace::default();
+    let mut nb: Vec<usize> = Vec::new();
+
+    let d2 = |a: [f64; D], b: [f64; D]| -> f64 {
+        let mut s = 0.0;
+        for d in 0..D {
+            let dd = a[d] - b[d];
+            s += dd * dd;
+        }
+        s
+    };
 
     for &cell in &path {
         let target = centers[cell];
-        let nb = search.k_nearest(target, cfg.max_neighbors, cfg.search_radius);
+        let nd = data_grid.k_nearest(target, cfg.max_neighbors, cfg.search_radius);
+        let nn = node_grid.k_nearest(target, nodmax, cfg.search_radius);
+
+        // Merge the two distance-ascending lists (node indices offset by
+        // n_data into the conditioning arrays).
+        nb.clear();
+        let (mut a, mut b) = (0, 0);
+        while a < nd.len() || b < nn.len() {
+            let take_data = match (nd.get(a), nn.get(b)) {
+                (Some(&i), Some(&j)) => {
+                    d2(target, cond_coords[i]) <= d2(target, cond_coords[n_data + j])
+                }
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if take_data {
+                nb.push(nd[a]);
+                a += 1;
+            } else {
+                nb.push(n_data + nn[b]);
+                b += 1;
+            }
+        }
+        if single_pool {
+            nb.truncate(cfg.max_neighbors);
+        }
 
         let (mean, var) = if nb.is_empty() {
             (0.0, c0)
@@ -207,7 +327,7 @@ fn simulate_one<const D: usize>(
 
         let z = mean + var.max(0.0).sqrt() * rng.normal();
         sim_ns[cell] = z;
-        search.insert(target);
+        node_grid.insert(target);
         cond_coords.push(target);
         cond_vals.push(z);
     }
@@ -317,6 +437,59 @@ mod tests {
         let cfg2 = SgsConfig { seed: 124, ..cfg };
         let c = sequential_gaussian_simulation(&data, &model, &grid, &cfg2).unwrap();
         assert_ne!(a.realizations[0], c.realizations[0]);
+    }
+
+    #[test]
+    fn grid_level_assigns_coarse_subgrids() {
+        assert_eq!(grid_level(&[0, 0], 3), 3);
+        assert_eq!(grid_level(&[8, 8], 3), 3);
+        assert_eq!(grid_level(&[4, 0], 3), 2);
+        assert_eq!(grid_level(&[2, 2], 3), 1);
+        assert_eq!(grid_level(&[3, 1], 3), 0);
+        assert_eq!(grid_level(&[6, 4], 3), 1);
+    }
+
+    #[test]
+    fn multigrid_and_node_quota_run_reproducibly() {
+        let (data, model, grid) = setup();
+        let base = SgsConfig {
+            n_realizations: 3,
+            seed: 11,
+            max_neighbors: 12,
+            search_radius: None,
+            ..Default::default()
+        };
+        let plain = sequential_gaussian_simulation(&data, &model, &grid, &base).unwrap();
+        // Multigrid path: reproducible, in bounds, and a different (still
+        // valid) realization than the fully random path.
+        let mg_cfg = SgsConfig {
+            multigrid: 2,
+            ..base.clone()
+        };
+        let mg1 = sequential_gaussian_simulation(&data, &model, &grid, &mg_cfg).unwrap();
+        let mg2 = sequential_gaussian_simulation(&data, &model, &grid, &mg_cfg).unwrap();
+        assert_eq!(mg1.realizations, mg2.realizations);
+        assert_ne!(mg1.realizations, plain.realizations);
+        // Separate node quota (GSLIB nodmax): reproducible and distinct.
+        let quota_cfg = SgsConfig {
+            max_node_neighbors: Some(8),
+            ..base
+        };
+        let q1 = sequential_gaussian_simulation(&data, &model, &grid, &quota_cfg).unwrap();
+        let q2 = sequential_gaussian_simulation(&data, &model, &grid, &quota_cfg).unwrap();
+        assert_eq!(q1.realizations, q2.realizations);
+        assert_ne!(q1.realizations, plain.realizations);
+        let (lo, hi) = data
+            .values()
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), &v| {
+                (l.min(v), h.max(v))
+            });
+        for r in mg1.realizations.iter().chain(&q1.realizations) {
+            for &v in r {
+                assert!(v >= lo - 1e-9 && v <= hi + 1e-9);
+            }
+        }
     }
 
     #[test]
