@@ -102,5 +102,15 @@ Computers & Geosciences.
    ltail/utail en SGS/SIS/IK, Goulard–Voltz iterativo, cell declustering +
    nscore ponderado, octantes/ndmin, error de medición estilo gstat Err).
    Paridad gstat extendida: `validation/compare_v07.py` (residuos 3e-15,
-   Err 2.5e-14). Siguen Fase 2 (escalabilidad Vecchia/SGS — material del
-   2º paper) y Fase 3 (diferenciación).
+   Err 2.5e-14). **Fase 2 ejecutada** (escalabilidad): plan Vecchia
+   O(n log n) exacto (maxmin lazy-heap + predecesores incrementales; n=2e5
+   en 23 s, antes ~5 min), shell walk por superficie en BucketGrid (H13),
+   Cholesky SPD + workspaces en hot loops (loglik 1.74×, MLE 1.6×, mismo
+   resultado), predicción Vecchia K&G (`vecchia_predict`, == SK exacto a
+   condicionamiento completo; CLI `krige --vecchia`, Python
+   `vecchia_krige`), SGS con cuotas ndmax/nodmax y camino multigrid
+   (`--nodmax`, `--multigrid`). Walker re-validado distribucionalmente
+   (1000 realizaciones en 2.6 s). Pendiente de Fase 2: grouping de
+   Guinness, SIMD en covarianzas, log-parametrización + multi-start.
+   Sigue Fase 3 (diferenciación: Matérn ν continuo, MM1/MM2, block CV
+   espacial, rotación 3-D completa).
