@@ -27,6 +27,7 @@ use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
 use crate::linalg::{lu_factor, solve};
 use crate::optim::nelder_mead;
+use crate::search::BucketGrid;
 use crate::variogram::{ModelKind, Structure, VariogramModel};
 
 /// Squared Euclidean distance between two points.
@@ -48,11 +49,41 @@ fn sep<const D: usize>(a: &[f64; D], b: &[f64; D]) -> [f64; D] {
     h
 }
 
+/// Heap key for the lazy farthest-point traversal: max by squared distance,
+/// ties broken toward the larger index (matching the previous `max_by`
+/// implementation, which returned the last maximal element).
+#[derive(PartialEq)]
+struct MaxminKey {
+    d2: f64,
+    idx: usize,
+}
+
+impl Eq for MaxminKey {}
+
+impl Ord for MaxminKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.d2.total_cmp(&other.d2).then(self.idx.cmp(&other.idx))
+    }
+}
+
+impl PartialOrd for MaxminKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// Max-min (farthest-point) ordering: start near the centroid, then repeatedly
 /// append the point whose minimum distance to the already-ordered set is
 /// largest. This spreads early points across the domain, which makes the
 /// Vecchia approximation accurate at small conditioning sizes.
+///
+/// Exact farthest-point traversal in `O(n log n)`-like time: each point's
+/// key (squared distance to the selected set) can only *decrease* as points
+/// are selected, so a max-heap with lazy re-evaluation is exact — pop the
+/// stale top, refresh its key against the current selected set (bucket-grid
+/// nearest-neighbor query), and select it if it still dominates.
 pub fn maxmin_order<const D: usize>(coords: &[[f64; D]]) -> Vec<usize> {
+    use std::collections::BinaryHeap;
     let n = coords.len();
     if n == 0 {
         return Vec::new();
@@ -66,50 +97,62 @@ pub fn maxmin_order<const D: usize>(coords: &[[f64; D]]) -> Vec<usize> {
     }
     let first = (0..n)
         .min_by(|&i, &j| dist2(&coords[i], &c).total_cmp(&dist2(&coords[j], &c)))
-        .unwrap();
+        .expect("n > 0");
 
-    let mut order = Vec::with_capacity(n);
-    let mut chosen = vec![false; n];
-    let mut min_d2 = vec![f64::INFINITY; n];
-    order.push(first);
-    chosen[first] = true;
-    for i in 0..n {
-        min_d2[i] = dist2(&coords[i], &coords[first]);
+    let mut min = coords[0];
+    let mut max = coords[0];
+    for p in coords {
+        for d in 0..D {
+            min[d] = min[d].min(p[d]);
+            max[d] = max[d].max(p[d]);
+        }
     }
-    for _ in 1..n {
-        let next = (0..n)
-            .filter(|&i| !chosen[i])
-            .max_by(|&i, &j| min_d2[i].total_cmp(&min_d2[j]))
-            .unwrap();
-        order.push(next);
-        chosen[next] = true;
-        for i in 0..n {
-            if !chosen[i] {
-                min_d2[i] = min_d2[i].min(dist2(&coords[i], &coords[next]));
-            }
+    let mut selected_grid = BucketGrid::new(min, max, n);
+    let mut selected_coords: Vec<[f64; D]> = Vec::with_capacity(n);
+    let mut order = Vec::with_capacity(n);
+    order.push(first);
+    selected_grid.insert(coords[first]);
+    selected_coords.push(coords[first]);
+
+    let mut heap: BinaryHeap<MaxminKey> = (0..n)
+        .filter(|&i| i != first)
+        .map(|i| MaxminKey {
+            d2: dist2(&coords[i], &coords[first]),
+            idx: i,
+        })
+        .collect();
+
+    // While the selected set is small, a linear scan is cheaper (and avoids
+    // long shell walks in the bucket grid when the nearest point is far).
+    const BRUTE_LIMIT: usize = 48;
+    while let Some(top) = heap.pop() {
+        let i = top.idx;
+        // Refresh the stale key against the current selected set.
+        let current = if selected_coords.len() <= BRUTE_LIMIT {
+            selected_coords
+                .iter()
+                .map(|s| dist2(&coords[i], s))
+                .fold(f64::INFINITY, f64::min)
+        } else {
+            let nb = selected_grid.k_nearest(coords[i], 1, None);
+            dist2(&coords[i], &selected_coords[nb[0]])
+        };
+        let refreshed = MaxminKey {
+            d2: current,
+            idx: i,
+        };
+        // Keys only decrease, so the other entries' stale keys are upper
+        // bounds: if the refreshed key still dominates the heap top, `i` is
+        // the true farthest point.
+        if heap.peek().is_none_or(|next| refreshed >= *next) {
+            order.push(i);
+            selected_grid.insert(coords[i]);
+            selected_coords.push(coords[i]);
+        } else {
+            heap.push(refreshed);
         }
     }
     order
-}
-
-/// The `m` nearest predecessors of `coords[target]` among `prev` (indices of
-/// already-ordered points), by Euclidean distance.
-fn nearest_predecessors<const D: usize>(
-    coords: &[[f64; D]],
-    target: usize,
-    prev: &[usize],
-    m: usize,
-) -> Vec<usize> {
-    if prev.len() <= m {
-        return prev.to_vec();
-    }
-    let mut scored: Vec<(f64, usize)> = prev
-        .iter()
-        .map(|&j| (dist2(&coords[target], &coords[j]), j))
-        .collect();
-    scored.select_nth_unstable_by(m - 1, |a, b| a.0.total_cmp(&b.0));
-    scored.truncate(m);
-    scored.into_iter().map(|(_, j)| j).collect()
 }
 
 /// A reusable Vecchia conditioning structure: the point ordering and, for each
@@ -158,9 +201,24 @@ pub fn vecchia_plan<const D: usize>(
         }
         None => maxmin_order(coords),
     };
-    let neighbours = (0..n)
-        .map(|k| nearest_predecessors(coords, order[k], &order[..k], m))
-        .collect();
+    // Nearest predecessors by incremental insertion: after inserting the
+    // first k ordered points, a k-nearest query sees exactly the
+    // predecessors of point k (bucket-grid indices are insertion order).
+    let mut min = coords[0];
+    let mut max = coords[0];
+    for p in coords {
+        for d in 0..D {
+            min[d] = min[d].min(p[d]);
+            max[d] = max[d].max(p[d]);
+        }
+    }
+    let mut grid = BucketGrid::new(min, max, n);
+    let mut neighbours = Vec::with_capacity(n);
+    for &i in &order {
+        let nb = grid.k_nearest(coords[i], m, None);
+        neighbours.push(nb.into_iter().map(|pos| order[pos]).collect());
+        grid.insert(coords[i]);
+    }
     Ok(VecchiaPlan { order, neighbours })
 }
 
@@ -774,6 +832,76 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), 50, "ordering must be a permutation");
+    }
+
+    /// Reference O(n^2) farthest-point traversal (the pre-v0.7 code) used to
+    /// verify the lazy-heap implementation is exact.
+    fn maxmin_order_brute<const D: usize>(coords: &[[f64; D]]) -> Vec<usize> {
+        let n = coords.len();
+        let mut c = [0.0; D];
+        for p in coords {
+            for d in 0..D {
+                c[d] += p[d] / n as f64;
+            }
+        }
+        let first = (0..n)
+            .min_by(|&i, &j| dist2(&coords[i], &c).total_cmp(&dist2(&coords[j], &c)))
+            .unwrap();
+        let mut order = vec![first];
+        let mut chosen = vec![false; n];
+        chosen[first] = true;
+        let mut min_d2: Vec<f64> = (0..n).map(|i| dist2(&coords[i], &coords[first])).collect();
+        for _ in 1..n {
+            let next = (0..n)
+                .filter(|&i| !chosen[i])
+                .max_by(|&i, &j| min_d2[i].total_cmp(&min_d2[j]))
+                .unwrap();
+            order.push(next);
+            chosen[next] = true;
+            for i in 0..n {
+                if !chosen[i] {
+                    min_d2[i] = min_d2[i].min(dist2(&coords[i], &coords[next]));
+                }
+            }
+        }
+        order
+    }
+
+    #[test]
+    fn lazy_maxmin_matches_the_exact_traversal() {
+        // Continuous random coordinates (tie-free): the lazy-heap ordering
+        // must reproduce the brute-force farthest-point traversal exactly.
+        for seed in [3, 11, 29] {
+            let data = field(400, seed);
+            assert_eq!(
+                maxmin_order(data.coords()),
+                maxmin_order_brute(data.coords()),
+                "seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_predecessors_match_brute_force() {
+        let data = field(300, 13);
+        let coords = data.coords();
+        let m = 8;
+        let plan = vecchia_plan(coords, m, None).unwrap();
+        for (k, nb) in plan.neighbours.iter().enumerate() {
+            let target = plan.order[k];
+            // Brute force: m nearest among the k predecessors.
+            let mut prev: Vec<(f64, usize)> = plan.order[..k]
+                .iter()
+                .map(|&j| (dist2(&coords[target], &coords[j]), j))
+                .collect();
+            prev.sort_by(|a, b| a.0.total_cmp(&b.0));
+            prev.truncate(m);
+            let mut expected: Vec<usize> = prev.into_iter().map(|(_, j)| j).collect();
+            let mut got = nb.clone();
+            expected.sort_unstable();
+            got.sort_unstable();
+            assert_eq!(got, expected, "predecessors differ at position {k}");
+        }
     }
 
     #[test]

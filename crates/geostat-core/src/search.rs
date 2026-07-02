@@ -210,44 +210,64 @@ impl<const D: usize> BucketGrid<D> {
         into_sorted(heap)
     }
 
-    /// Visits the buckets at Chebyshev distance `ring` from `tc` by walking
-    /// the bounding box of the shell and skipping interior cells.
+    /// Visits the buckets at Chebyshev distance `ring` from `tc`, walking
+    /// only the shell surface — `O(ring^(D-1))` cells instead of the full
+    /// `(2 ring + 1)^D` bounding box.
     fn for_shell_cells<F: FnMut(&[u32])>(&self, tc: [usize; D], ring: usize, mut f: F) {
         let r = ring as isize;
-        let mut lo = [0isize; D];
-        let mut hi = [0isize; D];
+        let mut t = [0isize; D];
         for d in 0..D {
-            lo[d] = tc[d] as isize - r;
-            hi[d] = tc[d] as isize + r;
+            t[d] = tc[d] as isize;
         }
-        // Odometer over the box [lo, hi]^D.
-        let mut cur = lo;
-        'outer: loop {
-            // Chebyshev distance of this cell from the target cell.
-            let mut cheb = 0isize;
-            let mut in_bounds = true;
-            for d in 0..D {
-                cheb = cheb.max((cur[d] - tc[d] as isize).abs());
-                if cur[d] < 0 || cur[d] >= self.n[d] as isize {
-                    in_bounds = false;
+        let visit = |cur: &[isize; D], f: &mut F| {
+            for (d, &v) in cur.iter().enumerate() {
+                if v < 0 || v >= self.n[d] as isize {
+                    return;
                 }
             }
-            if cheb == r && in_bounds {
-                let mut c = [0usize; D];
+            let mut c = [0usize; D];
+            for (cd, &v) in c.iter_mut().zip(cur) {
+                *cd = v as usize;
+            }
+            f(&self.buckets[self.bucket_index(c)]);
+        };
+        if ring == 0 {
+            visit(&t, &mut f);
+            return;
+        }
+        // Each surface cell has max |offset| = r: enumerate the two faces of
+        // every dimension `fd` exactly once by restricting dimensions before
+        // `fd` to |offset| < r (they are covered by their own faces).
+        for fd in 0..D {
+            for side in [-r, r] {
+                let mut lo = [0isize; D];
+                let mut hi = [0isize; D];
                 for d in 0..D {
-                    c[d] = cur[d] as usize;
+                    let (l, h) = match d.cmp(&fd) {
+                        std::cmp::Ordering::Less => (t[d] - r + 1, t[d] + r - 1),
+                        std::cmp::Ordering::Equal => (t[d] + side, t[d] + side),
+                        std::cmp::Ordering::Greater => (t[d] - r, t[d] + r),
+                    };
+                    lo[d] = l;
+                    hi[d] = h;
                 }
-                f(&self.buckets[self.bucket_index(c)]);
-            }
-            // Advance the odometer.
-            for d in 0..D {
-                cur[d] += 1;
-                if cur[d] <= hi[d] {
-                    continue 'outer;
+                if lo.iter().zip(&hi).any(|(l, h)| l > h) {
+                    continue;
                 }
-                cur[d] = lo[d];
+                // Odometer over the face box.
+                let mut cur = lo;
+                'face: loop {
+                    visit(&cur, &mut f);
+                    for d in 0..D {
+                        cur[d] += 1;
+                        if cur[d] <= hi[d] {
+                            continue 'face;
+                        }
+                        cur[d] = lo[d];
+                    }
+                    break;
+                }
             }
-            break;
         }
     }
 }
