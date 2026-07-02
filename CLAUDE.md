@@ -96,5 +96,11 @@ Computers & Geosciences.
    reproducibilidad determinista cross-platform, bindings Python/WASM, 2-D y
    3-D desde un solo motor const-genérico.
 9. Auditoría técnica completa (2026-07-02): `docs/AUDIT-2026-07.md` — roadmap
-   en 4 fases hacia estado del arte. Fase 0 ejecutada: fix block kriging 3-D,
-   detección de duplicados, metadata/CI, unificación ridge + helpers al core.
+   en 4 fases hacia estado del arte. **Fase 0 ejecutada** (fix block kriging
+   3-D, duplicados, metadata/CI, unificación ridge + helpers al core) y
+   **Fase 1 ejecutada** (variograma de residuos UK/KED, colas GSLIB
+   ltail/utail en SGS/SIS/IK, Goulard–Voltz iterativo, cell declustering +
+   nscore ponderado, octantes/ndmin, error de medición estilo gstat Err).
+   Paridad gstat extendida: `validation/compare_v07.py` (residuos 3e-15,
+   Err 2.5e-14). Siguen Fase 2 (escalabilidad Vecchia/SGS — material del
+   2º paper) y Fase 3 (diferenciación).
