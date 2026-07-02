@@ -25,7 +25,7 @@ use ndarray::Array2;
 
 use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
-use crate::linalg::{lu_factor, solve};
+use crate::linalg::{cholesky_solve_in_place, lu_factor};
 use crate::optim::nelder_mead;
 use crate::search::BucketGrid;
 use crate::variogram::{ModelKind, Structure, VariogramModel};
@@ -233,6 +233,12 @@ fn loglik_with_plan<const D: usize>(
     let z: Vec<f64> = data.values().iter().map(|v| v - mean).collect();
     let sill = model.total_sill(); // C(0)
 
+    // Workspaces reused across every point (the optimizer calls this
+    // thousands of times; per-point allocation dominated the profile).
+    let mut kss: Vec<f64> = Vec::new();
+    let mut ki: Vec<f64> = Vec::new();
+    let mut w: Vec<f64> = Vec::new();
+
     let mut loglik = 0.0;
     for (k, &i) in plan.order.iter().enumerate() {
         let nb = &plan.neighbours[k];
@@ -241,16 +247,22 @@ fn loglik_with_plan<const D: usize>(
         } else {
             let s = nb.len();
             // K_SS (neighbour covariance) and k_i (target-neighbour covariance).
-            let mut kss = vec![0.0; s * s];
-            let mut ki = vec![0.0; s];
+            kss.clear();
+            kss.resize(s * s, 0.0);
+            ki.clear();
+            ki.resize(s, 0.0);
             for a in 0..s {
                 ki[a] = model.covariance_dh(sep(&coords[i], &coords[nb[a]]));
-                for b in 0..s {
-                    kss[a * s + b] = model.covariance_dh(sep(&coords[nb[a]], &coords[nb[b]]));
+                for b in a..s {
+                    let c = model.covariance_dh(sep(&coords[nb[a]], &coords[nb[b]]));
+                    kss[a * s + b] = c;
+                    kss[b * s + a] = c;
                 }
             }
-            let arr = ndarray::Array2::from_shape_vec((s, s), kss).expect("square K_SS");
-            let w = solve(arr, ki.clone())?; // w = K_SS^{-1} k_i
+            // w = K_SS^{-1} k_i via Cholesky (K_SS is SPD).
+            w.clear();
+            w.extend_from_slice(&ki);
+            cholesky_solve_in_place(&mut kss, s, &mut w)?;
             let mu: f64 = w.iter().zip(nb).map(|(&wj, &j)| wj * z[j]).sum();
             let reduction: f64 = w.iter().zip(&ki).map(|(&wj, &kj)| wj * kj).sum();
             (mu, (sill - reduction).max(1e-12))
@@ -453,6 +465,10 @@ fn reml_loglik_with_plan<const D: usize>(
     let mut uz_uz = 0.0;
     let mut a = vec![0.0; p * p]; // F^T Sigma^{-1} F
     let mut c = vec![0.0; p]; // F^T Sigma^{-1} z
+    // Workspaces reused across every point (hot path of the optimizer).
+    let mut kss: Vec<f64> = Vec::new();
+    let mut ki: Vec<f64> = Vec::new();
+    let mut w: Vec<f64> = Vec::new();
     for (k, &i) in plan.order.iter().enumerate() {
         let nb = &plan.neighbours[k];
         // Whitened z and trend-row at this ordered point.
@@ -462,16 +478,22 @@ fn reml_loglik_with_plan<const D: usize>(
             (z[i] / sd, uf, sill)
         } else {
             let s = nb.len();
-            let mut kss = vec![0.0; s * s];
-            let mut ki = vec![0.0; s];
+            kss.clear();
+            kss.resize(s * s, 0.0);
+            ki.clear();
+            ki.resize(s, 0.0);
             for aa in 0..s {
                 ki[aa] = model.covariance_dh(sep(&coords[i], &coords[nb[aa]]));
-                for bb in 0..s {
-                    kss[aa * s + bb] = model.covariance_dh(sep(&coords[nb[aa]], &coords[nb[bb]]));
+                for bb in aa..s {
+                    let cv = model.covariance_dh(sep(&coords[nb[aa]], &coords[nb[bb]]));
+                    kss[aa * s + bb] = cv;
+                    kss[bb * s + aa] = cv;
                 }
             }
-            let arr = Array2::from_shape_vec((s, s), kss).expect("square K_SS");
-            let w = solve(arr, ki.clone())?;
+            // w = K_SS^{-1} k_i via Cholesky (K_SS is SPD).
+            w.clear();
+            w.extend_from_slice(&ki);
+            cholesky_solve_in_place(&mut kss, s, &mut w)?;
             let d = (sill - w.iter().zip(&ki).map(|(&wj, &kj)| wj * kj).sum::<f64>()).max(1e-12);
             let sd = d.sqrt();
             let uz = (z[i] - w.iter().zip(nb).map(|(&wj, &j)| wj * z[j]).sum::<f64>()) / sd;

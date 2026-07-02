@@ -111,6 +111,68 @@ impl Lu {
     }
 }
 
+/// Solves the symmetric positive-definite system `A x = b` in place:
+/// `a` holds the row-major `n x n` matrix (only the lower triangle is read;
+/// it is overwritten with the Cholesky factor) and `b` is overwritten with
+/// the solution.
+///
+/// Built for hot loops: both buffers are caller-owned and reusable across
+/// calls, and the unpivoted Cholesky factorization costs half the flops of
+/// the LU path (covariance blocks in Vecchia and sequential simulation are
+/// SPD, so no pivoting is needed). Fails with `SingularSystem` when a pivot
+/// is not meaningfully positive.
+pub fn cholesky_solve_in_place(a: &mut [f64], n: usize, b: &mut [f64]) -> Result<()> {
+    if a.len() != n * n || b.len() != n {
+        return Err(GeostatError::DimensionMismatch(format!(
+            "A has {} entries and b {}, expected {} and {n}",
+            a.len(),
+            b.len(),
+            n * n
+        )));
+    }
+    let scale = (0..n)
+        .map(|i| a[i * n + i])
+        .fold(0.0_f64, f64::max)
+        .max(f64::MIN_POSITIVE);
+    for k in 0..n {
+        let mut d = a[k * n + k];
+        for j in 0..k {
+            d -= a[k * n + j] * a[k * n + j];
+        }
+        if !(d > 1e-12 * scale) {
+            return Err(GeostatError::SingularSystem(format!(
+                "non-positive Cholesky pivot {d:.3e} at column {k} (scale {scale:.3e})"
+            )));
+        }
+        let d = d.sqrt();
+        a[k * n + k] = d;
+        for i in (k + 1)..n {
+            let mut s = a[i * n + k];
+            for j in 0..k {
+                s -= a[i * n + j] * a[k * n + j];
+            }
+            a[i * n + k] = s / d;
+        }
+    }
+    // Forward substitution L y = b.
+    for i in 0..n {
+        let mut s = b[i];
+        for j in 0..i {
+            s -= a[i * n + j] * b[j];
+        }
+        b[i] = s / a[i * n + i];
+    }
+    // Back substitution L^T x = y.
+    for i in (0..n).rev() {
+        let mut s = b[i];
+        for j in (i + 1)..n {
+            s -= a[j * n + i] * b[j];
+        }
+        b[i] = s / a[i * n + i];
+    }
+    Ok(())
+}
+
 /// Solves the dense system `A x = b` via LU with partial pivoting.
 pub fn solve(a: Array2<f64>, b: Vec<f64>) -> Result<Vec<f64>> {
     let n = a.nrows();
@@ -146,6 +208,28 @@ mod tests {
         let a = array![[1.0, 2.0], [2.0, 4.0]];
         let b = vec![1.0, 2.0];
         assert!(matches!(solve(a, b), Err(GeostatError::SingularSystem(_))));
+    }
+
+    #[test]
+    fn cholesky_matches_lu_on_spd_and_rejects_non_pd() {
+        // SPD covariance-like matrix.
+        let a = [4.0, 1.0, 0.5, 1.0, 3.0, 0.2, 0.5, 0.2, 2.0];
+        let b = [1.0, 2.0, 3.0];
+        let mut aw = a;
+        let mut bw = b;
+        cholesky_solve_in_place(&mut aw, 3, &mut bw).unwrap();
+        let a_nd = Array2::from_shape_vec((3, 3), a.to_vec()).unwrap();
+        let x_lu = solve(a_nd, b.to_vec()).unwrap();
+        for (c, l) in bw.iter().zip(&x_lu) {
+            assert!((c - l).abs() < 1e-12, "{c} vs {l}");
+        }
+        // Semi-definite (rank 1) rejected.
+        let mut sd = [1.0, 2.0, 2.0, 4.0];
+        let mut b2 = [1.0, 2.0];
+        assert!(matches!(
+            cholesky_solve_in_place(&mut sd, 2, &mut b2),
+            Err(GeostatError::SingularSystem(_))
+        ));
     }
 
     #[test]

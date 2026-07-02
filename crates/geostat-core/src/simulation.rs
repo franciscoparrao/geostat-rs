@@ -12,12 +12,10 @@
 //! Realizations run in parallel; each derives its own RNG stream from the
 //! base seed, so results are reproducible regardless of thread scheduling.
 
-use ndarray::Array2;
-
 use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
 use crate::grid::Grid2D;
-use crate::linalg::solve;
+use crate::linalg::cholesky_solve_in_place;
 use crate::rng::{Rng, splitmix64};
 use crate::search::BucketGrid;
 use crate::transform::{NormalScore, Tails};
@@ -184,6 +182,9 @@ fn simulate_one<const D: usize>(
         search.insert(p);
     }
     let mut sim_ns = vec![0.0_f64; n_cells];
+    // Workspaces reused across the whole realization: this is the engine's
+    // hottest loop, and per-node allocation dominated it.
+    let mut ws = SkWorkspace::default();
 
     for &cell in &path {
         let target = centers[cell];
@@ -192,7 +193,16 @@ fn simulate_one<const D: usize>(
         let (mean, var) = if nb.is_empty() {
             (0.0, c0)
         } else {
-            simple_kriging_ns(&cond_coords, &cond_vals, model, target, &nb, c0, stabilizer)?
+            simple_kriging_ns(
+                &cond_coords,
+                &cond_vals,
+                model,
+                target,
+                &nb,
+                c0,
+                stabilizer,
+                &mut ws,
+            )?
         };
 
         let z = mean + var.max(0.0).sqrt() * rng.normal();
@@ -205,7 +215,18 @@ fn simulate_one<const D: usize>(
     Ok(sim_ns.iter().map(|&s| ns.back_transform(s)).collect())
 }
 
+/// Reusable buffers for the per-node simple-kriging systems.
+#[derive(Default)]
+struct SkWorkspace {
+    a: Vec<f64>,
+    b: Vec<f64>,
+    w: Vec<f64>,
+}
+
 /// Simple kriging with mean 0 in Gaussian space; returns (mean, variance).
+/// The covariance system is SPD (stabilized diagonal), so it is solved by
+/// Cholesky in the caller-provided workspace — no allocation per node.
+#[allow(clippy::too_many_arguments)]
 fn simple_kriging_ns<const D: usize>(
     coords: &[[f64; D]],
     vals: &[f64],
@@ -214,10 +235,13 @@ fn simple_kriging_ns<const D: usize>(
     nb: &[usize],
     c0: f64,
     stabilizer: f64,
+    ws: &mut SkWorkspace,
 ) -> Result<(f64, f64)> {
     let n = nb.len();
-    let mut a = Array2::<f64>::zeros((n, n));
-    let mut b = vec![0.0; n];
+    ws.a.clear();
+    ws.a.resize(n * n, 0.0);
+    ws.b.clear();
+    ws.b.resize(n, 0.0);
     let sep = |a: [f64; D], b: [f64; D]| {
         let mut dh = [0.0; D];
         for d in 0..D {
@@ -227,21 +251,22 @@ fn simple_kriging_ns<const D: usize>(
     };
     for (ii, &i) in nb.iter().enumerate() {
         let pi = coords[i];
-        a[[ii, ii]] = c0 + stabilizer;
+        ws.a[ii * n + ii] = c0 + stabilizer;
         for (jj, &j) in nb.iter().enumerate().skip(ii + 1) {
             let c = model.covariance_dh(sep(pi, coords[j]));
-            a[[ii, jj]] = c;
-            a[[jj, ii]] = c;
+            ws.a[ii * n + jj] = c;
+            ws.a[jj * n + ii] = c;
         }
-        b[ii] = model.covariance_dh(sep(pi, target));
+        ws.b[ii] = model.covariance_dh(sep(pi, target));
     }
-    let b0 = b.clone();
-    let w = solve(a, b)?;
+    ws.w.clear();
+    ws.w.extend_from_slice(&ws.b);
+    cholesky_solve_in_place(&mut ws.a, n, &mut ws.w)?;
     let mut mean = 0.0;
     let mut reduction = 0.0;
     for ii in 0..n {
-        mean += w[ii] * vals[nb[ii]];
-        reduction += w[ii] * b0[ii];
+        mean += ws.w[ii] * vals[nb[ii]];
+        reduction += ws.w[ii] * ws.b[ii];
     }
     Ok((mean, (c0 - reduction).max(0.0)))
 }
