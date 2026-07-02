@@ -10,10 +10,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use geostat_core::{
     CoKriging, CoKrigingConfig, DirectionConfig, Grid2D, IkConfig, Kriging, KrigingConfig,
     KrigingMethod, ModelKind, PointSet, SgsConfig, SisConfig, VariogramConfig, VariogramModel,
-    experimental_variogram, fit_anisotropic, fit_best, fit_indicator_models, fit_lmc_collocated,
-    indicator_kriging, k_fold, leave_one_out, leave_one_out_with_drift,
-    sequential_gaussian_simulation, sequential_indicator_simulation, variogram_map, vecchia_mle,
-    vecchia_reml,
+    detrend_external, detrend_polynomial, experimental_variogram, fit_anisotropic, fit_best,
+    fit_indicator_models, fit_lmc_collocated, indicator_kriging, k_fold, leave_one_out,
+    leave_one_out_with_drift, sequential_gaussian_simulation, sequential_indicator_simulation,
+    variogram_map, vecchia_mle, vecchia_reml,
 };
 
 #[derive(Parser)]
@@ -249,6 +249,16 @@ struct VariogramCmd {
     /// constant plug-in mean. Use when the field has a spatial trend.
     #[arg(long)]
     trend: Option<u8>,
+    /// Compute the variogram on OLS residuals of a polynomial trend in the
+    /// coordinates (degree 1 or 2) — the correct variography for universal
+    /// kriging (gstat's `z ~ x + y`)
+    #[arg(long, value_name = "DEGREE")]
+    detrend: Option<u8>,
+    /// Compute the variogram on OLS residuals of a linear trend in these
+    /// covariate columns (comma-separated) — the correct variography for
+    /// kriging with an external drift
+    #[arg(long, value_name = "COLS")]
+    detrend_cols: Option<String>,
     /// Write experimental variogram bins to a CSV file
     #[arg(short, long)]
     output: Option<PathBuf>,
@@ -975,20 +985,48 @@ fn run_variogram(cmd: VariogramCmd) -> Result<()> {
     if cmd.trend.is_some() && !cmd.mle {
         bail!("--trend requires --mle (it selects REML/trend maximum likelihood)");
     }
+    if cmd.detrend.is_some() && cmd.detrend_cols.is_some() {
+        bail!("--detrend and --detrend-cols are mutually exclusive");
+    }
     if cmd.input.z_col.is_some() {
         if cmd.anisotropic {
             bail!("--anisotropic is 2-D only (drop --z-col)");
         }
-        let data = cmd.input.read3()?;
+        if cmd.detrend_cols.is_some() {
+            bail!("--detrend-cols is 2-D only (drop --z-col)");
+        }
+        let mut data = cmd.input.read3()?;
         println!("Loaded {} 3-D points", data.len());
+        if let Some(deg) = cmd.detrend {
+            data = detrend_polynomial(&data, deg)?.0;
+            println!("Variogram computed on OLS residuals of a degree-{deg} trend");
+        }
         return variogram_report(&data, &cmd);
     }
-    let data = cmd.input.read()?;
-    println!(
-        "Loaded {} points from {}",
-        data.len(),
-        cmd.input.input.display()
-    );
+    let mut data = if let Some(cols) = &cmd.detrend_cols {
+        let cols: Vec<String> = cols.split(',').map(|s| s.trim().to_string()).collect();
+        let (raw, covars) = cmd.input.read_with_extras(&cols)?;
+        let (resid, _) = detrend_external(&raw, &covars)?;
+        println!(
+            "Loaded {} points from {}; variogram on OLS residuals of drift [{}]",
+            raw.len(),
+            cmd.input.input.display(),
+            cols.join(", ")
+        );
+        resid
+    } else {
+        let raw = cmd.input.read()?;
+        println!(
+            "Loaded {} points from {}",
+            raw.len(),
+            cmd.input.input.display()
+        );
+        raw
+    };
+    if let Some(deg) = cmd.detrend {
+        data = detrend_polynomial(&data, deg)?.0;
+        println!("Variogram computed on OLS residuals of a degree-{deg} trend");
+    }
     if cmd.anisotropic {
         return anisotropic_report(&data, &cmd);
     }

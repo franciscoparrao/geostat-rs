@@ -115,10 +115,37 @@ impl VariogramModel {
     }
 }
 
+/// Detrends `data` before variography: `detrend` (1 or 2) removes an OLS
+/// polynomial trend in the coordinates; `detrend_drift` (one row of covariate
+/// values per point) removes an OLS linear trend in external covariates.
+fn maybe_detrend(
+    data: PointSet,
+    detrend: Option<u8>,
+    detrend_drift: Option<Vec<Vec<f64>>>,
+) -> PyResult<PointSet> {
+    if detrend.is_some() && detrend_drift.is_some() {
+        return Err(PyValueError::new_err(
+            "detrend and detrend_drift are mutually exclusive",
+        ));
+    }
+    if let Some(rows) = detrend_drift {
+        return Ok(core::detrend_external(&data, &rows).map_err(err)?.0);
+    }
+    if let Some(deg) = detrend {
+        return Ok(core::detrend_polynomial(&data, deg).map_err(err)?.0);
+    }
+    Ok(data)
+}
+
 /// Experimental semivariogram. Returns `(h, gamma, n_pairs)` lists; empty
-/// bins carry NaN gamma.
+/// bins carry NaN gamma. `detrend` (degree 1 or 2) computes the variogram on
+/// OLS residuals of a polynomial trend — the correct variography for
+/// universal kriging; `detrend_drift` (one row of covariates per point) does
+/// the same for an external drift (KED).
 #[pyfunction]
-#[pyo3(signature = (x, y, values, n_lags = 15, max_dist = None, azimuth = None, tolerance = 22.5))]
+#[pyo3(signature = (x, y, values, n_lags = 15, max_dist = None, azimuth = None, tolerance = 22.5,
+    detrend = None, detrend_drift = None))]
+#[allow(clippy::too_many_arguments)]
 fn experimental_variogram(
     x: Vec<f64>,
     y: Vec<f64>,
@@ -127,8 +154,10 @@ fn experimental_variogram(
     max_dist: Option<f64>,
     azimuth: Option<f64>,
     tolerance: f64,
+    detrend: Option<u8>,
+    detrend_drift: Option<Vec<Vec<f64>>>,
 ) -> PyResult<(Vec<f64>, Vec<f64>, Vec<usize>)> {
-    let data = point_set(x, y, values)?;
+    let data = maybe_detrend(point_set(x, y, values)?, detrend, detrend_drift)?;
     let cfg = vario_config(&data, n_lags, max_dist, azimuth, 0.0, tolerance);
     let ev = core::experimental_variogram(&data, &cfg).map_err(err)?;
     let mut h = Vec::new();
@@ -178,9 +207,13 @@ fn variogram_map(
 
 /// Fits a variogram model to the data by weighted least squares.
 /// `kinds` is "best" or a comma-separated list (spherical, exponential,
-/// gaussian, matern15, matern25).
+/// gaussian, matern15, matern25). `detrend`/`detrend_drift` fit the model on
+/// OLS trend residuals (see `experimental_variogram`) — use them when the
+/// model feeds universal or external-drift kriging.
 #[pyfunction]
-#[pyo3(signature = (x, y, values, n_lags = 15, max_dist = None, kinds = "best"))]
+#[pyo3(signature = (x, y, values, n_lags = 15, max_dist = None, kinds = "best",
+    detrend = None, detrend_drift = None))]
+#[allow(clippy::too_many_arguments)]
 fn fit_variogram(
     x: Vec<f64>,
     y: Vec<f64>,
@@ -188,8 +221,10 @@ fn fit_variogram(
     n_lags: usize,
     max_dist: Option<f64>,
     kinds: &str,
+    detrend: Option<u8>,
+    detrend_drift: Option<Vec<Vec<f64>>>,
 ) -> PyResult<VariogramModel> {
-    let data = point_set(x, y, values)?;
+    let data = maybe_detrend(point_set(x, y, values)?, detrend, detrend_drift)?;
     let cfg = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
     let ev = core::experimental_variogram(&data, &cfg).map_err(err)?;
     let fit = core::fit_best(&ev, &parse_kinds(kinds)?).map_err(err)?;

@@ -104,6 +104,68 @@ impl OlsTrend {
     }
 }
 
+/// OLS residuals of a polynomial trend in the coordinates (degree 1 or 2),
+/// as a point set sharing the data's coordinates.
+///
+/// This is the standard preparation for *universal-kriging variography*
+/// (gstat's `variogram(z ~ x + y, ...)`): fitting a variogram to raw data
+/// that carry a trend inflates range and sill, so the variogram must be
+/// estimated on trend residuals. Coordinates are centered and scaled
+/// internally for numerical conditioning; the residuals are unaffected
+/// (an affine change of variables spans the same polynomial space).
+pub fn detrend_polynomial<const D: usize>(
+    data: &PointSet<D>,
+    degree: u8,
+) -> Result<(PointSet<D>, OlsTrend)> {
+    if !(1..=2).contains(&degree) {
+        return Err(GeostatError::InvalidParameter(format!(
+            "detrend degree must be 1 or 2, got {degree}"
+        )));
+    }
+    let (min, max) = data.bbox();
+    let mut center = [0.0; D];
+    let mut spread = 0.0_f64;
+    for d in 0..D {
+        center[d] = 0.5 * (min[d] + max[d]);
+        spread = spread.max(max[d] - min[d]);
+    }
+    let scale = if spread > 0.0 { spread } else { 1.0 };
+    let covariates: Vec<Vec<f64>> = data
+        .coords()
+        .iter()
+        .map(|c| {
+            let u: Vec<f64> = (0..D).map(|d| (c[d] - center[d]) / scale).collect();
+            let mut row = u.clone();
+            if degree == 2 {
+                for a in 0..D {
+                    for b in a..D {
+                        row.push(u[a] * u[b]);
+                    }
+                }
+            }
+            row
+        })
+        .collect();
+    detrend_external(data, &covariates)
+}
+
+/// OLS residuals of a linear trend in external covariates (the
+/// kriging-with-external-drift analogue of [`detrend_polynomial`]):
+/// `covariates[i]` holds the covariate values at data point `i`.
+pub fn detrend_external<const D: usize>(
+    data: &PointSet<D>,
+    covariates: &[Vec<f64>],
+) -> Result<(PointSet<D>, OlsTrend)> {
+    let trend = OlsTrend::fit(covariates, data.values())?;
+    let resid: Vec<f64> = data
+        .values()
+        .iter()
+        .zip(covariates)
+        .map(|(&z, row)| z - trend.predict(row))
+        .collect();
+    Ok((PointSet::new(data.coords().to_vec(), resid)?, trend))
+}
+
 /// Regression-kriging predictor: kriges the residuals of an externally
 /// supplied trend and adds the trend back at the target.
 #[derive(Debug)]
@@ -214,6 +276,70 @@ mod tests {
             covs.push(vec![x]);
         }
         (PointSet::new(coords, values).unwrap(), covs)
+    }
+
+    #[test]
+    fn detrend_removes_exact_polynomial() {
+        // Values exactly linear in the coordinates: residuals must vanish.
+        let mut coords = Vec::new();
+        let mut values = Vec::new();
+        for i in 0..10 {
+            for j in 0..10 {
+                let p = [180_000.0 + i as f64 * 100.0, 330_000.0 + j as f64 * 100.0];
+                coords.push(p);
+                values.push(3.0 + 0.002 * p[0] - 0.001 * p[1]);
+            }
+        }
+        let data = PointSet::new(coords, values).unwrap();
+        let (resid, _) = detrend_polynomial(&data, 1).unwrap();
+        for &r in resid.values() {
+            assert!(r.abs() < 1e-6, "residual {r}");
+        }
+        // Degree 2 handles a quadratic surface (large UTM-like coordinates
+        // exercise the internal normalization).
+        let vals2: Vec<f64> = data
+            .coords()
+            .iter()
+            .map(|c| 1.0 + 1e-7 * c[0] * c[1] - 2e-8 * c[0] * c[0])
+            .collect();
+        let data2 = PointSet::new(data.coords().to_vec(), vals2).unwrap();
+        let (resid2, _) = detrend_polynomial(&data2, 2).unwrap();
+        for &r in resid2.values() {
+            assert!(r.abs() < 1e-5, "quadratic residual {r}");
+        }
+    }
+
+    #[test]
+    fn residual_variogram_deflates_trended_sill() {
+        use crate::variogram::{VariogramConfig, experimental_variogram};
+        // Strong linear trend over weak noise: the raw variogram grows
+        // without bound while the residual variogram stays near the noise.
+        let mut rng = Rng::new(17);
+        let mut coords = Vec::new();
+        let mut values = Vec::new();
+        for _ in 0..200 {
+            let x = rng.uniform() * 100.0;
+            let y = rng.uniform() * 100.0;
+            coords.push([x, y]);
+            values.push(0.5 * x + 0.1 * rng.normal());
+        }
+        let data = PointSet::new(coords, values).unwrap();
+        let cfg = VariogramConfig {
+            n_lags: 10,
+            max_dist: 60.0,
+            direction: None,
+        };
+        let raw = experimental_variogram(&data, &cfg).unwrap();
+        let (resid, trend) = detrend_polynomial(&data, 1).unwrap();
+        let res = experimental_variogram(&resid, &cfg).unwrap();
+        let last_raw = raw.bins.last().unwrap().gamma;
+        let last_res = res.bins.last().unwrap().gamma;
+        assert!(
+            last_res < 0.05 * last_raw,
+            "residual gamma {last_res} vs raw {last_raw}"
+        );
+        // The de-trended slope is recoverable from the normalized coefficients.
+        assert!(trend.coefficients().len() == 3);
     }
 
     #[test]

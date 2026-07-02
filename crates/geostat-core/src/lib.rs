@@ -72,7 +72,7 @@ pub use grid::{Grid2D, Grid3D};
 pub use ik::{CcdfEstimate, IkConfig, indicator_kriging};
 pub use interpolation::{Idw, Knn, idw_cross_validate, knn_cross_validate};
 pub use kriging::{Kriging, KrigingConfig, KrigingEstimate, KrigingMethod, block_offsets};
-pub use regression::{OlsTrend, RegressionKriging};
+pub use regression::{OlsTrend, RegressionKriging, detrend_external, detrend_polynomial};
 pub use rng::Rng;
 pub use simulation::{
     SgsConfig, SgsResult, sequential_gaussian_simulation, sequential_gaussian_simulation_3d, sgs_at,
