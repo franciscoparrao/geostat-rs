@@ -124,6 +124,15 @@ impl<const D: usize> PointSet<D> {
         (min, max)
     }
 
+    /// First pair of points sharing exactly the same coordinates, if any.
+    ///
+    /// Duplicate locations make kriging systems singular; predictors reject
+    /// them up front with [`GeostatError::DuplicatePoints`] instead of
+    /// failing per target. Collapse or jitter duplicates before estimating.
+    pub fn duplicate_pair(&self) -> Option<(usize, usize)> {
+        duplicate_coord_pair(&self.coords)
+    }
+
     /// A copy of this point set with point `i` removed (for cross-validation).
     pub fn excluding(&self, i: usize) -> Self {
         let mut coords = self.coords.clone();
@@ -132,6 +141,25 @@ impl<const D: usize> PointSet<D> {
         values.remove(i);
         Self { coords, values }
     }
+}
+
+/// First pair of indices with bitwise-identical coordinates, if any.
+///
+/// `-0.0` is normalized to `0.0` before comparing; coordinates are assumed
+/// finite (as guaranteed by [`PointSet::new`]). Runs in O(n).
+pub fn duplicate_coord_pair<const D: usize>(coords: &[[f64; D]]) -> Option<(usize, usize)> {
+    use std::collections::hash_map::{Entry, HashMap};
+    let mut seen: HashMap<[u64; D], usize> = HashMap::with_capacity(coords.len());
+    for (i, c) in coords.iter().enumerate() {
+        let key = std::array::from_fn(|d| (c[d] + 0.0).to_bits());
+        match seen.entry(key) {
+            Entry::Occupied(e) => return Some((*e.get(), i)),
+            Entry::Vacant(v) => {
+                v.insert(i);
+            }
+        }
+    }
+    None
 }
 
 /// Euclidean distance between two points.
@@ -157,6 +185,21 @@ mod tests {
         let ps = PointSet::new(vec![[0.0, 0.0], [1.0, 1.0]], vec![1.0, 2.0]).unwrap();
         assert_eq!(ps.len(), 2);
         assert!((ps.mean() - 1.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn duplicate_pair_detection() {
+        let unique = PointSet::new(vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], vec![1.0; 3]).unwrap();
+        assert_eq!(unique.duplicate_pair(), None);
+        let dup = PointSet::new(
+            vec![[0.0, 0.0], [1.0, 2.0], [1.0, 2.0], [3.0, 3.0]],
+            vec![1.0; 4],
+        )
+        .unwrap();
+        assert_eq!(dup.duplicate_pair(), Some((1, 2)));
+        // -0.0 and 0.0 are the same location.
+        let signed_zero = PointSet::new(vec![[0.0, 1.0], [-0.0, 1.0]], vec![1.0; 2]).unwrap();
+        assert_eq!(signed_zero.duplicate_pair(), Some((0, 1)));
     }
 
     #[test]

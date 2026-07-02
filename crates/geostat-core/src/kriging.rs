@@ -196,6 +196,9 @@ impl<'a, const D: usize> Kriging<'a, D> {
                 "max_neighbors must be at least 1".into(),
             ));
         }
+        if let Some((i, j)) = data.duplicate_pair() {
+            return Err(GeostatError::DuplicatePoints(i, j));
+        }
         let (min, max) = data.bbox();
         let mut center = [0.0; D];
         let mut spread = 0.0_f64;
@@ -621,6 +624,20 @@ mod tests {
 
     fn model() -> VariogramModel {
         VariogramModel::new(0.05, vec![Structure::new(ModelKind::Spherical, 0.95, 2.0)]).unwrap()
+    }
+
+    #[test]
+    fn duplicate_points_rejected_up_front() {
+        let data = PointSet::new(
+            vec![[0.0, 0.0], [1.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+            vec![1.0, 2.0, 2.1, 1.5],
+        )
+        .unwrap();
+        let m = model();
+        match Kriging::new(&data, &m, KrigingConfig::default()) {
+            Err(GeostatError::DuplicatePoints(1, 2)) => {}
+            other => panic!("expected DuplicatePoints(1, 2), got {other:?}"),
+        }
     }
 
     #[test]

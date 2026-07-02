@@ -24,6 +24,11 @@ pub enum GeostatError {
     /// No conditioning points were found inside the search neighborhood.
     #[error("no neighbors found within the search neighborhood")]
     NoNeighbors,
+
+    /// Two data points share exactly the same coordinates, which makes the
+    /// kriging system singular. Collapse or jitter duplicates first.
+    #[error("duplicate data points: indices {0} and {1} share the same coordinates")]
+    DuplicatePoints(usize, usize),
 }
 
 /// Crate-wide result alias.

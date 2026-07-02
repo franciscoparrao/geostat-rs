@@ -143,6 +143,9 @@ pub fn vecchia_plan<const D: usize>(
             "conditioning size m must be at least 1".into(),
         ));
     }
+    if let Some((i, j)) = crate::data::duplicate_coord_pair(coords) {
+        return Err(GeostatError::DuplicatePoints(i, j));
+    }
     let order = match order {
         Some(o) => {
             if o.len() != n {
