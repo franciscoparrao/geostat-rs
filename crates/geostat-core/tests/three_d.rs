@@ -169,6 +169,39 @@ fn sgs_3d_reproducible_and_bounded() {
 }
 
 #[test]
+fn block_kriging_3d_uses_z_separation() {
+    let data = synthetic_3d(100, 13);
+    let model =
+        VariogramModel::new(0.05, vec![Structure::new(ModelKind::Spherical, 1.0, 30.0)]).unwrap();
+    let k: Kriging<'_, 3> = Kriging::new(&data, &model, KrigingConfig::default()).unwrap();
+    let center = [42.0, 37.0, 18.0];
+
+    // A one-point block solves the same system as point kriging: identical
+    // value, and the variance only drops the nugget from C̄(B,B).
+    let block = k.predict_block(center, &[[0.0, 0.0, 0.0]]).unwrap();
+    let point = k.predict(center).unwrap();
+    assert!(
+        (block.value - point.value).abs() < 1e-10,
+        "{} vs {}",
+        block.value,
+        point.value
+    );
+    assert!((block.variance - (point.variance - model.nugget)).abs() < 1e-10);
+
+    // A vertical discretization must feed z into the point-to-block
+    // covariances: spreading the block along z changes the estimate.
+    let degenerate = k.predict_block(center, &[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]).unwrap();
+    let vertical = k.predict_block(center, &[[0.0, 0.0, -5.0], [0.0, 0.0, 5.0]]).unwrap();
+    assert!(
+        (vertical.value - degenerate.value).abs() > 1e-6,
+        "z offsets ignored: {} == {}",
+        vertical.value,
+        degenerate.value
+    );
+    assert!(vertical.variance >= 0.0);
+}
+
+#[test]
 fn cv_3d_beats_mean_predictor() {
     let data = synthetic_3d(120, 11);
     let cfg = VariogramConfig {

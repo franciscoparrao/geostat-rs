@@ -482,7 +482,7 @@ impl<'a, const D: usize> Kriging<'a, D> {
             a[[ii, ii]] = c0;
             for (jj, &j) in nb.iter().enumerate().skip(ii + 1) {
                 let pj = self.data.coord(j);
-                let c = self.model.covariance_dh([pi[0] - pj[0], pi[1] - pj[1]]);
+                let c = self.model.covariance_dh(sep(pi, pj));
                 a[[ii, jj]] = c;
                 a[[jj, ii]] = c;
             }
@@ -494,8 +494,8 @@ impl<'a, const D: usize> Kriging<'a, D> {
             b[ii] = offsets
                 .iter()
                 .map(|off| {
-                    self.model
-                        .covariance_dh([pi[0] - (center[0] + off[0]), pi[1] - (center[1] + off[1])])
+                    let dh = std::array::from_fn(|k| pi[k] - (center[k] + off[k]));
+                    self.model.covariance_dh::<D>(dh)
                 })
                 .sum::<f64>()
                 / nu;
