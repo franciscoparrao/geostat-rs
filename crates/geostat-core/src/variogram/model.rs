@@ -61,6 +61,17 @@ impl ModelKind {
         }
     }
 
+    /// Parses a comma-separated list of model names, or the shortcuts
+    /// `"best"`/`"all"` for [`ModelKind::ALL`] (the spec every front-end
+    /// accepts for auto-fitting).
+    pub fn parse_list(spec: &str) -> Result<Vec<ModelKind>> {
+        let spec = spec.trim();
+        if spec.eq_ignore_ascii_case("best") || spec.eq_ignore_ascii_case("all") {
+            return Ok(Self::ALL.to_vec());
+        }
+        spec.split(',').map(|s| s.parse()).collect()
+    }
+
     /// Short GSLIB-style abbreviation.
     pub fn abbrev(self) -> &'static str {
         match self {

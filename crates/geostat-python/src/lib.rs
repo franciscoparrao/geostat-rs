@@ -34,29 +34,20 @@ fn vario_config<const D: usize>(
     dip: f64,
     tolerance: f64,
 ) -> VariogramConfig {
-    let (min, max) = data.bbox();
-    let diag = (0..D)
-        .map(|d| (max[d] - min[d]).powi(2))
-        .sum::<f64>()
-        .sqrt();
-    VariogramConfig {
+    VariogramConfig::for_data(
+        data,
         n_lags,
-        max_dist: max_dist.unwrap_or(diag / 3.0),
-        direction: azimuth.map(|az| DirectionConfig {
+        max_dist,
+        azimuth.map(|az| DirectionConfig {
             azimuth_deg: az,
             dip_deg: dip,
             tolerance_deg: tolerance,
         }),
-    }
+    )
 }
 
 fn parse_kinds(spec: &str) -> PyResult<Vec<core::ModelKind>> {
-    if spec.eq_ignore_ascii_case("best") || spec.eq_ignore_ascii_case("all") {
-        return Ok(core::ModelKind::ALL.to_vec());
-    }
-    spec.split(',')
-        .map(|s| s.parse::<core::ModelKind>().map_err(err))
-        .collect()
+    core::ModelKind::parse_list(spec).map_err(err)
 }
 
 fn build_method(
@@ -598,12 +589,13 @@ fn regression_kriging(
 /// variables may have different supports (heterotopic): the direct variograms
 /// use each variable's own points and the cross-variogram is fitted on the
 /// collocated subset (points shared by both, matched on exact coordinates).
-/// `ridge` (default 1e-2) inflates the co-kriging matrix diagonal to keep the
-/// notoriously ill-conditioned system stable; set 0.0 for the exact system.
+/// `ridge` (default 0.0: the exact system, matching the CLI and the gstat
+/// validation) inflates the co-kriging matrix diagonal; set e.g. 1e-2 to
+/// stabilize notoriously ill-conditioned heterotopic systems.
 /// Returns `(predictions, variances)` of the primary at the targets.
 #[pyfunction]
 #[pyo3(signature = (px, py, pv, sx, sy, sv, target_x, target_y,
-    n_lags = 15, max_dist = None, max_neighbors = None, radius = None, ridge = 1e-2))]
+    n_lags = 15, max_dist = None, max_neighbors = None, radius = None, ridge = 0.0))]
 #[allow(clippy::too_many_arguments)]
 fn co_kriging(
     px: Vec<f64>,
@@ -620,7 +612,6 @@ fn co_kriging(
     radius: Option<f64>,
     ridge: f64,
 ) -> PyResult<(Vec<f64>, Vec<f64>)> {
-    use std::collections::HashMap;
     if target_x.len() != target_y.len() {
         return Err(PyValueError::new_err(
             "target_x and target_y differ in length",
@@ -629,36 +620,8 @@ fn co_kriging(
     let primary = point_set(px, py, pv)?;
     let secondary = point_set(sx, sy, sv)?;
     let cfg = vario_config(&primary, n_lags, max_dist, None, 0.0, 22.5);
-    let ea = core::experimental_variogram(&primary, &cfg).map_err(err)?;
-    let eb = core::experimental_variogram(&secondary, &cfg).map_err(err)?;
-
-    // Collocated subset (exact coordinate match) for the cross-variogram.
-    let key = |c: &[f64; 2]| (c[0].to_bits(), c[1].to_bits());
-    let sec_lookup: HashMap<(u64, u64), f64> = secondary
-        .coords()
-        .iter()
-        .zip(secondary.values())
-        .map(|(c, &v)| (key(c), v))
-        .collect();
-    let (mut co_coords, mut co_pv, mut co_sv) = (Vec::new(), Vec::new(), Vec::new());
-    for (c, &v) in primary.coords().iter().zip(primary.values()) {
-        if let Some(&s) = sec_lookup.get(&key(c)) {
-            co_coords.push(*c);
-            co_pv.push(v);
-            co_sv.push(s);
-        }
-    }
-    if co_coords.len() < n_lags {
-        return Err(PyValueError::new_err(
-            "too few collocated primary/secondary points to fit the cross-variogram",
-        ));
-    }
-    let prim_co = PointSet::new(co_coords.clone(), co_pv).map_err(err)?;
-    let sec_co = PointSet::new(co_coords, co_sv).map_err(err)?;
-    let eab = core::experimental_cross_variogram(&prim_co, &sec_co, &cfg).map_err(err)?;
-
-    let template = core::fit_best(&ea, &core::ModelKind::ALL).map_err(err)?;
-    let lmc = core::fit_lmc(&ea, &eb, &eab, &template.model).map_err(err)?;
+    let lmc =
+        core::fit_lmc_collocated(&primary, &secondary, &cfg, &core::ModelKind::ALL).map_err(err)?;
     let config = core::CoKrigingConfig {
         max_neighbors,
         search_radius: radius,
@@ -931,17 +894,7 @@ fn sis(
     let grid = Grid2D::from_bbox([bbox.0, bbox.1], [bbox.2, bbox.3], nx, ny).map_err(err)?;
     let cfg_v = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
     let kinds = [core::ModelKind::Spherical, core::ModelKind::Exponential];
-    let mut models = Vec::with_capacity(cutoffs.len());
-    for &c in &cutoffs {
-        let indicators: Vec<f64> = data
-            .values()
-            .iter()
-            .map(|&v| if v <= c { 1.0 } else { 0.0 })
-            .collect();
-        let ind = PointSet::new(data.coords().to_vec(), indicators).map_err(err)?;
-        let ev = core::experimental_variogram(&ind, &cfg_v).map_err(err)?;
-        models.push(core::fit_best(&ev, &kinds).map_err(err)?.model);
-    }
+    let models = core::fit_indicator_models(&data, &cutoffs, &kinds, &cfg_v).map_err(err)?;
     let cfg = SisConfig {
         cutoffs,
         models,
@@ -1091,17 +1044,7 @@ fn indicator_kriging(
     let data = point_set(x, y, values)?;
     let cfg_v = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
     let kinds = [core::ModelKind::Spherical, core::ModelKind::Exponential];
-    let mut models = Vec::with_capacity(cutoffs.len());
-    for &c in &cutoffs {
-        let indicators: Vec<f64> = data
-            .values()
-            .iter()
-            .map(|&v| if v <= c { 1.0 } else { 0.0 })
-            .collect();
-        let ind = PointSet::new(data.coords().to_vec(), indicators).map_err(err)?;
-        let ev = core::experimental_variogram(&ind, &cfg_v).map_err(err)?;
-        models.push(core::fit_best(&ev, &kinds).map_err(err)?.model);
-    }
+    let models = core::fit_indicator_models(&data, &cutoffs, &kinds, &cfg_v).map_err(err)?;
     let cfg = core::IkConfig {
         cutoffs,
         models,

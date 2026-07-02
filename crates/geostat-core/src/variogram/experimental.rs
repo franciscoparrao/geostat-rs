@@ -43,6 +43,29 @@ pub struct VariogramConfig {
     pub direction: Option<DirectionConfig>,
 }
 
+impl VariogramConfig {
+    /// Builds a config with the default-distance convention shared by every
+    /// front-end (CLI, Python, WASM): when `max_dist` is `None`, a third of
+    /// the bounding-box diagonal of `data` is used.
+    pub fn for_data<const D: usize>(
+        data: &PointSet<D>,
+        n_lags: usize,
+        max_dist: Option<f64>,
+        direction: Option<DirectionConfig>,
+    ) -> Self {
+        let (min, max) = data.bbox();
+        let diag = (0..D)
+            .map(|d| (max[d] - min[d]).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        Self {
+            n_lags,
+            max_dist: max_dist.unwrap_or(diag / 3.0),
+            direction,
+        }
+    }
+}
+
 /// One lag bin of the experimental variogram.
 #[derive(Debug, Clone, Copy)]
 pub struct LagBin {

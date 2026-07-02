@@ -23,13 +23,8 @@ fn point_set(x: &[f64], y: &[f64], values: &[f64]) -> Result<PointSet, JsValue> 
 }
 
 fn vario_config(data: &PointSet, n_lags: usize, max_dist: f64) -> VariogramConfig {
-    let (min, max) = data.bbox();
-    let diag = ((max[0] - min[0]).powi(2) + (max[1] - min[1]).powi(2)).sqrt();
-    VariogramConfig {
-        n_lags,
-        max_dist: if max_dist > 0.0 { max_dist } else { diag / 3.0 },
-        direction: None::<DirectionConfig>,
-    }
+    let max_dist = (max_dist > 0.0).then_some(max_dist);
+    VariogramConfig::for_data(data, n_lags, max_dist, None::<DirectionConfig>)
 }
 
 /// Experimental variogram as a JSON string:

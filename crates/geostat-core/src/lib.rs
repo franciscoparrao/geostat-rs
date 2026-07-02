@@ -65,7 +65,7 @@ pub mod validation;
 pub mod variogram;
 pub mod vecchia;
 
-pub use cokriging::{CoKriging, CoKrigingConfig, Lmc, LmcStructure, fit_lmc};
+pub use cokriging::{CoKriging, CoKrigingConfig, Lmc, LmcStructure, fit_lmc, fit_lmc_collocated};
 pub use data::PointSet;
 pub use error::{GeostatError, Result};
 pub use grid::{Grid2D, Grid3D};
@@ -85,7 +85,8 @@ pub use validation::{CvResult, k_fold, leave_one_out, leave_one_out_with_drift};
 pub use variogram::{
     Anisotropy, DirectionConfig, ExperimentalVariogram, FitResult, LagBin, ModelKind, Structure,
     VariogramConfig, VariogramMap, VariogramModel, experimental_cross_variogram,
-    experimental_variogram, fit_anisotropic, fit_best, fit_model, variogram_map,
+    experimental_variogram, fit_anisotropic, fit_best, fit_indicator_models, fit_model,
+    variogram_map,
 };
 pub use vecchia::{
     VecchiaFit, VecchiaPlan, maxmin_order, vecchia_loglik, vecchia_mle, vecchia_param_se,

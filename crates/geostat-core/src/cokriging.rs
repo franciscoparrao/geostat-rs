@@ -453,6 +453,56 @@ impl CoKriging<'_, 2> {
     }
 }
 
+/// Auto-fits a 2-variable LMC from the raw point sets: direct variograms on
+/// each variable's own points, cross-variogram on the *collocated subset*
+/// (points shared by both, matched on exact coordinates), template chosen by
+/// [`fit_best`](crate::variogram::fit_best) over `kinds` on the primary.
+///
+/// This is the shared auto-fit path of the CLI and Python front-ends. For
+/// isotopic data (all points shared, same order) it reduces exactly to
+/// fitting the direct cross-variogram.
+pub fn fit_lmc_collocated<const D: usize>(
+    primary: &PointSet<D>,
+    secondary: &PointSet<D>,
+    cfg: &crate::variogram::VariogramConfig,
+    kinds: &[ModelKind],
+) -> Result<Lmc> {
+    use std::collections::HashMap;
+    let ea = crate::variogram::experimental_variogram(primary, cfg)?;
+    let eb = crate::variogram::experimental_variogram(secondary, cfg)?;
+
+    // Collocated subset (exact coordinate match) for the cross-variogram.
+    let key = |c: &[f64; D]| -> [u64; D] { std::array::from_fn(|d| (c[d] + 0.0).to_bits()) };
+    let sec_lookup: HashMap<[u64; D], f64> = secondary
+        .coords()
+        .iter()
+        .zip(secondary.values())
+        .map(|(c, &v)| (key(c), v))
+        .collect();
+    let (mut co_coords, mut co_pv, mut co_sv) = (Vec::new(), Vec::new(), Vec::new());
+    for (c, &v) in primary.coords().iter().zip(primary.values()) {
+        if let Some(&s) = sec_lookup.get(&key(c)) {
+            co_coords.push(*c);
+            co_pv.push(v);
+            co_sv.push(s);
+        }
+    }
+    if co_coords.len() < cfg.n_lags {
+        return Err(GeostatError::InsufficientData(format!(
+            "{} collocated primary/secondary points for {} lags: too few to \
+             fit the cross-variogram",
+            co_coords.len(),
+            cfg.n_lags
+        )));
+    }
+    let prim_co = PointSet::new(co_coords.clone(), co_pv)?;
+    let sec_co = PointSet::new(co_coords, co_sv)?;
+    let eab = crate::variogram::experimental_cross_variogram(&prim_co, &sec_co, cfg)?;
+
+    let template = crate::variogram::fit_best(&ea, kinds)?;
+    fit_lmc(&ea, &eb, &eab, &template.model)
+}
+
 /// Fits a 2-variable LMC by linear weighted least squares.
 ///
 /// The structure shapes (nugget presence, kinds, ranges, anisotropy) are

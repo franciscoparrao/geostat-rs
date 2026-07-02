@@ -10,7 +10,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use geostat_core::{
     CoKriging, CoKrigingConfig, DirectionConfig, Grid2D, IkConfig, Kriging, KrigingConfig,
     KrigingMethod, ModelKind, PointSet, SgsConfig, SisConfig, VariogramConfig, VariogramModel,
-    experimental_cross_variogram, experimental_variogram, fit_anisotropic, fit_best, fit_lmc,
+    experimental_variogram, fit_anisotropic, fit_best, fit_indicator_models, fit_lmc_collocated,
     indicator_kriging, k_fold, leave_one_out, leave_one_out_with_drift,
     sequential_gaussian_simulation, sequential_indicator_simulation, variogram_map, vecchia_mle,
     vecchia_reml,
@@ -131,20 +131,16 @@ struct VariogramOpts {
 
 impl VariogramOpts {
     fn config<const D: usize>(&self, data: &PointSet<D>) -> VariogramConfig {
-        let (min, max) = data.bbox();
-        let diag = (0..D)
-            .map(|d| (max[d] - min[d]).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        VariogramConfig {
-            n_lags: self.n_lags,
-            max_dist: self.max_dist.unwrap_or(diag / 3.0),
-            direction: self.azimuth.map(|az| DirectionConfig {
+        VariogramConfig::for_data(
+            data,
+            self.n_lags,
+            self.max_dist,
+            self.azimuth.map(|az| DirectionConfig {
                 azimuth_deg: az,
                 dip_deg: self.dip,
                 tolerance_deg: self.tolerance,
             }),
-        }
+        )
     }
 }
 
@@ -333,6 +329,10 @@ struct CokrigeCmd {
     grid: GridOpts,
     #[command(flatten)]
     neighbors: NeighborOpts,
+    /// Diagonal inflation of the co-kriging matrix (0 = exact system;
+    /// e.g. 1e-2 stabilizes ill-conditioned heterotopic systems)
+    #[arg(long, default_value_t = 0.0)]
+    ridge: f64,
     /// Output CSV file (x,y,prediction,variance)
     #[arg(short, long)]
     output: PathBuf,
@@ -1293,17 +1293,8 @@ fn run_cokrige(cmd: CokrigeCmd) -> Result<()> {
         }
         None => {
             let cfg = cmd.vario.config(&primary);
-            let ea = experimental_variogram(&primary, &cfg)?;
-            let eb = experimental_variogram(&secondary, &cfg)?;
-            let eab = experimental_cross_variogram(&primary, &secondary, &cfg)?;
-            let template = fit_best(&ea, &ModelKind::ALL)?;
-            let lmc = fit_lmc(&ea, &eb, &eab, &template.model)?;
-            println!(
-                "LMC auto-fitted (template {} {}, range {:.1}):",
-                template.model.structures[0].sill,
-                template.model.structures[0].kind,
-                template.model.structures[0].range,
-            );
+            let lmc = fit_lmc_collocated(&primary, &secondary, &cfg, &ModelKind::ALL)?;
+            println!("LMC auto-fitted:");
             println!("  nugget matrix: {:?}", lmc.nugget);
             for s in &lmc.structures {
                 println!("  {} ({:.1}): {:?}", s.kind, s.range, s.sills);
@@ -1320,7 +1311,7 @@ fn run_cokrige(cmd: CokrigeCmd) -> Result<()> {
     let config = CoKrigingConfig {
         max_neighbors: cmd.neighbors.max_neighbors,
         search_radius: cmd.neighbors.radius,
-        ridge: 0.0,
+        ridge: cmd.ridge,
     };
     let ck = CoKriging::new(vec![&primary, &secondary], &lmc, config)?;
     let (values, variances) = match &cmd.block {
@@ -1530,18 +1521,9 @@ fn run_sis(cmd: SisCmd) -> Result<()> {
     // Fit an indicator variogram model per cutoff.
     let kinds = parse_kinds(&cmd.fit)?;
     let cfg_v = cmd.vario.config(&data);
-    let mut models: Vec<VariogramModel> = Vec::with_capacity(cutoffs.len());
-    for &c in &cutoffs {
-        let indicators: Vec<f64> = data
-            .values()
-            .iter()
-            .map(|&v| if v <= c { 1.0 } else { 0.0 })
-            .collect();
-        let ind_data = PointSet::new(data.coords().to_vec(), indicators)?;
-        let ev = experimental_variogram(&ind_data, &cfg_v)?;
-        let fit = fit_best(&ev, &kinds)?;
-        println!("Indicator model at cutoff {c:.4}: {}", fit.model);
-        models.push(fit.model);
+    let models = fit_indicator_models(&data, &cutoffs, &kinds, &cfg_v)?;
+    for (c, m) in cutoffs.iter().zip(&models) {
+        println!("Indicator model at cutoff {c:.4}: {m}");
     }
 
     let grid = cmd.grid.build(&data)?;
@@ -1618,21 +1600,11 @@ fn run_ik(cmd: IkCmd) -> Result<()> {
         None => {
             let kinds = parse_kinds(&cmd.fit)?;
             let cfg_v = cmd.vario.config(&data);
-            cutoffs
-                .iter()
-                .map(|&c| {
-                    let indicators: Vec<f64> = data
-                        .values()
-                        .iter()
-                        .map(|&v| if v <= c { 1.0 } else { 0.0 })
-                        .collect();
-                    let ind = PointSet::new(data.coords().to_vec(), indicators)?;
-                    let ev = experimental_variogram(&ind, &cfg_v)?;
-                    let fit = fit_best(&ev, &kinds)?;
-                    println!("Indicator model at cutoff {c:.4}: {}", fit.model);
-                    Ok(fit.model)
-                })
-                .collect::<Result<_>>()?
+            let models = fit_indicator_models(&data, &cutoffs, &kinds, &cfg_v)?;
+            for (c, m) in cutoffs.iter().zip(&models) {
+                println!("Indicator model at cutoff {c:.4}: {m}");
+            }
+            models
         }
     };
 
@@ -1661,13 +1633,7 @@ fn run_ik(cmd: IkCmd) -> Result<()> {
 }
 
 fn parse_kinds(spec: &str) -> Result<Vec<ModelKind>> {
-    let spec = spec.trim();
-    if spec.eq_ignore_ascii_case("best") || spec.eq_ignore_ascii_case("all") {
-        return Ok(ModelKind::ALL.to_vec());
-    }
-    spec.split(',')
-        .map(|s| s.parse::<ModelKind>().map_err(Into::into))
-        .collect()
+    ModelKind::parse_list(spec).map_err(Into::into)
 }
 
 fn parse_floats(spec: &str) -> Result<Vec<f64>> {

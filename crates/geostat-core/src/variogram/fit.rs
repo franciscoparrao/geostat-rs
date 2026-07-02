@@ -117,6 +117,32 @@ pub fn fit_best(exp_v: &ExperimentalVariogram, kinds: &[ModelKind]) -> Result<Fi
     })
 }
 
+/// Fits one indicator variogram model per cutoff: the data are coded as
+/// `1.0` where `value <= cutoff` (else `0.0`), an experimental variogram is
+/// computed under `cfg`, and the best of `kinds` is fitted. This is the
+/// auto-fit path shared by sequential indicator simulation and indicator
+/// kriging in every front-end.
+pub fn fit_indicator_models<const D: usize>(
+    data: &PointSet<D>,
+    cutoffs: &[f64],
+    kinds: &[ModelKind],
+    cfg: &VariogramConfig,
+) -> Result<Vec<VariogramModel>> {
+    cutoffs
+        .iter()
+        .map(|&c| {
+            let indicators: Vec<f64> = data
+                .values()
+                .iter()
+                .map(|&v| if v <= c { 1.0 } else { 0.0 })
+                .collect();
+            let ind = PointSet::new(data.coords().to_vec(), indicators)?;
+            let ev = experimental_variogram(&ind, cfg)?;
+            Ok(fit_best(&ev, kinds)?.model)
+        })
+        .collect()
+}
+
 /// One directional bin used by the anisotropy fit: the lag's unit direction
 /// `(sin φ, cos φ)`, its mean distance, the semivariance and the fit weight.
 struct DirSample {
