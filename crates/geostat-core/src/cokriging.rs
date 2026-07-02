@@ -503,82 +503,167 @@ pub fn fit_lmc_collocated<const D: usize>(
     fit_lmc(&ea, &eb, &eab, &template.model)
 }
 
-/// Fits a 2-variable LMC by linear weighted least squares.
+/// One experimental curve prepared for the LMC fit: semivariances, WLS
+/// weights and the basis functions evaluated at each retained bin.
+struct LmcCurve {
+    gamma: Vec<f64>,
+    w: Vec<f64>,
+    /// `basis[bin][k]`: nugget (k = 0) and unit-sill structures.
+    basis: Vec<Vec<f64>>,
+}
+
+/// Fits a 2-variable LMC by the iterative Goulard & Voltz (1992) algorithm.
 ///
-/// The structure shapes (nugget presence, kinds, ranges, anisotropy) are
-/// taken from `template` (typically a fit of the primary variable). For each
-/// variable pair, the (co)sills are solved by WLS (weights `N/h²`) — the
-/// problem is linear once shapes are fixed — and each per-structure sill
-/// matrix is then projected onto the PSD cone (eigenvalue clipping).
+/// The structure shapes (nugget presence, kinds, ranges) are taken from
+/// `template` (typically a fit of the primary variable). Starting from the
+/// per-pair WLS solution (weights `N/h²`, gstat's default), the algorithm
+/// cycles over structures: each per-structure sill matrix is re-solved by
+/// WLS given the others and projected onto the PSD cone (eigenvalue
+/// clipping), until the weighted SSE stops improving. When no PSD
+/// constraint is active this reduces exactly to the separable per-pair WLS
+/// optimum.
+///
+/// The template must be isotropic: the experimental inputs are
+/// omnidirectional curves, so an anisotropic template would fit sills
+/// against a direction-averaged curve and then apply them directionally —
+/// silently inconsistent. Fit anisotropy separately or supply the LMC
+/// explicitly.
 pub fn fit_lmc(
     direct_a: &ExperimentalVariogram,
     direct_b: &ExperimentalVariogram,
     cross_ab: &ExperimentalVariogram,
     template: &VariogramModel,
 ) -> Result<Lmc> {
+    if template.structures.iter().any(|s| s.anis.is_some()) {
+        return Err(GeostatError::InvalidParameter(
+            "fit_lmc requires an isotropic template: sills are fitted to \
+             omnidirectional curves and cannot be reused anisotropically \
+             (fit directional models separately or supply the LMC explicitly)"
+                .into(),
+        ));
+    }
     let n_str = template.structures.len();
     let n_par = 1 + n_str; // nugget + one sill per structure
 
-    // Solve the WLS sills for one experimental curve.
-    let fit_pair = |ev: &ExperimentalVariogram| -> Result<Vec<f64>> {
-        let pts: Vec<(f64, f64, f64)> = ev
-            .bins
-            .iter()
-            .filter(|b| b.n_pairs > 0 && b.h > 0.0 && b.gamma.is_finite())
-            .map(|b| (b.h, b.gamma, b.n_pairs as f64 / (b.h * b.h)))
-            .collect();
-        if pts.len() < n_par + 1 {
+    let prep = |ev: &ExperimentalVariogram| -> Result<LmcCurve> {
+        let mut curve = LmcCurve {
+            gamma: Vec::new(),
+            w: Vec::new(),
+            basis: Vec::new(),
+        };
+        for b in &ev.bins {
+            if b.n_pairs == 0 || !(b.h > 0.0) || !b.gamma.is_finite() {
+                continue;
+            }
+            let mut row = vec![1.0; n_par];
+            for (s, st) in template.structures.iter().enumerate() {
+                row[1 + s] = st.kind.g(b.h, st.range);
+            }
+            curve.gamma.push(b.gamma);
+            curve.w.push(b.n_pairs as f64 / (b.h * b.h));
+            curve.basis.push(row);
+        }
+        if curve.gamma.len() < n_par + 1 {
             return Err(GeostatError::InsufficientData(format!(
                 "LMC fit needs more non-empty lag bins than parameters ({n_par})"
             )));
         }
-        // Normal equations for gamma(h) = x0 + sum_s x_s * g_s(h).
+        Ok(curve)
+    };
+    let curves = [prep(direct_a)?, prep(direct_b)?, prep(cross_ab)?];
+
+    // Initial estimate: independent WLS per pair (normal equations with a
+    // tiny ridge against collinear bases), then a one-shot PSD projection.
+    let wls = |curve: &LmcCurve| -> Result<Vec<f64>> {
         let mut ata = Array2::<f64>::zeros((n_par, n_par));
         let mut atb = vec![0.0; n_par];
-        let mut basis = vec![0.0; n_par];
-        for &(h, gamma, wgt) in &pts {
-            basis[0] = 1.0;
-            for (s, st) in template.structures.iter().enumerate() {
-                let unit = VariogramModel {
-                    nugget: 0.0,
-                    structures: vec![crate::variogram::Structure {
-                        kind: st.kind,
-                        sill: 1.0,
-                        range: st.range,
-                        anis: None,
-                    }],
-                };
-                basis[1 + s] = unit.gamma(h);
-            }
+        for ((row, &g), &wgt) in curve.basis.iter().zip(&curve.gamma).zip(&curve.w) {
             for r in 0..n_par {
                 for c in 0..n_par {
-                    ata[[r, c]] += wgt * basis[r] * basis[c];
+                    ata[[r, c]] += wgt * row[r] * row[c];
                 }
-                atb[r] += wgt * basis[r] * gamma;
+                atb[r] += wgt * row[r] * g;
             }
         }
-        // Tiny ridge: with a degenerate template (range far smaller or larger
-        // than the lag span) the basis columns become collinear.
         let trace_scale = (0..n_par).map(|r| ata[[r, r]]).fold(0.0_f64, f64::max);
         for r in 0..n_par {
             ata[[r, r]] += 1e-9 * trace_scale.max(f64::MIN_POSITIVE);
         }
         solve(ata, atb)
     };
+    let sa = wls(&curves[0])?;
+    let sb = wls(&curves[1])?;
+    let sab = wls(&curves[2])?;
 
-    let sa = fit_pair(direct_a)?;
-    let sb = fit_pair(direct_b)?;
-    let sab = fit_pair(cross_ab)?;
+    // sills[k] = (aa, bb, ab) of parameter k, kept PSD at all times.
+    let mut sills: Vec<(f64, f64, f64)> = (0..n_par)
+        .map(|k| {
+            let m = project_psd_2x2(sa[k].max(0.0), sab[k], sb[k].max(0.0));
+            (m[0][0], m[1][1], m[0][1])
+        })
+        .collect();
 
-    // Assemble per-structure 2x2 matrices and project each onto PSD.
-    let assemble = |k: usize| -> Vec<Vec<f64>> {
-        // Direct sills cannot be negative; clamp before projection.
-        let aa = sa[k].max(0.0);
-        let bb = sb[k].max(0.0);
-        project_psd_2x2(aa, sab[k], bb)
+    // Weighted SSE of a candidate sill set over the three curves, in the
+    // Goulard-Voltz (Frobenius) convention: the cross entry appears twice in
+    // the symmetric coregionalization matrix, so its curve counts double.
+    // Under this norm the eigenvalue clip is the exact solution of each
+    // per-structure subproblem when the curves share bins and weights.
+    let entry = |s: &(f64, f64, f64), pair: usize| match pair {
+        0 => s.0,
+        1 => s.1,
+        _ => s.2,
+    };
+    let wss = |sills: &[(f64, f64, f64)]| -> f64 {
+        let mut total = 0.0;
+        for (pair, curve) in curves.iter().enumerate() {
+            let mult = if pair == 2 { 2.0 } else { 1.0 };
+            for ((row, &g), &wgt) in curve.basis.iter().zip(&curve.gamma).zip(&curve.w) {
+                let fit: f64 = (0..n_par).map(|k| entry(&sills[k], pair) * row[k]).sum();
+                total += mult * wgt * (g - fit) * (g - fit);
+            }
+        }
+        total
     };
 
-    let nugget = assemble(0);
+    // Goulard–Voltz coordinate descent: re-solve one structure's sill matrix
+    // given the others, project onto PSD, keep while the WSS improves.
+    let mut best = wss(&sills);
+    for _ in 0..100 {
+        let previous = sills.clone();
+        for k in 0..n_par {
+            let mut beta = [0.0_f64; 3];
+            for (pair, curve) in curves.iter().enumerate() {
+                let (mut num, mut den) = (0.0, 0.0);
+                for ((row, &g), &wgt) in curve.basis.iter().zip(&curve.gamma).zip(&curve.w) {
+                    let others: f64 = (0..n_par)
+                        .filter(|&j| j != k)
+                        .map(|j| entry(&sills[j], pair) * row[j])
+                        .sum();
+                    num += wgt * row[k] * (g - others);
+                    den += wgt * row[k] * row[k];
+                }
+                beta[pair] = if den > 0.0 { num / den } else { 0.0 };
+            }
+            let m = project_psd_2x2(beta[0].max(0.0), beta[2], beta[1].max(0.0));
+            sills[k] = (m[0][0], m[1][1], m[0][1]);
+        }
+        let current = wss(&sills);
+        if current > best {
+            // The projection is not exactly the weighted subproblem optimum
+            // when the three curves carry different weights; never accept a
+            // WSS increase.
+            sills = previous;
+            break;
+        }
+        let converged = best - current <= 1e-12 * best.max(1e-300);
+        best = current;
+        if converged {
+            break;
+        }
+    }
+
+    let to_matrix = |s: &(f64, f64, f64)| vec![vec![s.0, s.2], vec![s.2, s.1]];
+    let nugget = to_matrix(&sills[0]);
     let structures = template
         .structures
         .iter()
@@ -586,8 +671,8 @@ pub fn fit_lmc(
         .map(|(s, st)| LmcStructure {
             kind: st.kind,
             range: st.range,
-            anis: st.anis,
-            sills: assemble(1 + s),
+            anis: None,
+            sills: to_matrix(&sills[1 + s]),
         })
         .collect();
     Lmc::new(nugget, structures)
@@ -857,6 +942,116 @@ mod tests {
         .unwrap();
         let s = &fitted.structures[0].sills;
         assert!(s[0][1] * s[0][1] <= s[0][0] * s[1][1] + 1e-9);
+    }
+
+    #[test]
+    fn fit_lmc_rejects_anisotropic_template() {
+        let cfg_width = 2.0;
+        let mk = || -> ExperimentalVariogram {
+            let m = VariogramModel::new(0.0, vec![Structure::new(ModelKind::Spherical, 1.0, 15.0)])
+                .unwrap();
+            let bins = (0..12)
+                .map(|i| {
+                    let h = (i as f64 + 0.5) * cfg_width;
+                    crate::variogram::LagBin {
+                        h,
+                        gamma: m.gamma(h),
+                        n_pairs: 50,
+                    }
+                })
+                .collect();
+            ExperimentalVariogram {
+                bins,
+                max_dist: 24.0,
+            }
+        };
+        let template = VariogramModel::new(
+            0.0,
+            vec![Structure {
+                kind: ModelKind::Spherical,
+                sill: 1.0,
+                range: 15.0,
+                anis: Some(crate::variogram::Anisotropy {
+                    azimuth_deg: 30.0,
+                    ratio: 0.5,
+                    ratio_z: 1.0,
+                }),
+            }],
+        )
+        .unwrap();
+        assert!(fit_lmc(&mk(), &mk(), &mk(), &template).is_err());
+    }
+
+    #[test]
+    fn goulard_voltz_beats_one_shot_clipping() {
+        // Direct curves carry a real nugget (0.3) and structure sill 1; the
+        // cross curve has no nugget but an impossible structure sill of 1.8.
+        // The one-shot clip of [[1, 1.8], [1.8, 1]] leaves a large residual
+        // on the cross curve that a re-fitted cross nugget (bounded by the
+        // direct nuggets) can absorb - exactly the coupling the iterated
+        // Goulard-Voltz pass exploits.
+        let cfg_width = 2.0;
+        let mk_gamma = |sill: f64, nug: f64| -> ExperimentalVariogram {
+            let m =
+                VariogramModel::new(nug, vec![Structure::new(ModelKind::Spherical, sill, 15.0)])
+                    .unwrap();
+            let bins = (0..12)
+                .map(|i| {
+                    let h = (i as f64 + 0.5) * cfg_width;
+                    crate::variogram::LagBin {
+                        h,
+                        gamma: m.gamma(h),
+                        n_pairs: 50,
+                    }
+                })
+                .collect();
+            ExperimentalVariogram {
+                bins,
+                max_dist: 24.0,
+            }
+        };
+        let template =
+            VariogramModel::new(0.1, vec![Structure::new(ModelKind::Spherical, 1.0, 15.0)])
+                .unwrap();
+        let curves = [mk_gamma(1.0, 0.3), mk_gamma(1.0, 0.3), mk_gamma(1.8, 0.0)];
+        let fitted = fit_lmc(&curves[0], &curves[1], &curves[2], &template).unwrap();
+
+        // Frobenius-convention WSS (cross curve counted twice).
+        let wss_of = |nug: &[Vec<f64>], sills: &[Vec<f64>]| -> f64 {
+            let base =
+                VariogramModel::new(0.0, vec![Structure::new(ModelKind::Spherical, 1.0, 15.0)])
+                    .unwrap();
+            let mut total = 0.0;
+            for (pair, (i, j)) in [(0usize, 0usize), (1, 1), (0, 1)].iter().enumerate() {
+                let mult = if pair == 2 { 2.0 } else { 1.0 };
+                for b in &curves[pair].bins {
+                    let fit = nug[*i][*j] + sills[*i][*j] * base.gamma(b.h);
+                    let w = b.n_pairs as f64 / (b.h * b.h);
+                    total += mult * w * (b.gamma - fit) * (b.gamma - fit);
+                }
+            }
+            total
+        };
+        // One-shot reference: independent WLS recovers the true per-pair
+        // coefficients exactly (the curves are noiseless), so the clip acts
+        // on nugget [[0.3, 0], [0, 0.3]] (already PSD) and structure
+        // [[1, 1.8], [1.8, 1]] -> [[1.4, 1.4], [1.4, 1.4]].
+        let clip_nug = vec![vec![0.3, 0.0], vec![0.0, 0.3]];
+        let clip_str = vec![vec![1.4, 1.4], vec![1.4, 1.4]];
+        let wss_gv = wss_of(&fitted.nugget, &fitted.structures[0].sills);
+        let wss_clip = wss_of(&clip_nug, &clip_str);
+        assert!(
+            wss_gv <= wss_clip + 1e-9,
+            "GV wss {wss_gv} vs one-shot {wss_clip}"
+        );
+        assert!(wss_gv < 0.98 * wss_clip, "expected strict improvement");
+        // The improvement comes through a positive cross nugget within the
+        // PSD bound of the direct nuggets.
+        let cn = fitted.nugget[0][1];
+        assert!(
+            cn > 0.01 && cn * cn <= fitted.nugget[0][0] * fitted.nugget[1][1] + 1e-9,
+            "cross nugget {cn}"
+        );
     }
 
     #[test]

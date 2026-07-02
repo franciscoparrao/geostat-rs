@@ -38,7 +38,7 @@ impl ModelKind {
     ];
 
     /// Normalized variogram (unit sill) at lag `h` for range parameter `a`.
-    fn g(self, h: f64, a: f64) -> f64 {
+    pub(crate) fn g(self, h: f64, a: f64) -> f64 {
         let d = h / a;
         match self {
             ModelKind::Spherical => {
