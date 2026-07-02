@@ -50,8 +50,8 @@ impl KrigingMethod {
 
 /// Kriging configuration: method plus search neighborhood.
 ///
-/// With both `max_neighbors` and `search_radius` unset, a global
-/// neighborhood (all data points) is used. Neighbor distances are
+/// With `max_neighbors`, `search_radius` and `max_per_octant` unset, a
+/// global neighborhood (all data points) is used. Neighbor distances are
 /// Euclidean even for anisotropic models (gstat/GSLIB behavior).
 #[derive(Debug, Clone, PartialEq)]
 pub struct KrigingConfig {
@@ -61,6 +61,15 @@ pub struct KrigingConfig {
     pub max_neighbors: Option<usize>,
     /// Maximum search distance for conditioning points.
     pub search_radius: Option<f64>,
+    /// Minimum conditioning points per estimate (GSLIB `ndmin`): targets
+    /// whose neighborhood is smaller fail with `NoNeighbors` instead of
+    /// estimating from too little data.
+    pub min_neighbors: Option<usize>,
+    /// Maximum conditioning points taken per octant around the target
+    /// (GSLIB `noct`; quadrants in 2-D). Balances the neighborhood when the
+    /// data are clustered: nearest-only search would take every point from
+    /// one side and screen the rest of the domain.
+    pub max_per_octant: Option<usize>,
 }
 
 impl Default for KrigingConfig {
@@ -69,6 +78,8 @@ impl Default for KrigingConfig {
             method: KrigingMethod::Ordinary,
             max_neighbors: None,
             search_radius: None,
+            min_neighbors: None,
+            max_per_octant: None,
         }
     }
 }
@@ -199,6 +210,31 @@ impl<'a, const D: usize> Kriging<'a, D> {
         if let Some((i, j)) = data.duplicate_pair() {
             return Err(GeostatError::DuplicatePoints(i, j));
         }
+        if config.max_per_octant == Some(0) {
+            return Err(GeostatError::InvalidParameter(
+                "max_per_octant must be at least 1".into(),
+            ));
+        }
+        if let Some(min_nb) = config.min_neighbors {
+            if min_nb == 0 {
+                return Err(GeostatError::InvalidParameter(
+                    "min_neighbors must be at least 1".into(),
+                ));
+            }
+            if min_nb > data.len() {
+                return Err(GeostatError::InsufficientData(format!(
+                    "min_neighbors ({min_nb}) exceeds the number of data points ({})",
+                    data.len()
+                )));
+            }
+            if let Some(max_nb) = config.max_neighbors
+                && min_nb > max_nb
+            {
+                return Err(GeostatError::InvalidParameter(format!(
+                    "min_neighbors ({min_nb}) exceeds max_neighbors ({max_nb})"
+                )));
+            }
+        }
         let (min, max) = data.bbox();
         let mut center = [0.0; D];
         let mut spread = 0.0_f64;
@@ -226,8 +262,10 @@ impl<'a, const D: usize> Kriging<'a, D> {
             }
         }
 
-        let tree = (config.max_neighbors.is_some() || config.search_radius.is_some())
-            .then(|| KdTree::build(data.coords()));
+        let tree = (config.max_neighbors.is_some()
+            || config.search_radius.is_some()
+            || config.max_per_octant.is_some())
+        .then(|| KdTree::build(data.coords()));
 
         let mut kriging = Self {
             data,
@@ -287,14 +325,44 @@ impl<'a, const D: usize> Kriging<'a, D> {
     }
 
     fn neighbors(&self, target: [f64; D]) -> Vec<usize> {
-        match &self.tree {
-            None => (0..self.data.len()).collect(),
-            Some(tree) => tree.k_nearest(
+        let Some(tree) = &self.tree else {
+            return (0..self.data.len()).collect();
+        };
+        let Some(per_octant) = self.config.max_per_octant else {
+            return tree.k_nearest(
                 target,
                 self.config.max_neighbors.unwrap_or(self.data.len()),
                 self.config.search_radius,
-            ),
+            );
+        };
+        // Octant search (GSLIB noct): walk the radius-bounded candidates in
+        // distance order, taking at most `per_octant` per 2^D sector around
+        // the target, then cap the total at max_neighbors (GSLIB ndmax).
+        let mut cand = tree.k_nearest(target, self.data.len(), self.config.search_radius);
+        let d2 = |i: usize| -> f64 {
+            let c = self.data.coord(i);
+            (0..D).map(|d| (c[d] - target[d]).powi(2)).sum()
+        };
+        cand.sort_by(|&a, &b| d2(a).total_cmp(&d2(b)));
+        let mut counts = vec![0_usize; 1 << D];
+        let mut selected = Vec::new();
+        for &i in &cand {
+            let c = self.data.coord(i);
+            let mut oct = 0;
+            for d in 0..D {
+                if c[d] >= target[d] {
+                    oct |= 1 << d;
+                }
+            }
+            if counts[oct] < per_octant {
+                counts[oct] += 1;
+                selected.push(i);
+            }
         }
+        if let Some(k) = self.config.max_neighbors {
+            selected.truncate(k); // distance-ordered, so this keeps the nearest
+        }
+        selected
     }
 
     /// Kriging estimate at a single target location (simple/ordinary/
@@ -363,7 +431,7 @@ impl<'a, const D: usize> Kriging<'a, D> {
         target_drift: Option<&[f64]>,
     ) -> Result<KrigingEstimate> {
         let nb = self.neighbors(target);
-        if nb.is_empty() {
+        if nb.len() < self.config.min_neighbors.unwrap_or(1) {
             return Err(GeostatError::NoNeighbors);
         }
         let m = self.config.method.n_drift(D);
@@ -469,7 +537,7 @@ impl<'a, const D: usize> Kriging<'a, D> {
             ));
         }
         let nb = self.neighbors(center);
-        if nb.is_empty() {
+        if nb.len() < self.config.min_neighbors.unwrap_or(1) {
             return Err(GeostatError::NoNeighbors);
         }
         let m = self.config.method.n_drift(D);
@@ -624,6 +692,106 @@ mod tests {
 
     fn model() -> VariogramModel {
         VariogramModel::new(0.05, vec![Structure::new(ModelKind::Spherical, 0.95, 2.0)]).unwrap()
+    }
+
+    #[test]
+    fn min_neighbors_fails_sparse_targets() {
+        let data = sample_data();
+        let m = model();
+        let k = Kriging::new(
+            &data,
+            &m,
+            KrigingConfig {
+                search_radius: Some(0.75),
+                min_neighbors: Some(3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Near the cloud: enough neighbors.
+        assert!(k.predict([0.5, 0.5]).is_ok());
+        // Isolated corner: only one point within 0.75 -> refused.
+        match k.predict([1.5, 1.5]) {
+            Err(GeostatError::NoNeighbors) => {}
+            other => panic!("expected NoNeighbors, got {other:?}"),
+        }
+        // Invalid combinations rejected at build.
+        assert!(
+            Kriging::new(
+                &data,
+                &m,
+                KrigingConfig {
+                    min_neighbors: Some(0),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            Kriging::new(
+                &data,
+                &m,
+                KrigingConfig {
+                    max_neighbors: Some(2),
+                    min_neighbors: Some(3),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn octant_search_balances_clustered_neighbors() {
+        // Dense cluster of high values just east of the target; a few low
+        // values west, slightly farther. Nearest-only search sees only the
+        // cluster; a 1-per-quadrant search must include the west points.
+        let mut coords = vec![
+            [1.0, 0.1],
+            [1.1, -0.1],
+            [1.2, 0.2],
+            [1.3, -0.2],
+            [1.4, 0.05],
+        ];
+        let mut values = vec![10.0; coords.len()];
+        coords.extend_from_slice(&[[-2.0, 0.5], [-2.0, -0.5], [0.5, -2.0], [0.5, 2.0]]);
+        values.extend_from_slice(&[0.0, 0.0, 0.0, 0.0]);
+        let data = PointSet::new(coords, values).unwrap();
+        let m = model();
+        let target = [0.0, 0.0];
+
+        let nearest = Kriging::new(
+            &data,
+            &m,
+            KrigingConfig {
+                max_neighbors: Some(4),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .predict(target)
+        .unwrap();
+        let octant = Kriging::new(
+            &data,
+            &m,
+            KrigingConfig {
+                max_neighbors: Some(4),
+                max_per_octant: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .predict(target)
+        .unwrap();
+        // Pure k-nearest conditions only on the cluster (estimate ~10);
+        // octant search mixes in the low values from the other quadrants.
+        assert!(nearest.value > 9.0, "nearest-only {}", nearest.value);
+        assert!(
+            octant.value < nearest.value - 2.0,
+            "octant {} vs nearest {}",
+            octant.value,
+            nearest.value
+        );
     }
 
     #[test]
@@ -796,6 +964,7 @@ mod tests {
             method: KrigingMethod::Ordinary,
             max_neighbors: Some(3),
             search_radius: Some(0.001),
+            ..Default::default()
         };
         let k = Kriging::new(&data, &m, cfg).unwrap();
         assert!(matches!(

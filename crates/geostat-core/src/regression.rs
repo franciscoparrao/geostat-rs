@@ -384,6 +384,7 @@ mod tests {
             method: KrigingMethod::Ordinary,
             max_neighbors: None,
             search_radius: None,
+            ..Default::default()
         };
         let targets = [[40.0, 55.0], [70.0, 20.0], [15.0, 80.0]];
 

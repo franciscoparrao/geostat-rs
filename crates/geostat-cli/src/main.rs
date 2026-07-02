@@ -186,6 +186,14 @@ struct NeighborOpts {
     /// Search radius for conditioning points
     #[arg(long)]
     radius: Option<f64>,
+    /// Minimum conditioning points per estimate (GSLIB ndmin): estimates
+    /// with fewer neighbors fail instead of using too little data
+    #[arg(long)]
+    min_neighbors: Option<usize>,
+    /// Maximum conditioning points per octant/quadrant around the target
+    /// (GSLIB noct): balances the neighborhood for clustered data
+    #[arg(long)]
+    octant: Option<usize>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -862,6 +870,8 @@ fn run_compare(cmd: CompareCmd) -> Result<()> {
         method: KrigingMethod::Ordinary,
         max_neighbors: cmd.neighbors.max_neighbors,
         search_radius: cmd.neighbors.radius,
+        min_neighbors: cmd.neighbors.min_neighbors,
+        max_per_octant: cmd.neighbors.octant,
     };
 
     let mn = cmd.neighbors.max_neighbors;
@@ -967,6 +977,8 @@ fn run_rk(cmd: RkCmd) -> Result<()> {
         method: KrigingMethod::Ordinary,
         max_neighbors: cmd.neighbors.max_neighbors,
         search_radius: cmd.neighbors.radius,
+        min_neighbors: cmd.neighbors.min_neighbors,
+        max_per_octant: cmd.neighbors.octant,
     };
     let ests = rk.predict(&coords, &trend_at_targets, &resid_model, &config)?;
     let n_nan = ests.iter().filter(|e| e.value.is_nan()).count();
@@ -1225,6 +1237,8 @@ fn run_krige(cmd: KrigeCmd) -> Result<()> {
             method: cmd.method.build(&data),
             max_neighbors: cmd.neighbors.max_neighbors,
             search_radius: cmd.neighbors.radius,
+            min_neighbors: cmd.neighbors.min_neighbors,
+            max_per_octant: cmd.neighbors.octant,
         };
         let kriging: Kriging<'_, 3> = Kriging::new(&data, &model, config)?;
         let targets =
@@ -1259,6 +1273,8 @@ fn run_krige(cmd: KrigeCmd) -> Result<()> {
             },
             max_neighbors: cmd.neighbors.max_neighbors,
             search_radius: cmd.neighbors.radius,
+            min_neighbors: cmd.neighbors.min_neighbors,
+            max_per_octant: cmd.neighbors.octant,
         };
         let kriging = Kriging::with_external_drift(&data, &model, config, drift_data)?;
         let (coords, target_drift) = io_utils::read_targets(
@@ -1287,6 +1303,8 @@ fn run_krige(cmd: KrigeCmd) -> Result<()> {
         method: cmd.method.build(&data),
         max_neighbors: cmd.neighbors.max_neighbors,
         search_radius: cmd.neighbors.radius,
+        min_neighbors: cmd.neighbors.min_neighbors,
+        max_per_octant: cmd.neighbors.octant,
     };
 
     if cmd.lognormal {
@@ -1348,6 +1366,9 @@ fn run_krige(cmd: KrigeCmd) -> Result<()> {
 }
 
 fn run_cokrige(cmd: CokrigeCmd) -> Result<()> {
+    if cmd.neighbors.min_neighbors.is_some() || cmd.neighbors.octant.is_some() {
+        bail!("--min-neighbors/--octant are not supported by this command yet");
+    }
     let (primary, secondary) = match &cmd.secondary_input {
         Some(path) => {
             // Heterotopic: the secondary variable has its own locations.
@@ -1479,6 +1500,8 @@ fn run_cv(cmd: CvCmd) -> Result<()> {
             method: cmd.method.build(&data),
             max_neighbors: cmd.neighbors.max_neighbors,
             search_radius: cmd.neighbors.radius,
+            min_neighbors: cmd.neighbors.min_neighbors,
+            max_per_octant: cmd.neighbors.octant,
         };
         let cv = match cmd.folds {
             Some(k) => k_fold(&data, &model, &config, k, cmd.seed)?,
@@ -1511,6 +1534,8 @@ fn run_cv(cmd: CvCmd) -> Result<()> {
             },
             max_neighbors: cmd.neighbors.max_neighbors,
             search_radius: cmd.neighbors.radius,
+            min_neighbors: cmd.neighbors.min_neighbors,
+            max_per_octant: cmd.neighbors.octant,
         };
         let cv = leave_one_out_with_drift(&data, &drift_data, &model, &config)?;
         (data, cv)
@@ -1521,6 +1546,8 @@ fn run_cv(cmd: CvCmd) -> Result<()> {
             method: cmd.method.build(&data),
             max_neighbors: cmd.neighbors.max_neighbors,
             search_radius: cmd.neighbors.radius,
+            min_neighbors: cmd.neighbors.min_neighbors,
+            max_per_octant: cmd.neighbors.octant,
         };
         let cv = match cmd.folds {
             Some(k) => k_fold(&data, &model, &config, k, cmd.seed)?,
@@ -1725,6 +1752,9 @@ fn run_sis(cmd: SisCmd) -> Result<()> {
 }
 
 fn run_ik(cmd: IkCmd) -> Result<()> {
+    if cmd.neighbors.min_neighbors.is_some() || cmd.neighbors.octant.is_some() {
+        bail!("--min-neighbors/--octant are not supported by this command yet");
+    }
     let data = cmd.input.read()?;
     println!(
         "Loaded {} points from {}",

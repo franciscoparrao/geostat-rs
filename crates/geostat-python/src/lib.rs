@@ -355,10 +355,13 @@ fn vecchia_loglik(
 }
 
 /// Kriging at arbitrary target locations. Returns `(predictions, variances)`;
-/// failed targets yield NaN.
+/// failed targets yield NaN. `min_neighbors` (GSLIB ndmin) fails estimates
+/// with too few conditioning points; `octant` (GSLIB noct) caps the
+/// neighbors taken per quadrant to balance clustered data.
 #[pyfunction]
 #[pyo3(signature = (x, y, values, model, target_x, target_y, method = "ordinary",
-    mean = None, degree = 1, max_neighbors = None, radius = None))]
+    mean = None, degree = 1, max_neighbors = None, radius = None,
+    min_neighbors = None, octant = None))]
 #[allow(clippy::too_many_arguments)]
 fn krige(
     x: Vec<f64>,
@@ -372,6 +375,8 @@ fn krige(
     degree: u8,
     max_neighbors: Option<usize>,
     radius: Option<f64>,
+    min_neighbors: Option<usize>,
+    octant: Option<usize>,
 ) -> PyResult<(Vec<f64>, Vec<f64>)> {
     if target_x.len() != target_y.len() {
         return Err(PyValueError::new_err(
@@ -383,6 +388,8 @@ fn krige(
         method: build_method(method, mean, degree, &data)?,
         max_neighbors,
         search_radius: radius,
+        min_neighbors,
+        max_per_octant: octant,
     };
     let kriging = Kriging::new(&data, &model.inner, config).map_err(err)?;
     let targets: Vec<[f64; 2]> = target_x
@@ -438,6 +445,7 @@ fn lognormal_kriging(
         method: kmethod,
         max_neighbors,
         search_radius: radius,
+        ..Default::default()
     };
     let targets: Vec<[f64; 2]> = target_x
         .into_iter()
@@ -452,7 +460,8 @@ fn lognormal_kriging(
 /// cell centers with y increasing. Returns `(predictions, variances)`.
 #[pyfunction]
 #[pyo3(signature = (x, y, values, model, bbox, nx, ny, method = "ordinary",
-    mean = None, degree = 1, max_neighbors = None, radius = None, block = None, block_discr = (4, 4)))]
+    mean = None, degree = 1, max_neighbors = None, radius = None, block = None, block_discr = (4, 4),
+    min_neighbors = None, octant = None))]
 #[allow(clippy::too_many_arguments)]
 fn krige_grid(
     x: Vec<f64>,
@@ -469,6 +478,8 @@ fn krige_grid(
     radius: Option<f64>,
     block: Option<(f64, f64)>,
     block_discr: (usize, usize),
+    min_neighbors: Option<usize>,
+    octant: Option<usize>,
 ) -> PyResult<(Vec<f64>, Vec<f64>)> {
     let data = point_set(x, y, values)?;
     let grid = Grid2D::from_bbox([bbox.0, bbox.1], [bbox.2, bbox.3], nx, ny).map_err(err)?;
@@ -476,6 +487,8 @@ fn krige_grid(
         method: build_method(method, mean, degree, &data)?,
         max_neighbors,
         search_radius: radius,
+        min_neighbors,
+        max_per_octant: octant,
     };
     let kriging = Kriging::new(&data, &model.inner, config).map_err(err)?;
     match block {
@@ -491,7 +504,8 @@ fn krige_grid(
 /// `me`, `mae`, `rmse`, `msdr`, `vecv`, `e1`, `predicted` and `variance`.
 #[pyfunction]
 #[pyo3(signature = (x, y, values, model, method = "ordinary", mean = None,
-    degree = 1, max_neighbors = None, radius = None, folds = None, seed = 0))]
+    degree = 1, max_neighbors = None, radius = None, folds = None, seed = 0,
+    min_neighbors = None, octant = None))]
 #[allow(clippy::too_many_arguments)]
 fn loo_cv(
     py: Python<'_>,
@@ -506,12 +520,16 @@ fn loo_cv(
     radius: Option<f64>,
     folds: Option<usize>,
     seed: u64,
+    min_neighbors: Option<usize>,
+    octant: Option<usize>,
 ) -> PyResult<Py<PyDict>> {
     let data = point_set(x, y, values)?;
     let config = KrigingConfig {
         method: build_method(method, mean, degree, &data)?,
         max_neighbors,
         search_radius: radius,
+        min_neighbors,
+        max_per_octant: octant,
     };
     let cv = match folds {
         Some(k) => core::k_fold(&data, &model.inner, &config, k, seed).map_err(err)?,
@@ -608,6 +626,7 @@ fn regression_kriging(
         method: KrigingMethod::Ordinary,
         max_neighbors,
         search_radius: radius,
+        ..Default::default()
     };
     let ests = rk
         .predict(&targets, &trend_targets, &resid_model, &config)
@@ -760,6 +779,7 @@ fn compare_methods(
         method: KrigingMethod::Ordinary,
         max_neighbors,
         search_radius: radius,
+        ..Default::default()
     };
 
     let entries = [
@@ -1134,6 +1154,7 @@ fn krige_3d(
         method: kmethod,
         max_neighbors,
         search_radius: radius,
+        ..Default::default()
     };
     let kriging: Kriging<'_, 3> = Kriging::new(&data, &model.inner, config).map_err(err)?;
     let targets: Vec<[f64; 3]> = target_x

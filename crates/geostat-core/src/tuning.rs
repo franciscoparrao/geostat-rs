@@ -113,6 +113,7 @@ pub fn tune_kriging_neighbors<const D: usize>(
                 method,
                 max_neighbors: Some(n),
                 search_radius: radius,
+                ..Default::default()
             };
             let v = leave_one_out(data, model, &cfg)
                 .map(|cv| cv.vecv())
