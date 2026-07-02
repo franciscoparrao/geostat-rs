@@ -339,6 +339,39 @@ fn vecchia_param_se(
     Ok((se[0], se[1], se[2]))
 }
 
+/// Vecchia prediction at arbitrary targets (Katzfuss-Guinness): targets in
+/// max-min order condition on their `m` nearest previous points, observed
+/// data and already-processed targets alike, which keeps the joint
+/// predictive consistent at small `m`. Simple-kriging mean (the data mean).
+/// Scalable to very large data/target sets; equals exact global simple
+/// kriging when `m` covers everything. Returns `(predictions, variances)`.
+#[pyfunction]
+#[pyo3(signature = (x, y, values, model, target_x, target_y, m = 30))]
+#[allow(clippy::too_many_arguments)]
+fn vecchia_krige(
+    x: Vec<f64>,
+    y: Vec<f64>,
+    values: Vec<f64>,
+    model: &VariogramModel,
+    target_x: Vec<f64>,
+    target_y: Vec<f64>,
+    m: usize,
+) -> PyResult<(Vec<f64>, Vec<f64>)> {
+    if target_x.len() != target_y.len() {
+        return Err(PyValueError::new_err(
+            "target_x and target_y differ in length",
+        ));
+    }
+    let data = point_set(x, y, values)?;
+    let targets: Vec<[f64; 2]> = target_x
+        .into_iter()
+        .zip(target_y)
+        .map(|(tx, ty)| [tx, ty])
+        .collect();
+    let ests = core::vecchia_predict(&data, &model.inner, &targets, m).map_err(err)?;
+    Ok(ests.into_iter().map(|e| (e.value, e.variance)).unzip())
+}
+
 /// Vecchia-approximated Gaussian log-likelihood of the data under `model`, with
 /// conditioning size `m` (exact when `m >= n-1`).
 #[pyfunction]
@@ -1246,6 +1279,7 @@ fn geostat_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(vecchia_reml_drift, m)?)?;
     m.add_function(wrap_pyfunction!(vecchia_param_se, m)?)?;
     m.add_function(wrap_pyfunction!(vecchia_loglik, m)?)?;
+    m.add_function(wrap_pyfunction!(vecchia_krige, m)?)?;
     m.add_function(wrap_pyfunction!(krige, m)?)?;
     m.add_function(wrap_pyfunction!(krige_grid, m)?)?;
     m.add_function(wrap_pyfunction!(loo_cv, m)?)?;

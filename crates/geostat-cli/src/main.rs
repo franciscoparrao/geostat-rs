@@ -14,7 +14,7 @@ use geostat_core::{
     detrend_polynomial, experimental_variogram, fit_anisotropic, fit_best, fit_indicator_models,
     fit_lmc_collocated, indicator_kriging, k_fold, leave_one_out, leave_one_out_with_drift,
     sequential_gaussian_simulation, sequential_indicator_simulation, variogram_map, vecchia_mle,
-    vecchia_reml,
+    vecchia_predict, vecchia_reml,
 };
 
 #[derive(Parser)]
@@ -312,6 +312,11 @@ struct KrigeCmd {
     /// Column with a per-datum measurement-error variance (overrides --error)
     #[arg(long)]
     error_col: Option<String>,
+    /// Vecchia prediction with this conditioning size (Katzfuss-Guinness):
+    /// targets in max-min order condition on data and previous targets.
+    /// Simple-kriging mean (data mean); scalable to very large n
+    #[arg(long, value_name = "M")]
+    vecchia: Option<usize>,
     #[command(flatten)]
     grid: GridOpts,
     #[command(flatten)]
@@ -1233,6 +1238,15 @@ fn run_krige(cmd: KrigeCmd) -> Result<()> {
     if has_error && (cmd.drift_cols.is_some() || cmd.lognormal || cmd.input.z_col.is_some()) {
         bail!("--error/--error-col support plain 2-D (block) kriging only for now");
     }
+    if cmd.vecchia.is_some()
+        && (has_error
+            || cmd.drift_cols.is_some()
+            || cmd.lognormal
+            || cmd.block.is_some()
+            || cmd.input.z_col.is_some())
+    {
+        bail!("--vecchia supports plain 2-D point kriging only (simple-kriging mean)");
+    }
 
     if let Some(z_col) = &cmd.input.z_col {
         // 3-D kriging at explicit targets.
@@ -1337,6 +1351,20 @@ fn run_krige(cmd: KrigeCmd) -> Result<()> {
         let variances: Vec<f64> = ests.iter().map(|e| e.log_variance).collect();
         println!(
             "Lognormal kriging on {} cells (variance column is in log space)",
+            grid.n_cells()
+        );
+        write_grid_result(&cmd.output, &grid, &values, &variances, cmd.srs, cmd.raster)?;
+        println!("Output written to {}", cmd.output.display());
+        return Ok(());
+    }
+
+    if let Some(m) = cmd.vecchia {
+        let centers = grid.centers();
+        let ests = vecchia_predict(&data, &model, &centers, m)?;
+        let values: Vec<f64> = ests.iter().map(|e| e.value).collect();
+        let variances: Vec<f64> = ests.iter().map(|e| e.variance).collect();
+        println!(
+            "Vecchia prediction on {} cells (m = {m}, simple-kriging mean)",
             grid.n_cells()
         );
         write_grid_result(&cmd.output, &grid, &values, &variances, cmd.srs, cmd.raster)?;

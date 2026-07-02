@@ -273,6 +273,145 @@ fn loglik_with_plan<const D: usize>(
     Ok(loglik)
 }
 
+/// One Vecchia prediction: posterior mean and variance under the Vecchia
+/// joint approximation.
+#[derive(Debug, Clone, Copy)]
+pub struct VecchiaEstimate {
+    /// Predictive mean.
+    pub value: f64,
+    /// Predictive variance.
+    pub variance: f64,
+}
+
+/// Vecchia prediction at `targets` (Katzfuss & Guinness 2021, §5): the
+/// targets are appended *after* the data in max-min order, and each target
+/// conditions on its `m` nearest previous points — observed data **and**
+/// already-processed targets. Unlike plain moving-neighborhood kriging
+/// (which conditions each target on data only), the target-on-target
+/// conditioning makes the joint predictive distribution consistent across
+/// targets, which is what lets a small `m` track the exact answer.
+///
+/// The mean of the field is treated as known and equal to the data mean
+/// (simple-kriging convention, matching [`vecchia_loglik`]). Predictive
+/// means propagate exactly through the ordered conditionals; predictive
+/// variances propagate the per-target innovation coefficients (sparse rows
+/// of the implied Cholesky factor), truncating relative coefficients below
+/// `1e-8` — numerically irrelevant, but it bounds the fill-in.
+///
+/// With `m >= n + targets` the result equals exact global simple kriging.
+pub fn vecchia_predict<const D: usize>(
+    data: &PointSet<D>,
+    model: &VariogramModel,
+    targets: &[[f64; D]],
+    m: usize,
+) -> Result<Vec<VecchiaEstimate>> {
+    if m == 0 {
+        return Err(GeostatError::InvalidParameter(
+            "conditioning size m must be at least 1".into(),
+        ));
+    }
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    if let Some((i, j)) = crate::data::duplicate_coord_pair(data.coords()) {
+        return Err(GeostatError::DuplicatePoints(i, j));
+    }
+    let n = data.len();
+    let mean = data.mean();
+    let z: Vec<f64> = data.values().iter().map(|v| v - mean).collect();
+    let c0 = model.covariance_dh([0.0; D]);
+
+    // Conditioning store over data + processed targets.
+    let mut min = data.coords()[0];
+    let mut max = min;
+    for p in data.coords().iter().chain(targets) {
+        for d in 0..D {
+            min[d] = min[d].min(p[d]);
+            max[d] = max[d].max(p[d]);
+        }
+    }
+    let mut grid = BucketGrid::new(min, max, n + targets.len());
+    // store_coords[j]: coordinates of store entry j (0..n = data, then
+    // targets in processing order), with their centred conditional means.
+    let mut store_coords: Vec<[f64; D]> = data.coords().to_vec();
+    let mut store_mean: Vec<f64> = z.clone();
+    for &p in data.coords() {
+        grid.insert(p);
+    }
+
+    // Innovation-coefficient rows (sparse) for processed targets, indexed by
+    // innovation id; observed data carry no innovations.
+    let mut rows: Vec<Vec<(u32, f64)>> = Vec::with_capacity(targets.len());
+    let order = maxmin_order(targets);
+    let mut estimates = vec![
+        VecchiaEstimate {
+            value: f64::NAN,
+            variance: f64::NAN,
+        };
+        targets.len()
+    ];
+
+    let mut kss: Vec<f64> = Vec::new();
+    let mut ki: Vec<f64> = Vec::new();
+    let mut w: Vec<f64> = Vec::new();
+    let mut acc: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
+    let coef_tol = 1e-8 * c0.sqrt();
+
+    for &t in &order {
+        let target = targets[t];
+        let nb = grid.k_nearest(target, m, None);
+        let (mu, var, row) = if nb.is_empty() {
+            (0.0, c0, vec![(rows.len() as u32, c0.max(0.0).sqrt())])
+        } else {
+            let s = nb.len();
+            kss.clear();
+            kss.resize(s * s, 0.0);
+            ki.clear();
+            ki.resize(s, 0.0);
+            for a in 0..s {
+                ki[a] = model.covariance_dh(sep(&target, &store_coords[nb[a]]));
+                for b in a..s {
+                    let c = model.covariance_dh(sep(&store_coords[nb[a]], &store_coords[nb[b]]));
+                    kss[a * s + b] = c;
+                    kss[b * s + a] = c;
+                }
+            }
+            w.clear();
+            w.extend_from_slice(&ki);
+            cholesky_solve_in_place(&mut kss, s, &mut w)?;
+            let mu: f64 = w.iter().zip(&nb).map(|(&wj, &j)| wj * store_mean[j]).sum();
+            let d = (c0 - w.iter().zip(&ki).map(|(&wj, &kj)| wj * kj).sum::<f64>()).max(0.0);
+            // Propagate innovation coefficients: this target's deviation is
+            // sum_j w_j (deviation of conditioning target j) + sqrt(d) eps_t.
+            acc.clear();
+            for (&wj, &j) in w.iter().zip(&nb) {
+                if j >= n {
+                    for &(inno, coef) in &rows[j - n] {
+                        *acc.entry(inno).or_insert(0.0) += wj * coef;
+                    }
+                }
+            }
+            let mut row: Vec<(u32, f64)> = acc
+                .iter()
+                .filter(|&(_, &c)| c.abs() > coef_tol)
+                .map(|(&i, &c)| (i, c))
+                .collect();
+            row.push((rows.len() as u32, d.sqrt()));
+            let var: f64 = row.iter().map(|&(_, c)| c * c).sum();
+            (mu, var, row)
+        };
+        estimates[t] = VecchiaEstimate {
+            value: mean + mu,
+            variance: var,
+        };
+        grid.insert(target);
+        store_coords.push(target);
+        store_mean.push(mu);
+        rows.push(row);
+    }
+    Ok(estimates)
+}
+
 /// Vecchia-approximated Gaussian log-likelihood of `data` under `model`, with
 /// each point conditioning on its `m` nearest predecessors in `order` (defaults
 /// to [`maxmin_order`] when `None`). Values are centred by their mean (a known
@@ -844,6 +983,78 @@ mod tests {
             rel < 0.02,
             "rel err {rel}: approx {approx} vs exact {exact}"
         );
+    }
+
+    #[test]
+    fn predict_full_conditioning_equals_exact_simple_kriging() {
+        use crate::kriging::{Kriging, KrigingConfig, KrigingMethod};
+        let data = field(60, 5);
+        let model =
+            VariogramModel::new(0.1, vec![Structure::new(ModelKind::Exponential, 0.9, 30.0)])
+                .unwrap();
+        let targets: Vec<[f64; 2]> = vec![[12.0, 33.0], [55.0, 71.0], [80.0, 20.0], [40.0, 40.0]];
+        // Full conditioning: every target sees all data and all previous
+        // targets, so the Vecchia joint is exact and the marginals must
+        // match global simple kriging with the same (data-mean) mean.
+        let est = vecchia_predict(&data, &model, &targets, 1000).unwrap();
+        let sk = Kriging::new(
+            &data,
+            &model,
+            KrigingConfig {
+                method: KrigingMethod::Simple { mean: data.mean() },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for (t, e) in targets.iter().zip(&est) {
+            let exact = sk.predict(*t).unwrap();
+            assert!(
+                (e.value - exact.value).abs() < 1e-8,
+                "mean {} vs exact {}",
+                e.value,
+                exact.value
+            );
+            assert!(
+                (e.variance - exact.variance).abs() < 1e-8,
+                "var {} vs exact {}",
+                e.variance,
+                exact.variance
+            );
+        }
+    }
+
+    #[test]
+    fn predict_small_m_tracks_exact_kriging() {
+        use crate::kriging::{Kriging, KrigingConfig, KrigingMethod};
+        let data = field(150, 9);
+        let model = VariogramModel::new(
+            0.05,
+            vec![Structure::new(ModelKind::Exponential, 0.95, 25.0)],
+        )
+        .unwrap();
+        let targets: Vec<[f64; 2]> = (0..40)
+            .map(|i| [2.5 * i as f64 + 1.0, 97.0 - 2.3 * i as f64])
+            .collect();
+        let est = vecchia_predict(&data, &model, &targets, 25).unwrap();
+        let sk = Kriging::new(
+            &data,
+            &model,
+            KrigingConfig {
+                method: KrigingMethod::Simple { mean: data.mean() },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut max_dv = 0.0_f64;
+        let mut max_dm = 0.0_f64;
+        for (t, e) in targets.iter().zip(&est) {
+            let exact = sk.predict(*t).unwrap();
+            max_dm = max_dm.max((e.value - exact.value).abs());
+            max_dv = max_dv.max((e.variance - exact.variance).abs());
+            assert!(e.variance >= 0.0 && e.variance <= model.total_sill() + 1e-9);
+        }
+        assert!(max_dm < 0.02, "mean deviation {max_dm}");
+        assert!(max_dv < 0.02, "variance deviation {max_dv}");
     }
 
     #[test]
