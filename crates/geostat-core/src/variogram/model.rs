@@ -4,6 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use super::bessel;
 use crate::error::{GeostatError, Result};
 
 /// Supported variogram model families.
@@ -12,7 +13,25 @@ use crate::error::{GeostatError, Result};
 /// (correlation `(1 + √3 h/a) exp(-√3 h/a)` for ν = 3/2, etc.), so `range`
 /// is comparable across families. Note that Matérn with ν = 1/2 is exactly
 /// the exponential model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// [`ModelKind::Matern15`] and [`ModelKind::Matern25`] keep their closed-form
+/// evaluation (cheaper, no quadrature); [`ModelKind::Matern`] covers any
+/// other real `ν > 0` via the general correlation `(2^{1-ν}/Γ(ν)) (√(2ν) d)^ν
+/// K_ν(√(2ν) d)` (`K_ν` the modified Bessel function of the second kind, see
+/// [`super::bessel`]) and agrees with the closed forms at ν = 1.5/2.5 to
+/// within quadrature error (~1e-9, see
+/// `tests::matern_matches_closed_form_special_cases`).
+///
+/// **gstat interop**: gstat's `"Ste"` model (M. Stein's parameterization)
+/// scales the Bessel argument by `2√ν` instead of `√(2ν)`, a *different but
+/// equally valid* convention for what "range" means. The two `range`s are
+/// related by a constant independent of `ν`: `range_here = range_gstat_Ste /
+/// √2` (derived and cross-checked against `fit.variogram(..., vgm(..., "Ste",
+/// ..., kappa=ν), fit.kappa=FALSE)` on Meuse in
+/// `validation/matern_gstat.R`/`compare_matern.py`, parity ~5e-7). gstat's
+/// older `"Mat"` model uses yet another convention (`h/range` with no
+/// `ν`-dependent scaling at all) and is not the one to compare against.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelKind {
     /// Spherical model; reaches the sill exactly at `range`.
@@ -25,16 +44,40 @@ pub enum ModelKind {
     Matern15,
     /// Matérn with smoothness ν = 5/2.
     Matern25,
+    /// Matérn with an arbitrary real smoothness `ν > 0`.
+    Matern(f64),
+    /// Circular model (2-D disc indicator covariance); reaches the sill
+    /// exactly at `range`, steeper near the origin than spherical.
+    Circular,
+    /// Stable (power-exponential) model with shape `α ∈ (0, 2]`:
+    /// `γ(d) = 1 - exp(-d^α)`, `d = h/range`. Generalizes exponential
+    /// (`α = 1`) and Gaussian (`α = 2`); matches gstat's `"Exc"` model
+    /// exactly (no range-convention subtlety, unlike Matérn/Ste).
+    Stable(f64),
+    /// Hole-effect (cardinal-sine) model: `γ(d) = 1 - sin(d)/d`,
+    /// `d = h/range`. Oscillates around the sill (bounded overshoot),
+    /// modeling periodic/pseudo-periodic phenomena — **not** monotone, and
+    /// deliberately excluded from [`ModelKind::ALL`]. Matches gstat's
+    /// `"Hol"` model exactly.
+    Hole,
+    /// Wave (cardinal-sine) model: `γ(d) = 1 - sin(πd)/(πd)`,
+    /// `d = h/range` — like [`ModelKind::Hole`] but scaled so the
+    /// covariance's first zero-crossing sits exactly at `h = range`.
+    /// Matches gstat's `"Wav"` model exactly.
+    Wave,
 }
 
 impl ModelKind {
-    /// All supported kinds, for "fit the best model" workflows.
-    pub const ALL: [ModelKind; 5] = [
+    /// All supported *bounded, monotone* kinds, for "fit the best model"
+    /// workflows (auto-fit assumes a single well-defined sill/range guess,
+    /// which does not make sense for the oscillating hole-effect models).
+    pub const ALL: [ModelKind; 6] = [
         ModelKind::Spherical,
         ModelKind::Exponential,
         ModelKind::Gaussian,
         ModelKind::Matern15,
         ModelKind::Matern25,
+        ModelKind::Circular,
     ];
 
     /// Normalized variogram (unit sill) at lag `h` for range parameter `a`.
@@ -58,6 +101,36 @@ impl ModelKind {
                 let s = 5.0_f64.sqrt() * d;
                 1.0 - (1.0 + s + s * s / 3.0) * (-s).exp()
             }
+            ModelKind::Matern(nu) => {
+                if d <= 0.0 {
+                    0.0
+                } else {
+                    let s = (2.0 * nu).sqrt() * d;
+                    let corr =
+                        2f64.powf(1.0 - nu) / bessel::gamma(nu) * s.powf(nu) * bessel::bessel_k(nu, s);
+                    1.0 - corr
+                }
+            }
+            ModelKind::Circular => {
+                let d = d.min(1.0);
+                1.0 - (2.0 / std::f64::consts::PI) * (d.acos() - d * (1.0 - d * d).sqrt())
+            }
+            ModelKind::Stable(alpha) => 1.0 - (-d.powf(alpha)).exp(),
+            ModelKind::Hole => {
+                if d <= 0.0 {
+                    0.0
+                } else {
+                    1.0 - d.sin() / d
+                }
+            }
+            ModelKind::Wave => {
+                if d <= 0.0 {
+                    0.0
+                } else {
+                    let pd = std::f64::consts::PI * d;
+                    1.0 - pd.sin() / pd
+                }
+            }
         }
     }
 
@@ -73,13 +146,18 @@ impl ModelKind {
     }
 
     /// Short GSLIB-style abbreviation.
-    pub fn abbrev(self) -> &'static str {
+    pub fn abbrev(self) -> String {
         match self {
-            ModelKind::Spherical => "Sph",
-            ModelKind::Exponential => "Exp",
-            ModelKind::Gaussian => "Gau",
-            ModelKind::Matern15 => "Mat1.5",
-            ModelKind::Matern25 => "Mat2.5",
+            ModelKind::Spherical => "Sph".to_string(),
+            ModelKind::Exponential => "Exp".to_string(),
+            ModelKind::Gaussian => "Gau".to_string(),
+            ModelKind::Matern15 => "Mat1.5".to_string(),
+            ModelKind::Matern25 => "Mat2.5".to_string(),
+            ModelKind::Matern(nu) => format!("Mat(ν={nu:.3})"),
+            ModelKind::Circular => "Cir".to_string(),
+            ModelKind::Stable(alpha) => format!("Stable(α={alpha:.3})"),
+            ModelKind::Hole => "Hol".to_string(),
+            ModelKind::Wave => "Wav".to_string(),
         }
     }
 }
@@ -88,22 +166,55 @@ impl std::str::FromStr for ModelKind {
     type Err = GeostatError;
 
     fn from_str(s: &str) -> Result<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "sph" | "spherical" => Ok(ModelKind::Spherical),
-            "exp" | "exponential" => Ok(ModelKind::Exponential),
-            "gau" | "gaussian" => Ok(ModelKind::Gaussian),
-            "mat15" | "matern15" => Ok(ModelKind::Matern15),
-            "mat25" | "matern25" => Ok(ModelKind::Matern25),
-            other => Err(GeostatError::InvalidParameter(format!(
-                "unknown model kind '{other}' (expected spherical, exponential, gaussian, matern15 or matern25)"
-            ))),
+        let lower = s.trim().to_ascii_lowercase();
+        match lower.as_str() {
+            "sph" | "spherical" => return Ok(ModelKind::Spherical),
+            "exp" | "exponential" => return Ok(ModelKind::Exponential),
+            "gau" | "gaussian" => return Ok(ModelKind::Gaussian),
+            "mat15" | "matern15" => return Ok(ModelKind::Matern15),
+            "mat25" | "matern25" => return Ok(ModelKind::Matern25),
+            "cir" | "circular" => return Ok(ModelKind::Circular),
+            "hol" | "hole" => return Ok(ModelKind::Hole),
+            "wav" | "wave" => return Ok(ModelKind::Wave),
+            _ => {}
         }
+        // General Matern: "matern:<nu>" or "mat:<nu>" (e.g. "matern:1.2").
+        if let Some(nu_str) = lower
+            .strip_prefix("matern:")
+            .or_else(|| lower.strip_prefix("mat:"))
+        {
+            let nu: f64 = nu_str.parse().map_err(|_| {
+                GeostatError::InvalidParameter(format!("invalid Matern nu '{nu_str}'"))
+            })?;
+            if !(nu > 0.0) || !nu.is_finite() {
+                return Err(GeostatError::InvalidParameter(format!(
+                    "Matern nu must be finite and > 0, got {nu}"
+                )));
+            }
+            return Ok(ModelKind::Matern(nu));
+        }
+        // Stable: "stable:<alpha>" (e.g. "stable:1.2"), alpha in (0, 2].
+        if let Some(alpha_str) = lower.strip_prefix("stable:") {
+            let alpha: f64 = alpha_str.parse().map_err(|_| {
+                GeostatError::InvalidParameter(format!("invalid Stable alpha '{alpha_str}'"))
+            })?;
+            if !(alpha > 0.0) || alpha > 2.0 {
+                return Err(GeostatError::InvalidParameter(format!(
+                    "Stable alpha must be in (0, 2], got {alpha}"
+                )));
+            }
+            return Ok(ModelKind::Stable(alpha));
+        }
+        Err(GeostatError::InvalidParameter(format!(
+            "unknown model kind '{s}' (expected spherical, exponential, gaussian, matern15, \
+             matern25, matern:<nu>, circular, hole, wave or stable:<alpha>)"
+        )))
     }
 }
 
 impl fmt::Display for ModelKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.abbrev())
+        f.write_str(&self.abbrev())
     }
 }
 
@@ -116,20 +227,30 @@ fn is_one(v: &f64) -> bool {
     *v == 1.0
 }
 
-/// Geometric (range) anisotropy, gstat/GSLIB convention: `azimuth_deg` is
-/// the direction of the *major* axis in degrees clockwise from north, and
-/// `ratio = minor_range / major_range` in `(0, 1]`. The structure's `range`
-/// is the major-axis range.
+/// Geometric (range) anisotropy, gstat/GSLIB convention: `azimuth_deg` is a
+/// reference direction in degrees clockwise from north, `range` (on the
+/// enclosing [`Structure`]) is that direction's range, and `ratio` scales
+/// the orthogonal (`azimuth_deg + 90°`) direction's range relative to it.
 ///
-/// In 3-D, `ratio_z` is the vertical/major range ratio (gstat's second
-/// anisotropy ratio with zero dip/rake rotations); it is ignored in 2-D.
+/// `ratio ∈ (0, 1]` is the common case: `azimuth_deg` names the *major* axis
+/// and `ratio = minor/major`. **Zonal anisotropy** — a *longer* range
+/// orthogonal to `azimuth_deg` (e.g. much greater lateral than vertical
+/// continuity) — is `ratio > 1`; no axis relabeling ("major" becomes
+/// whichever axis ends up longer) is needed, `effective_h`'s rotate-then-
+/// scale math is valid for any `ratio > 0` unchanged.
+///
+/// In 3-D, `ratio_z` plays the same role for the vertical axis (gstat's
+/// second anisotropy ratio with zero dip/rake rotations); it is ignored in
+/// 2-D.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Anisotropy {
-    /// Major-axis direction, degrees clockwise from north.
+    /// Reference direction, degrees clockwise from north.
     pub azimuth_deg: f64,
-    /// Minor/major range ratio in `(0, 1]` (horizontal in 3-D).
+    /// `(azimuth_deg + 90°)` / `azimuth_deg` range ratio, `> 0` (horizontal
+    /// in 3-D). `≤ 1` for the common "major axis" case; `> 1` for zonal
+    /// anisotropy (see the struct docs).
     pub ratio: f64,
-    /// Vertical/major range ratio in `(0, 1]` (3-D only; default 1).
+    /// Vertical / `azimuth_deg` range ratio, `> 0` (3-D only; default 1).
     #[serde(default = "one", skip_serializing_if = "is_one")]
     pub ratio_z: f64,
 }
@@ -239,16 +360,31 @@ impl VariogramModel {
                     s.range
                 )));
             }
-            if let Some(a) = s.anis {
-                if !(a.ratio_z > 0.0) || a.ratio_z > 1.0 {
+            if let ModelKind::Matern(nu) = s.kind
+                && (!(nu > 0.0) || !nu.is_finite()) {
                     return Err(GeostatError::InvalidParameter(format!(
-                        "anisotropy ratio_z must be in (0, 1], got {}",
+                        "Matern nu must be finite and > 0, got {nu}"
+                    )));
+                }
+            if let ModelKind::Stable(alpha) = s.kind
+                && (!(alpha > 0.0) || alpha > 2.0) {
+                    return Err(GeostatError::InvalidParameter(format!(
+                        "Stable alpha must be in (0, 2], got {alpha}"
+                    )));
+                }
+            if let Some(a) = s.anis {
+                // ratio > 1 is valid (zonal anisotropy: the orthogonal axis
+                // is longer than the labeled one; see `Anisotropy` docs) --
+                // only non-finite/non-positive values are rejected.
+                if !(a.ratio_z > 0.0) || !a.ratio_z.is_finite() {
+                    return Err(GeostatError::InvalidParameter(format!(
+                        "anisotropy ratio_z must be finite and > 0, got {}",
                         a.ratio_z
                     )));
                 }
-                if !(a.ratio > 0.0) || a.ratio > 1.0 {
+                if !(a.ratio > 0.0) || !a.ratio.is_finite() {
                     return Err(GeostatError::InvalidParameter(format!(
-                        "anisotropy ratio must be in (0, 1], got {}",
+                        "anisotropy ratio must be finite and > 0, got {}",
                         a.ratio
                     )));
                 }
@@ -405,20 +541,70 @@ mod tests {
             .unwrap();
         let h = (3.0_f64 * 3.0 + 4.0 * 4.0).sqrt();
         assert!((iso.gamma_dh([3.0, 4.0]) - iso.gamma(h)).abs() < 1e-12);
-        // Invalid ratio rejected.
-        assert!(
-            VariogramModel::new(
-                0.0,
-                vec![Structure::with_anisotropy(
-                    ModelKind::Spherical,
-                    1.0,
-                    100.0,
+        // Invalid ratio rejected (non-positive/non-finite; ratio > 1 is now
+        // valid -- zonal anisotropy, see `zonal_anisotropy_ratio_above_one`).
+        for bad_ratio in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                VariogramModel::new(
                     0.0,
-                    1.5
-                )]
-            )
-            .is_err()
-        );
+                    vec![Structure::with_anisotropy(
+                        ModelKind::Spherical,
+                        1.0,
+                        100.0,
+                        0.0,
+                        bad_ratio
+                    )]
+                )
+                .is_err(),
+                "ratio {bad_ratio} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn zonal_anisotropy_ratio_above_one() {
+        // azimuth 0 (N-S) labeled range 50; ratio 2 means the orthogonal
+        // (E-W) axis has *twice* the range (100) -- no axis relabeling
+        // "trick" needed, unlike the old `ratio <= 1` restriction.
+        let m = VariogramModel::new(
+            0.0,
+            vec![Structure::with_anisotropy(
+                ModelKind::Spherical,
+                1.0,
+                50.0,
+                0.0,
+                2.0,
+            )],
+        )
+        .unwrap();
+        // Along the labeled (N-S) axis: sill reached at 50.
+        assert!((m.gamma_dh([0.0, 50.0]) - 1.0).abs() < 1e-12);
+        // Along the orthogonal (E-W) axis: sill reached at 100 (2x).
+        assert!((m.gamma_dh([100.0, 0.0]) - 1.0).abs() < 1e-12);
+        assert!(m.gamma_dh([50.0, 0.0]) < 1.0 - 1e-6);
+        // Same lag distance hits *less* hard across the now-longer axis.
+        assert!(m.gamma_dh([30.0, 0.0]) < m.gamma_dh([0.0, 30.0]));
+        // This is exactly the mirror image of ratio=0.5 with a 90-degree
+        // azimuth shift (major/minor swapped).
+        let mirrored = VariogramModel::new(
+            0.0,
+            vec![Structure::with_anisotropy(
+                ModelKind::Spherical,
+                1.0,
+                100.0,
+                90.0,
+                0.5,
+            )],
+        )
+        .unwrap();
+        for &(x, y) in &[(0.0, 50.0), (100.0, 0.0), (30.0, 0.0), (0.0, 30.0), (17.0, -42.0)] {
+            assert!(
+                (m.gamma_dh([x, y]) - mirrored.gamma_dh([x, y])).abs() < 1e-12,
+                "({x},{y}): {} vs {}",
+                m.gamma_dh([x, y]),
+                mirrored.gamma_dh([x, y])
+            );
+        }
     }
 
     #[test]
@@ -429,5 +615,185 @@ mod tests {
             ModelKind::Matern15
         );
         assert!("foo".parse::<ModelKind>().is_err());
+    }
+
+    #[test]
+    fn parses_matern_nu_spec() {
+        assert_eq!(
+            "matern:1.2".parse::<ModelKind>().unwrap(),
+            ModelKind::Matern(1.2)
+        );
+        assert_eq!(
+            "MAT:0.75".parse::<ModelKind>().unwrap(),
+            ModelKind::Matern(0.75)
+        );
+        assert!("matern:0".parse::<ModelKind>().is_err());
+        assert!("matern:-1".parse::<ModelKind>().is_err());
+        assert!("matern:nope".parse::<ModelKind>().is_err());
+    }
+
+    #[test]
+    fn parses_new_family_names() {
+        assert_eq!("cir".parse::<ModelKind>().unwrap(), ModelKind::Circular);
+        assert_eq!(
+            "circular".parse::<ModelKind>().unwrap(),
+            ModelKind::Circular
+        );
+        assert_eq!("hol".parse::<ModelKind>().unwrap(), ModelKind::Hole);
+        assert_eq!("wave".parse::<ModelKind>().unwrap(), ModelKind::Wave);
+        assert_eq!(
+            "stable:1.7".parse::<ModelKind>().unwrap(),
+            ModelKind::Stable(1.7)
+        );
+        assert!("stable:0".parse::<ModelKind>().is_err());
+        assert!("stable:2.1".parse::<ModelKind>().is_err());
+    }
+
+    /// The continuous-ν Matern (evaluated via the Bessel-K quadrature) must
+    /// agree with the hardcoded closed forms at ν = 1.5, 2.5, and with the
+    /// exponential model at ν = 0.5 (all classical special cases of Matern).
+    #[test]
+    fn matern_matches_closed_form_special_cases() {
+        let d_values = [0.001, 0.01, 0.1, 0.3, 0.5, 1.0, 2.0, 5.0];
+        for &d in &d_values {
+            let general15 = ModelKind::Matern(1.5).g(d, 1.0);
+            let closed15 = ModelKind::Matern15.g(d, 1.0);
+            let rel15 = (general15 - closed15).abs() / closed15.max(1e-12);
+            assert!(rel15 < 1e-7, "nu=1.5, d={d}: {general15} vs {closed15}");
+
+            let general25 = ModelKind::Matern(2.5).g(d, 1.0);
+            let closed25 = ModelKind::Matern25.g(d, 1.0);
+            let rel25 = (general25 - closed25).abs() / closed25.max(1e-12);
+            assert!(rel25 < 1e-7, "nu=2.5, d={d}: {general25} vs {closed25}");
+
+            let general05 = ModelKind::Matern(0.5).g(d, 1.0);
+            let exp = ModelKind::Exponential.g(d, 1.0);
+            let rel05 = (general05 - exp).abs() / exp.max(1e-12);
+            assert!(rel05 < 1e-7, "nu=0.5, d={d}: {general05} vs {exp}");
+        }
+    }
+
+    #[test]
+    fn matern_continuous_nu_bounded_and_monotone() {
+        for &nu in &[0.15, 0.3, 0.75, 1.0, 1.8, 3.0, 4.5] {
+            let m = VariogramModel::new(0.0, vec![Structure::new(ModelKind::Matern(nu), 2.0, 50.0)])
+                .unwrap();
+            let mut prev = 0.0;
+            for i in 1..=100 {
+                let g = m.gamma(i as f64 * 5.0);
+                assert!(g >= prev - 1e-9, "nu={nu}: non-monotone at {i}");
+                assert!(g <= 2.0 + 1e-9, "nu={nu}: exceeds sill");
+                prev = g;
+            }
+            assert!(m.gamma(5000.0) > 1.99, "nu={nu}");
+            assert_eq!(m.gamma(0.0), 0.0, "nu={nu}");
+        }
+    }
+
+    /// Ground truth from gstat's `variogramLine` at `range = 100`, sill = 1
+    /// (`Cir`, `Hol`, `Wav`, `Exc` with `kappa = 1.5`/`0.8`/`2.0`); see the
+    /// session notes deriving these exact closed forms by matching gstat's
+    /// output numerically (no ambiguity/range-convention issue here, unlike
+    /// Matérn/Ste).
+    #[test]
+    fn new_families_match_gstat_reference_values() {
+        let hs = [1.0, 10.0, 30.0, 50.0, 80.0, 100.0, 150.0, 200.0, 300.0, 500.0];
+
+        let cir_gstat = [
+            0.01273218, 0.12711143, 0.37616234, 0.60899778, 0.89591196, 1.0, 1.0, 1.0, 1.0, 1.0,
+        ];
+        for (&h, &expected) in hs.iter().zip(&cir_gstat) {
+            let got = ModelKind::Circular.g(h, 100.0);
+            assert!((got - expected).abs() < 1e-7, "Cir h={h}: {got} vs {expected}");
+        }
+
+        let hol_gstat = [
+            1.666658e-05,
+            1.665834e-03,
+            1.493264e-02,
+            4.114892e-02,
+            1.033049e-01,
+            1.585290e-01,
+            3.350033e-01,
+            5.453513e-01,
+            9.529600e-01,
+            1.191785e+00,
+        ];
+        for (&h, &expected) in hs.iter().zip(&hol_gstat) {
+            let got = ModelKind::Hole.g(h, 100.0);
+            assert!((got - expected).abs() < 1e-6, "Hol h={h}: {got} vs {expected}");
+        }
+
+        let wav_gstat = [
+            0.0001644853,
+            0.0163683569,
+            0.1416063087,
+            0.3633802276,
+            0.7661276791,
+            1.0,
+            1.2122065908,
+            1.0,
+            1.0,
+            1.0,
+        ];
+        for (&h, &expected) in hs.iter().zip(&wav_gstat) {
+            let got = ModelKind::Wave.g(h, 100.0);
+            assert!((got - expected).abs() < 1e-6, "Wav h={h}: {got} vs {expected}");
+        }
+
+        let exc15_gstat = [
+            0.0009995002,
+            0.0311280057,
+            0.1515267892,
+            0.2978114987,
+            0.5110728376,
+            0.6321205588,
+            0.8407240915,
+            0.9408942534,
+            0.9944621693,
+            0.9999860543,
+        ];
+        for (&h, &expected) in hs.iter().zip(&exc15_gstat) {
+            let got = ModelKind::Stable(1.5).g(h, 100.0);
+            assert!((got - expected).abs() < 1e-7, "Exc(1.5) h={h}: {got} vs {expected}");
+        }
+    }
+
+    #[test]
+    fn circular_and_stable_bounded_and_monotone() {
+        for kind in [
+            ModelKind::Circular,
+            ModelKind::Stable(0.5),
+            ModelKind::Stable(1.0),
+            ModelKind::Stable(2.0),
+        ] {
+            let m = VariogramModel::new(0.0, vec![Structure::new(kind, 2.0, 50.0)]).unwrap();
+            let mut prev = 0.0;
+            for i in 1..=100 {
+                let g = m.gamma(i as f64 * 5.0);
+                assert!(g >= prev - 1e-12, "{kind}: non-monotone at {i}");
+                assert!(g <= 2.0 + 1e-12, "{kind}: exceeds sill");
+                prev = g;
+            }
+            assert!(m.gamma(5000.0) > 1.99, "{kind}");
+        }
+    }
+
+    #[test]
+    fn hole_and_wave_oscillate_and_are_valid_covariances() {
+        // Both are valid (positive-definite) covariance models but are NOT
+        // monotone: they overshoot the sill (negative covariance) once past
+        // their first zero-crossing.
+        let hol = VariogramModel::new(0.0, vec![Structure::new(ModelKind::Hole, 1.0, 100.0)])
+            .unwrap();
+        let wav = VariogramModel::new(0.0, vec![Structure::new(ModelKind::Wave, 1.0, 100.0)])
+            .unwrap();
+        assert_eq!(hol.gamma(0.0), 0.0);
+        assert_eq!(wav.gamma(0.0), 0.0);
+        // Wave's covariance is exactly zero at h = range by construction.
+        assert!(wav.covariance(100.0).abs() < 1e-9, "{}", wav.covariance(100.0));
+        // Hole overshoots the sill (negative covariance) well past its range.
+        assert!(hol.gamma(500.0) > 1.0, "Hol should overshoot by h=500");
+        assert!(hol.covariance(500.0) < 0.0);
     }
 }

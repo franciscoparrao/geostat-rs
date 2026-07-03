@@ -170,6 +170,33 @@ reuses the gstat-validated neighbour search; co-kriging with `ridge = 0` is the
 same system validated in v0.2/v0.4; VEcv/E₁ match their definitions (Li 2016).
 Reproduce: `Rscript validation/idw_gstat.R` then `python3 validation/compare_idw.py`.
 
+## Fase 3: continuous-ν Matérn (`ModelKind::Matern`)
+
+`K_ν` (modified Bessel function of the second kind) and `Γ` are implemented
+in-house (`variogram::bessel`, composite Gauss–Legendre quadrature on the
+integral representation, validated against R's `besselK`/`gamma` to ≤1e-9
+relative error) rather than pulling in a special-function crate, matching the
+project's existing RNG/optimizer/linalg house-building. gstat's `"Ste"` model
+(M. Stein's parameterization) scales the Bessel argument by `2√ν` instead of
+this engine's Rasmussen & Williams `√(2ν)`; the two `range`s are related by a
+constant independent of `ν`: `range_rw = range_ste / √2` (verified
+analytically and numerically to 2e-15).
+
+| Check | Max difference | Verdict |
+|---|---|---|
+| WLS fit vs `fit.variogram(..., vgm(..., "Ste", ..., kappa=1.2), fit.kappa=FALSE)`, nugget/sill | ~5e-7 | independent optimizers agree |
+| Same, range (after `range_ste / √2` conversion) | 5.7e-7 | independent optimizers agree |
+| `ModelKind::Matern(1.5)`/`Matern(2.5)` vs the closed-form `Matern15`/`Matern25` | ~1e-9 | quadrature error |
+
+Reproduce: `Rscript validation/matern_gstat.R`, then
+```sh
+$BIN variogram -i validation/out/meuse_lzinc.csv --value-col lzinc \
+    --n-lags 15 --max-dist 1500 \
+    -o validation/out/rust_matern_vario.csv \
+    --fit "matern:1.2" --model-out validation/out/rust_matern_model.json
+python3 validation/compare_matern.py
+```
+
 ## Reproduce
 
 ```sh

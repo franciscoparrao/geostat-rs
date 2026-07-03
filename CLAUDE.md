@@ -132,5 +132,58 @@ Computers & Geosciences.
    camino sin agrupar. Paridad gstat re-validada sin regresiones (Meuse +
    Walker Lake, incl. SGS distribucional). Pendiente (menor): SIMD
    explícito (`std::simd`/crate vectorial) más allá de la limpieza de
-   covarianzas escalares hecha ahora. Sigue Fase 3 (diferenciación: Matérn
-   ν continuo, MM1/MM2, block CV espacial, rotación 3-D completa).
+   covarianzas escalares hecha ahora.
+9. **Fase 3 en curso** (2026-07-02): Matérn ν continuo hecho —
+   `ModelKind::Matern(f64)` evalúa la correlación general vía `K_ν` de
+   Bessel (integral `∫exp(-x cosh t)cosh(νt)dt`, cuadratura Gauss-Legendre
+   compuesta) + Γ (Lanczos), ambos implementados in-house (sin dependencia
+   nueva, WASM-friendly) en `variogram::bessel`, validados contra
+   `besselK`/`gamma` de R a ≤1e-9 relativo. `Matern15`/`Matern25` (formas
+   cerradas) sin cambios; `Matern(1.5)`/`Matern(2.5)` coinciden con ellas a
+   ~1e-9. **Hallazgo de paridad no trivial**: gstat's `"Ste"` usa la
+   parametrización de Stein (escala `2√ν`) en vez de R&W (`√(2ν)` — la que
+   ya usaban `Matern15`/`Matern25` desde siempre, nunca antes validada
+   contra gstat); las dos convenciones de `range` difieren por un factor
+   constante `√2` independiente de ν (`range_rw = range_ste/√2`, verificado
+   analítica y numéricamente a 2e-15). Con esa conversión, el fit WLS
+   coincide con gstat a ~5e-7 (mismo orden que el resto de la paridad de
+   "optimizadores independientes"). Documentado en el docstring de
+   `ModelKind` y en `validation/matern_gstat.R`/`compare_matern.py`. CLI:
+   `--fit "matern:1.2"`.
+
+   Mismo día, resto del ítem #16: **familias nuevas** `Circular`
+   (`ModelKind::ALL` pasa a 6), `Stable(α)` (power-exponential, α∈(0,2],
+   generaliza exponential/gaussian igual que Matérn generaliza vía ν),
+   `Hole` y `Wave` (hole-effect cardinal-sine, oscilan más allá del sill —
+   excluidas de `ALL` a propósito). Las 4 fórmulas se **derivaron
+   numéricamente** contra `variogramLine()` de gstat (`Cir`/`Hol`/`Wav`/`Exc`)
+   en vez de confiar en fórmulas de memoria — enfoque forzado por el
+   hallazgo Matérn/Ste de la sesión anterior — y coinciden exactas (resid
+   ~1e-11 a 1e-15): `Cir` = fórmula clásica del disco; `Hol` = `1-sin(d)/d`;
+   `Wav` = `1-sin(πd)/(πd)` (cruce por cero exactamente en `range`); `Exc` =
+   `1-exp(-d^κ)`. Tests: `new_families_match_gstat_reference_values`,
+   `circular_and_stable_bounded_and_monotone`,
+   `hole_and_wave_oscillate_and_are_valid_covariances`. **Anisotropía
+   zonal**: se relajó `ratio ≤ 1` a `ratio > 0` (cualquier positivo finito)
+   — `effective_h` ya era válido para `ratio > 1` sin cambios (solo
+   documentación/validación); `ratio > 1` = el eje ortogonal a `azimuth_deg`
+   es el más largo, sin el "truco" de rotar 90° a mano
+   (`zonal_anisotropy_ratio_above_one`, verifica simetría espejo exacta con
+   azimuth+90°/ratio inverso). **Pesos WLS seleccionables**: `FitWeights`
+   {`NPairs`, `Cressie` (N/γ_modelo², autoconsistente, recalculado en cada
+   iteración del optimizador), `Ols`, `NOverHSquared` (default, sin cambio)}
+   + `fit_model_weighted`; `NPairs` coincide con gstat `fit.method=1` a
+   ~0.07% relativo, `Cressie` cae dentro del mismo rango de variabilidad que
+   gstat muestra entre corridas con `fit.method=2` (~1-2%, el propio gstat
+   no es perfectamente autoconsistente en este esquema no lineal).
+
+   Pendiente del ítem #16: familia `Power` (no estacionaria — requeriría
+   krigear en forma-γ en vez de forma-covarianza, cambio de arquitectura
+   real, no solo una fórmula; documentado, no implementado), rotación 3-D
+   completa (ang1/ang2/ang3 estilo GSLIB; hoy `Anisotropy` solo tiene
+   azimuth + `ratio_z` sin rotar dip/rake), ajuste conjunto de ν/α por
+   MLE/WLS (hoy se fijan, no se estiman), anidamiento multi-estructura en
+   el fit WLS (`fit_model` sigue siendo nugget + 1 estructura). Quedan
+   además los ítems #17 (collocated cokriging MM1/MM2, median/ordinary IK,
+   Markov-Bayes), #18 (block CV espacial, accuracy plots de Deutsch), #19
+   (trait de covarianza, rust-numpy, proptest, publicación crates.io/PyPI).

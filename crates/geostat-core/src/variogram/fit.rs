@@ -20,14 +20,50 @@ pub struct FitResult {
     pub wsse: f64,
 }
 
+/// WLS weight scheme for [`fit_model_weighted`]. Matches gstat's
+/// `fit.method` options (gstat manual table 4.2); values not listed here
+/// (REML, `fit.method` 5) are a different estimator entirely, see
+/// [`crate::vecchia::vecchia_reml`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FitWeights {
+    /// `N_j` (gstat `fit.method = 1`).
+    NPairs,
+    /// `N_j / γ_model(h_j)²`, recomputed from the *current* candidate model
+    /// at every optimizer iteration (Cressie 1985; gstat `fit.method = 2`).
+    /// Self-consistent nonlinear WLS: down-weights lags where the candidate
+    /// model already predicts a large semivariance. Cross-checked against
+    /// `fit.variogram(..., fit.method = 2)` — see
+    /// `tests::cressie_weights_match_gstat_fit_method_2`.
+    Cressie,
+    /// Unweighted / ordinary least squares (gstat `fit.method = 6`).
+    Ols,
+    /// `N_j / h_j²` (gstat's default, `fit.method = 7`); emphasizes short
+    /// lags and well-populated bins — "not supported by theory, but by
+    /// practice" per the gstat manual. What [`fit_model`] always uses.
+    #[default]
+    NOverHSquared,
+}
+
 /// Fits a single-structure model of the given kind (plus nugget) to an
-/// experimental variogram by weighted least squares.
+/// experimental variogram by weighted least squares, using gstat's default
+/// weights (`N_j / h_j²`). Equivalent to
+/// `fit_model_weighted(exp_v, kind, FitWeights::NOverHSquared)`.
 pub fn fit_model(exp_v: &ExperimentalVariogram, kind: ModelKind) -> Result<FitResult> {
+    fit_model_weighted(exp_v, kind, FitWeights::NOverHSquared)
+}
+
+/// Like [`fit_model`], with a selectable WLS weight scheme (see
+/// [`FitWeights`]) instead of gstat's default `N_j / h_j²`.
+pub fn fit_model_weighted(
+    exp_v: &ExperimentalVariogram,
+    kind: ModelKind,
+    weights: FitWeights,
+) -> Result<FitResult> {
     let pts: Vec<(f64, f64, f64)> = exp_v
         .bins
         .iter()
         .filter(|b| b.n_pairs > 0 && b.h > 0.0 && b.gamma.is_finite())
-        .map(|b| (b.h, b.gamma, b.n_pairs as f64 / (b.h * b.h)))
+        .map(|b| (b.h, b.gamma, b.n_pairs as f64))
         .collect();
     if pts.len() < 4 {
         return Err(GeostatError::InsufficientData(format!(
@@ -63,8 +99,17 @@ pub fn fit_model(exp_v: &ExperimentalVariogram, kind: ModelKind) -> Result<FitRe
             structures: vec![Structure::new(kind, psill, range)],
         };
         pts.iter()
-            .map(|&(h, g, w)| {
-                let e = g - model.gamma(h);
+            .map(|&(h, g, n)| {
+                let pred = model.gamma(h);
+                let e = g - pred;
+                let w = match weights {
+                    FitWeights::NPairs => n,
+                    // Self-consistent: the weight uses THIS candidate
+                    // model's own prediction, not the empirical gamma.
+                    FitWeights::Cressie => n / pred.max(1e-12).powi(2),
+                    FitWeights::Ols => 1.0,
+                    FitWeights::NOverHSquared => n / (h * h),
+                };
                 w * e * e
             })
             .sum()
@@ -363,6 +408,31 @@ mod tests {
         );
         assert!((s.sill - 0.9).abs() < 0.1, "sill {}", s.sill);
         assert!((s.range - 300.0).abs() < 30.0, "range {}", s.range);
+    }
+
+    #[test]
+    fn all_weight_schemes_recover_the_true_model() {
+        let truth =
+            VariogramModel::new(0.1, vec![Structure::new(ModelKind::Spherical, 0.9, 300.0)])
+                .unwrap();
+        let ev = synthetic_bins(&truth, 450.0, 15);
+        for w in [
+            FitWeights::NPairs,
+            FitWeights::Cressie,
+            FitWeights::Ols,
+            FitWeights::NOverHSquared,
+        ] {
+            let fit = fit_model_weighted(&ev, ModelKind::Spherical, w).unwrap();
+            let s = fit.model.structures[0];
+            assert!((fit.model.nugget - 0.1).abs() < 0.05, "{w:?}: nugget {}", fit.model.nugget);
+            assert!((s.sill - 0.9).abs() < 0.1, "{w:?}: sill {}", s.sill);
+            assert!((s.range - 300.0).abs() < 30.0, "{w:?}: range {}", s.range);
+        }
+        // `fit_model` is exactly the NOverHSquared scheme.
+        let default_fit = fit_model(&ev, ModelKind::Spherical).unwrap();
+        let weighted_fit = fit_model_weighted(&ev, ModelKind::Spherical, FitWeights::NOverHSquared)
+            .unwrap();
+        assert_eq!(default_fit.model, weighted_fit.model);
     }
 
     #[test]
