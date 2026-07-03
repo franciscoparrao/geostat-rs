@@ -292,13 +292,36 @@ Computers & Geosciences.
     ordinary=)`), probado end-to-end con Meuse. 175 tests, clippy limpio,
     paridad gstat re-confirmada sin regresiones.
 
-    **Con esto el ítem #17 queda cerrado salvo Markov-Bayes** (datos
-    blandos/probabilidades calibradas — sin infraestructura previa
-    alguna: necesitaría tipo de dato nuevo para indicadores blandos,
-    calibración de coeficientes B(k), y cambios en el sistema de kriging
-    para mezclar datos duros+blandos; alcance comparable al de MM1/MM2
-    pero para indicadores, deliberadamente no abordado esta sesión).
+    **Markov-Bayes** (mismo día) hecho — la clave fue notar que la
+    calibración de Zhu & Journel (1993) es *exactamente* MM1 de collocated
+    cokriging (`crate::collocated`) aplicada por-cutoff a un canal de
+    probabilidad blanda en vez de una vez a una secundaria continua, así
+    que se reusó la misma matemática en vez de inventar una nueva:
+    `sis::MarkovBayesCalibration{rho, sigma_soft}` +
+    `calibrate_markov_bayes(hard, soft)` (estima ambos por cutoff desde
+    pares colocalizados duro+blando, reusando literalmente
+    `collocated::estimate_collocated_stats` columna por columna) +
+    `ik::indicator_kriging_soft(data, targets, soft, calib, cfg)` — extiende
+    el sistema n×n del indicador duro con una fila/columna para el dato
+    blando colocalizado en el target, cruzada vía
+    `C_IY(h)=ρ·(σ_soft/σ_I)·C_I(h)`. Solo IK estándar (no SIS — llevar
+    datos blandos al hot loop secuencial necesitaría muestrear un ráster en
+    cada nodo simulado, una abstracción que no existe todavía) y solo
+    simple (no ordinary — mismo motivo que collocated cokriging). El ahorro
+    ~nc× de median IK NO se hereda aquí: la calibración es propia de cada
+    cutoff aunque el modelo duro sea compartido, así que los pesos se
+    resuelven cutoff por cutoff igual que full IK. Validado por: ρ=0
+    coincide exacto con IK solo-duro; un canal blando informativo (pero
+    imperfecto) baja la varianza condicional promedio vs solo-duro;
+    `calibrate_markov_bayes` recupera una correlación conocida desde pares
+    sintéticos; rechaza `ordinary=true` y dimensiones inconsistentes.
+    **Sin exponer en CLI/Python** (igual que collocated cokriging — alcance
+    de esta sesión: el núcleo). 179 tests, clippy limpio, paridad gstat
+    re-confirmada.
+
+    **Con esto el ítem #17 queda completo.**
 
     Quedan además los ítems #18 (block CV espacial, accuracy plots de
     Deutsch), #19
-    (trait de covarianza, rust-numpy, proptest, publicación crates.io/PyPI).
+    (trait de covarianza, rust-numpy, proptest, publicación crates.io/PyPI),
+    y del #16 solo `Power` (no estacionaria, cambio de arquitectura real).

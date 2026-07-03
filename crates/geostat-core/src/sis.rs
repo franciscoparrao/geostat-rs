@@ -352,6 +352,155 @@ pub(crate) fn indicator_ccdf<const D: usize>(
     Ok(())
 }
 
+/// Markov-Bayes calibration for one cutoff (Zhu & Journel 1993): the
+/// correlation `rho` between the hard indicator and a collocated soft datum,
+/// and the soft datum's marginal standard deviation `sigma_soft`, both
+/// estimated from calibration pairs (locations where both a hard
+/// measurement and a collocated secondary reading are available) — see
+/// [`calibrate_markov_bayes`]. This is the same Markov screening hypothesis
+/// as [`crate::collocated::MarkovModel::Mm1`] (`crate::collocated`),
+/// applied here per cutoff to a soft *probability* channel instead of once
+/// to a continuous secondary variable.
+#[derive(Debug, Clone, Copy)]
+pub struct MarkovBayesCalibration {
+    /// Correlation between the hard indicator and the soft datum at
+    /// collocated calibration pairs, in `[-1, 1]`.
+    pub rho: f64,
+    /// Marginal standard deviation of the soft datum.
+    pub sigma_soft: f64,
+}
+
+/// Estimates one [`MarkovBayesCalibration`] per cutoff from collocated
+/// hard/soft calibration pairs: `hard[i][k]` is the 0/1 indicator
+/// (`Z(x_i) <= cutoffs[k]`) and `soft[i][k]` the corresponding soft
+/// probability at the *same* location `i`, for every cutoff `k` (e.g. wells
+/// with both a hard measurement and a co-located secondary reading).
+pub fn calibrate_markov_bayes(
+    hard: &[Vec<f64>],
+    soft: &[Vec<f64>],
+) -> Result<Vec<MarkovBayesCalibration>> {
+    if hard.len() != soft.len() {
+        return Err(GeostatError::DimensionMismatch(format!(
+            "{} hard calibration rows vs {} soft rows",
+            hard.len(),
+            soft.len()
+        )));
+    }
+    if hard.is_empty() {
+        return Err(GeostatError::InsufficientData(
+            "at least one calibration pair required".into(),
+        ));
+    }
+    let nc = hard[0].len();
+    if nc == 0 || hard.iter().any(|r| r.len() != nc) || soft.iter().any(|r| r.len() != nc) {
+        return Err(GeostatError::DimensionMismatch(
+            "all calibration rows must share the same (nonzero) number of cutoffs".into(),
+        ));
+    }
+    (0..nc)
+        .map(|k| {
+            let h: Vec<f64> = hard.iter().map(|r| r[k]).collect();
+            let s: Vec<f64> = soft.iter().map(|r| r[k]).collect();
+            let (rho, _sigma_hard, sigma_soft) = crate::collocated::estimate_collocated_stats(&h, &s)?;
+            Ok(MarkovBayesCalibration { rho, sigma_soft })
+        })
+        .collect()
+}
+
+/// Indicator-kriging weights with one collocated soft datum (Markov-Bayes;
+/// simple-kriging form only — see [`MarkovBayesCalibration`]): extends
+/// [`indicator_weights`]'s hard system by one row/column for the soft term,
+/// whose cross-covariance to each hard neighbour follows the hard
+/// indicator's own spatial shape (the same MM1 hypothesis
+/// [`crate::collocated`] uses for continuous secondaries).
+fn indicator_weights_soft<const D: usize>(
+    coords: &[[f64; D]],
+    nb: &[usize],
+    model: &VariogramModel,
+    target: [f64; D],
+    calib: MarkovBayesCalibration,
+) -> Result<Vec<f64>> {
+    let n = nb.len();
+    let c0 = model.covariance_dh([0.0; D]);
+    let sigma_i = c0.max(1e-300).sqrt();
+    let stabilizer = c0 * 1e-9;
+    let dim = n + 1;
+    let mut a = Array2::<f64>::zeros((dim, dim));
+    let mut b = vec![0.0; dim];
+    let sep = |a: [f64; D], b: [f64; D]| {
+        let mut dh = [0.0; D];
+        for d in 0..D {
+            dh[d] = a[d] - b[d];
+        }
+        dh
+    };
+    let cross = |h: [f64; D]| -> f64 {
+        calib.rho * (calib.sigma_soft / sigma_i) * (c0 - model.gamma_dh(h))
+    };
+    for (ii, &i) in nb.iter().enumerate() {
+        let pi = coords[i];
+        a[[ii, ii]] = c0 + stabilizer;
+        for (jj, &j) in nb.iter().enumerate().skip(ii + 1) {
+            let c = c0 - model.gamma_dh(sep(pi, coords[j]));
+            a[[ii, jj]] = c;
+            a[[jj, ii]] = c;
+        }
+        b[ii] = c0 - model.gamma_dh(sep(pi, target));
+        let c_is = cross(sep(pi, target));
+        a[[ii, n]] = c_is;
+        a[[n, ii]] = c_is;
+    }
+    a[[n, n]] = calib.sigma_soft * calib.sigma_soft + stabilizer;
+    b[n] = calib.rho * calib.sigma_soft * sigma_i;
+    solve(a, b)
+}
+
+fn indicator_estimate_soft(
+    w: &[f64],
+    nb: &[usize],
+    vals: &[f64],
+    cutoff: f64,
+    p: f64,
+    soft_val: f64,
+) -> f64 {
+    let n = nb.len();
+    let mut est = p;
+    for (ii, &i) in nb.iter().enumerate() {
+        let ind = if vals[i] <= cutoff { 1.0 } else { 0.0 };
+        est += w[ii] * (ind - p);
+    }
+    est += w[n] * (soft_val - p);
+    est
+}
+
+/// ccdf at every cutoff for one target, incorporating one collocated soft
+/// datum per cutoff via Markov-Bayes (simple IK only; see
+/// [`indicator_weights_soft`]). `soft[k]`/`calib[k]` line up with
+/// `cutoffs[k]`. Unlike [`indicator_ccdf`], median IK's shared-factorization
+/// trick does not extend here: the calibration (and hence the soft
+/// cross-covariance) is cutoff-specific even when the hard model is shared,
+/// so weights are still solved once per cutoff.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn indicator_ccdf_soft<const D: usize>(
+    coords: &[[f64; D]],
+    vals: &[f64],
+    nb: &[usize],
+    cutoffs: &[f64],
+    props: &[f64],
+    models: &[VariogramModel],
+    target: [f64; D],
+    soft: &[f64],
+    calib: &[MarkovBayesCalibration],
+    ccdf: &mut [f64],
+) -> Result<()> {
+    for k in 0..cutoffs.len() {
+        let model = if models.len() == 1 { &models[0] } else { &models[k] };
+        let w = indicator_weights_soft(coords, nb, model, target, calib[k])?;
+        ccdf[k] = indicator_estimate_soft(&w, nb, vals, cutoffs[k], props[k], soft[k]);
+    }
+    Ok(())
+}
+
 /// GSLIB-style order-relation corrections: clamp to [0, 1], then average an
 /// upward (running max) and a downward (running min) pass.
 pub(crate) fn order_corrections(ccdf: &mut [f64]) {

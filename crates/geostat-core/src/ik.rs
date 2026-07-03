@@ -166,6 +166,166 @@ pub fn indicator_kriging<const D: usize>(
     })
 }
 
+/// Indicator kriging incorporating soft (secondary, calibrated) data at
+/// every target via the Markov-Bayes hypothesis (Zhu & Journel 1993; see
+/// [`crate::sis::MarkovBayesCalibration`]/
+/// [`crate::sis::calibrate_markov_bayes`]). `soft[t][k]` is the soft
+/// probability `P(Z(targets[t]) <= cutoffs[k])` from secondary information
+/// (e.g. calibrated remote sensing or seismic), `calib[k]` its per-cutoff
+/// calibration. Simple IK only — `cfg.ordinary` must be `false` (see
+/// [`crate::collocated`] for why the ordinary form of a collocated system
+/// is avoided). With no hard neighbours at a target this degenerates
+/// gracefully to a regression estimate on the collocated soft datum alone,
+/// the same fallback [`crate::collocated::CollocatedCokriging::predict`]
+/// uses.
+pub fn indicator_kriging_soft<const D: usize>(
+    data: &PointSet<D>,
+    targets: &[[f64; D]],
+    soft: &[Vec<f64>],
+    calib: &[crate::sis::MarkovBayesCalibration],
+    cfg: &IkConfig,
+) -> Result<Vec<CcdfEstimate>> {
+    let nc = cfg.cutoffs.len();
+    if nc == 0 {
+        return Err(GeostatError::InvalidParameter(
+            "at least one cutoff required".into(),
+        ));
+    }
+    if cfg.ordinary {
+        return Err(GeostatError::InvalidParameter(
+            "Markov-Bayes soft data needs simple indicator kriging \
+             (IkConfig::ordinary must be false)"
+                .into(),
+        ));
+    }
+    if cfg.cutoffs.windows(2).any(|w| !(w[0] < w[1])) {
+        return Err(GeostatError::InvalidParameter(
+            "cutoffs must be strictly ascending".into(),
+        ));
+    }
+    if cfg.models.len() != nc && cfg.models.len() != 1 {
+        return Err(GeostatError::DimensionMismatch(format!(
+            "{} models for {nc} cutoffs (expected {nc}, or 1 for median IK)",
+            cfg.models.len()
+        )));
+    }
+    if soft.len() != targets.len() {
+        return Err(GeostatError::DimensionMismatch(format!(
+            "{} soft rows for {} targets",
+            soft.len(),
+            targets.len()
+        )));
+    }
+    if soft.iter().any(|r| r.len() != nc) {
+        return Err(GeostatError::DimensionMismatch(format!(
+            "every soft row must have {nc} entries (one per cutoff)"
+        )));
+    }
+    if calib.len() != nc {
+        return Err(GeostatError::DimensionMismatch(format!(
+            "{} calibrations for {nc} cutoffs",
+            calib.len()
+        )));
+    }
+    for c in calib {
+        if !c.rho.is_finite() || !(-1.0..=1.0).contains(&c.rho) {
+            return Err(GeostatError::InvalidParameter(format!(
+                "Markov-Bayes rho must be finite and in [-1, 1], got {}",
+                c.rho
+            )));
+        }
+        if !(c.sigma_soft > 0.0) || !c.sigma_soft.is_finite() {
+            return Err(GeostatError::InvalidParameter(
+                "Markov-Bayes sigma_soft must be finite and > 0".into(),
+            ));
+        }
+    }
+    if cfg.max_neighbors == Some(0) {
+        return Err(GeostatError::InvalidParameter(
+            "max_neighbors must be at least 1".into(),
+        ));
+    }
+    if let Some(r) = cfg.search_radius
+        && !(r > 0.0)
+    {
+        return Err(GeostatError::InvalidParameter(format!(
+            "search radius must be positive, got {r}"
+        )));
+    }
+
+    let n = data.len() as f64;
+    let props: Vec<f64> = cfg
+        .cutoffs
+        .iter()
+        .map(|&c| data.values().iter().filter(|&&v| v <= c).count() as f64 / n)
+        .collect();
+    for (k, &p) in props.iter().enumerate() {
+        if !(p > 0.0 && p < 1.0) {
+            return Err(GeostatError::InvalidParameter(format!(
+                "cutoff {} (= {}) leaves no data on one side (proportion {p})",
+                k, cfg.cutoffs[k]
+            )));
+        }
+    }
+    let (dmin, dmax) = data
+        .values()
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+            (lo.min(v), hi.max(v))
+        });
+    let tail_min = cfg.tail_min.unwrap_or(dmin);
+    let tail_max = cfg.tail_max.unwrap_or(dmax);
+    if !(tail_min <= cfg.cutoffs[0]) || !(tail_max >= cfg.cutoffs[nc - 1]) {
+        return Err(GeostatError::InvalidParameter(
+            "tail bounds must bracket the cutoffs".into(),
+        ));
+    }
+    validate_ccdf_tails(cfg.lower_tail, cfg.upper_tail, cfg.cutoffs[nc - 1])?;
+
+    let local = cfg.max_neighbors.is_some() || cfg.search_radius.is_some();
+    let tree = local.then(|| KdTree::build(data.coords()));
+    let all: Vec<usize> = (0..data.len()).collect();
+
+    crate::parallel::par_try_map(targets.len(), |t| {
+        let target = targets[t];
+        let nb = match &tree {
+            Some(tree) => tree.k_nearest(
+                target,
+                cfg.max_neighbors.unwrap_or(data.len()),
+                cfg.search_radius,
+            ),
+            None => all.clone(),
+        };
+        let mut ccdf = vec![0.0; nc];
+        crate::sis::indicator_ccdf_soft(
+            data.coords(),
+            data.values(),
+            &nb,
+            &cfg.cutoffs,
+            &props,
+            &cfg.models,
+            target,
+            &soft[t],
+            calib,
+            &mut ccdf,
+        )?;
+        order_corrections(&mut ccdf);
+        let (e_type, cond_var) = ccdf_moments(
+            &ccdf,
+            &cfg.cutoffs,
+            tail_min,
+            tail_max,
+            cfg.lower_tail,
+            cfg.upper_tail,
+        );
+        Ok(CcdfEstimate {
+            ccdf,
+            e_type,
+            cond_var,
+        })
+    })
+}
+
 /// Validates ccdf tail models: `None` is not a distribution here, and a
 /// hyperbolic upper tail needs a positive last cutoff (Pareto support).
 pub(crate) fn validate_ccdf_tails(
@@ -370,6 +530,142 @@ mod tests {
         let mut bad = cfg.clone();
         bad.models = vec![cfg.models[0].clone(), cfg.models[0].clone()]; // 2 for 3 cutoffs
         assert!(indicator_kriging(&data, &targets, &bad).is_err());
+    }
+
+    #[test]
+    fn markov_bayes_zero_correlation_matches_hard_only_ik() {
+        let (data, cfg) = setup();
+        let nc = cfg.cutoffs.len();
+        let targets: Vec<[f64; 2]> = (0..10).map(|i| [i as f64 * 9.0, 45.0]).collect();
+        let hard_only = indicator_kriging(&data, &targets, &cfg).unwrap();
+
+        let soft: Vec<Vec<f64>> = targets.iter().map(|_| vec![0.7; nc]).collect();
+        let calib: Vec<crate::sis::MarkovBayesCalibration> = (0..nc)
+            .map(|_| crate::sis::MarkovBayesCalibration {
+                rho: 0.0,
+                sigma_soft: 0.25,
+            })
+            .collect();
+        let with_soft = indicator_kriging_soft(&data, &targets, &soft, &calib, &cfg).unwrap();
+
+        for (a, b) in hard_only.iter().zip(&with_soft) {
+            for (fa, fb) in a.ccdf.iter().zip(&b.ccdf) {
+                assert!((fa - fb).abs() < 1e-9, "{fa} vs {fb}");
+            }
+        }
+    }
+
+    #[test]
+    fn markov_bayes_informative_soft_data_reduces_conditional_variance() {
+        let (data, cfg) = setup();
+        let nc = cfg.cutoffs.len();
+        let targets: Vec<[f64; 2]> = (0..10).map(|i| [i as f64 * 9.0, 45.0]).collect();
+        let hard_only = indicator_kriging(&data, &targets, &cfg).unwrap();
+
+        // A genuinely informative (if imperfect) soft channel: the true
+        // hard indicator at the target, shrunk toward the cutoff's global
+        // proportion (a plausible "soft probability" shape) plus a fixed
+        // offset so it's not literally identical to the ccdf being solved
+        // for.
+        let mut sorted = data.values().to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let soft: Vec<Vec<f64>> = targets
+            .iter()
+            .map(|&t| {
+                // Nearest data value to the target, as a stand-in for a
+                // densely-sampled secondary reading correlated with Z.
+                let nearest = data
+                    .coords()
+                    .iter()
+                    .zip(data.values())
+                    .min_by(|(c1, _), (c2, _)| {
+                        let d1: f64 = (0..2).map(|d| (c1[d] - t[d]).powi(2)).sum();
+                        let d2: f64 = (0..2).map(|d| (c2[d] - t[d]).powi(2)).sum();
+                        d1.total_cmp(&d2)
+                    })
+                    .map(|(_, &v)| v)
+                    .unwrap();
+                cfg.cutoffs
+                    .iter()
+                    .map(|&c| if nearest <= c { 0.85 } else { 0.15 })
+                    .collect()
+            })
+            .collect();
+        let calib: Vec<crate::sis::MarkovBayesCalibration> = (0..nc)
+            .map(|_| crate::sis::MarkovBayesCalibration {
+                rho: 0.75,
+                sigma_soft: 0.3,
+            })
+            .collect();
+        let with_soft = indicator_kriging_soft(&data, &targets, &soft, &calib, &cfg).unwrap();
+
+        let mean_var = |ests: &[CcdfEstimate]| -> f64 {
+            ests.iter().map(|e| e.cond_var).sum::<f64>() / ests.len() as f64
+        };
+        assert!(
+            mean_var(&with_soft) < mean_var(&hard_only),
+            "soft {} vs hard-only {}",
+            mean_var(&with_soft),
+            mean_var(&hard_only)
+        );
+    }
+
+    #[test]
+    fn markov_bayes_rejects_ordinary_and_bad_dims() {
+        let (data, mut cfg) = setup();
+        let nc = cfg.cutoffs.len();
+        let targets: Vec<[f64; 2]> = vec![[50.0, 50.0]];
+        let good_soft = vec![vec![0.5; nc]];
+        let good_calib: Vec<crate::sis::MarkovBayesCalibration> = (0..nc)
+            .map(|_| crate::sis::MarkovBayesCalibration {
+                rho: 0.3,
+                sigma_soft: 0.2,
+            })
+            .collect();
+
+        cfg.ordinary = true;
+        assert!(
+            indicator_kriging_soft(&data, &targets, &good_soft, &good_calib, &cfg).is_err()
+        );
+        cfg.ordinary = false;
+
+        let bad_soft = vec![vec![0.5; nc - 1]]; // wrong cutoff count
+        assert!(
+            indicator_kriging_soft(&data, &targets, &bad_soft, &good_calib, &cfg).is_err()
+        );
+
+        let bad_calib = vec![crate::sis::MarkovBayesCalibration {
+            rho: 1.5, // out of [-1,1]
+            sigma_soft: 0.2,
+        }]
+        .into_iter()
+        .chain(good_calib.iter().skip(1).copied())
+        .collect::<Vec<_>>();
+        assert!(
+            indicator_kriging_soft(&data, &targets, &good_soft, &bad_calib, &cfg).is_err()
+        );
+    }
+
+    #[test]
+    fn calibrate_markov_bayes_recovers_known_correlation() {
+        use crate::rng::Rng;
+        let mut rng = Rng::new(3);
+        let n = 300;
+        let mut hard = Vec::with_capacity(n);
+        let mut soft = Vec::with_capacity(n);
+        for _ in 0..n {
+            let latent = rng.normal();
+            // A single cutoff channel: hard = 1{latent > 0}; soft correlates
+            // with latent at a known strength.
+            let h = if latent > 0.0 { 1.0 } else { 0.0 };
+            let s = 0.6 * latent + 0.4 * rng.normal();
+            hard.push(vec![h]);
+            soft.push(vec![s]);
+        }
+        let calib = crate::sis::calibrate_markov_bayes(&hard, &soft).unwrap();
+        assert_eq!(calib.len(), 1);
+        assert!(calib[0].rho > 0.3, "rho {}", calib[0].rho);
+        assert!(calib[0].sigma_soft > 0.0);
     }
 
     #[test]

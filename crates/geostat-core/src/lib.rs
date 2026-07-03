@@ -74,7 +74,7 @@ pub use data::PointSet;
 pub use declustering::{DeclusterScan, cell_declustering_weights, decluster_scan};
 pub use error::{GeostatError, Result};
 pub use grid::{Grid2D, Grid3D};
-pub use ik::{CcdfEstimate, IkConfig, indicator_kriging};
+pub use ik::{CcdfEstimate, IkConfig, indicator_kriging, indicator_kriging_soft};
 pub use interpolation::{Idw, Knn, idw_cross_validate, knn_cross_validate};
 pub use kriging::{Kriging, KrigingConfig, KrigingEstimate, KrigingMethod, block_offsets};
 pub use regression::{OlsTrend, RegressionKriging, detrend_external, detrend_polynomial};
@@ -82,7 +82,10 @@ pub use rng::Rng;
 pub use simulation::{
     SgsConfig, SgsResult, sequential_gaussian_simulation, sequential_gaussian_simulation_3d, sgs_at,
 };
-pub use sis::{SisConfig, sequential_indicator_simulation, sis_at};
+pub use sis::{
+    MarkovBayesCalibration, SisConfig, calibrate_markov_bayes, sequential_indicator_simulation,
+    sis_at,
+};
 pub use tails::TailModel;
 pub use trans::{LognormalEstimate, lognormal_kriging};
 pub use transform::{NormalScore, Tails, norm_cdf};
