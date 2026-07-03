@@ -44,6 +44,7 @@
 #![allow(clippy::neg_cmp_op_on_partial_ord)]
 
 pub mod cokriging;
+pub mod collocated;
 pub mod data;
 pub mod declustering;
 pub mod error;
@@ -68,6 +69,7 @@ pub mod variogram;
 pub mod vecchia;
 
 pub use cokriging::{CoKriging, CoKrigingConfig, Lmc, LmcStructure, fit_lmc, fit_lmc_collocated};
+pub use collocated::{CollocatedCokriging, CollocatedConfig, MarkovModel, estimate_collocated_stats};
 pub use data::PointSet;
 pub use declustering::{DeclusterScan, cell_declustering_weights, decluster_scan};
 pub use error::{GeostatError, Result};
@@ -89,12 +91,13 @@ pub use validation::{CvResult, k_fold, leave_one_out, leave_one_out_with_drift};
 pub use variogram::{
     Anisotropy, DirectionConfig, ExperimentalVariogram, FitResult, FitWeights, LagBin, ModelKind,
     Structure, VariogramConfig, VariogramMap, VariogramModel, experimental_cross_variogram,
-    experimental_variogram, fit_anisotropic, fit_best, fit_indicator_models, fit_model,
-    fit_model_weighted, variogram_map,
+    experimental_variogram, fit_anisotropic, fit_best, fit_indicator_models, fit_matern,
+    fit_median_indicator_model, fit_model, fit_model_weighted, fit_nested, fit_stable,
+    variogram_map,
 };
 pub use vecchia::{
     VecchiaEstimate, VecchiaFit, VecchiaPlan, maxmin_order, vecchia_loglik,
-    vecchia_loglik_grouped, vecchia_mle, vecchia_mle_grouped, vecchia_param_se, vecchia_plan,
-    vecchia_predict, vecchia_reml, vecchia_reml_drift, vecchia_reml_drift_grouped,
-    vecchia_reml_grouped,
+    vecchia_loglik_grouped, vecchia_mle, vecchia_mle_grouped, vecchia_mle_matern,
+    vecchia_param_se, vecchia_plan, vecchia_predict, vecchia_reml, vecchia_reml_drift,
+    vecchia_reml_drift_grouped, vecchia_reml_grouped,
 };

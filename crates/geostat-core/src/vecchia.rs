@@ -723,6 +723,91 @@ fn mle_fit_with_plan<const D: usize>(
     })
 }
 
+/// Fits a Matérn model (nugget + partial sill + range + smoothness `ν`)
+/// jointly by maximum likelihood on the Vecchia approximation, instead of
+/// fixing `ν` and calling `vecchia_mle(data, ModelKind::Matern(nu), m,
+/// order)`. Same `ν`-range confounding caveat as [`fit_matern`] (its WLS
+/// counterpart): `ν` is multi-started alongside range rather than treated
+/// as a fixed input.
+///
+/// [`fit_matern`]: crate::variogram::fit_matern
+pub fn vecchia_mle_matern<const D: usize>(
+    data: &PointSet<D>,
+    m: usize,
+    order: Option<&[usize]>,
+) -> Result<VecchiaFit> {
+    let plan = vecchia_plan(data.coords(), m, order)?;
+
+    let mean = data.mean();
+    let var0 = (data
+        .values()
+        .iter()
+        .map(|v| (v - mean).powi(2))
+        .sum::<f64>()
+        / data.len() as f64)
+        .max(1e-12);
+    let coords = data.coords();
+    let mut lo = [f64::INFINITY; D];
+    let mut hi = [f64::NEG_INFINITY; D];
+    for p in coords {
+        for d in 0..D {
+            lo[d] = lo[d].min(p[d]);
+            hi[d] = hi[d].max(p[d]);
+        }
+    }
+    let extent = (0..D).map(|d| (hi[d] - lo[d]).powi(2)).sum::<f64>().sqrt();
+    let range0 = (extent / 3.0).max(1e-9);
+
+    let objective = |x: &[f64]| -> f64 {
+        let nugget = x[0] * x[0];
+        let psill = x[1].exp();
+        let range = x[2].exp();
+        let nu = x[3].exp();
+        let range_max = 10.0 * extent;
+        let reg = if range > range_max {
+            ((range - range_max) / range_max).powi(2)
+        } else {
+            0.0
+        };
+        let model = VariogramModel {
+            nugget,
+            structures: vec![Structure::new(ModelKind::Matern(nu), psill, range)],
+        };
+        match loglik_with_plan(data, &model, &plan) {
+            Ok(ll) if ll.is_finite() => -ll + 1e6 * reg,
+            _ => 1e12,
+        }
+    };
+
+    // Each start here re-evaluates the Vecchia likelihood (an O(n m^3) pass
+    // over every conditioning pair, each needing a K_nu Bessel quadrature)
+    // up to `max_iter` times, unlike a fixed-kind fit -- keep the (nu0,
+    // range0) grid modest so a joint fit stays practical.
+    let ln_range0 = range0.ln();
+    let starts: Vec<Vec<f64>> = [0.7_f64, 2.5]
+        .into_iter()
+        .flat_map(|nu0| {
+            [0.5_f64, 2.0].into_iter().map(move |f| {
+                vec![
+                    (0.1 * var0).sqrt(),
+                    (0.9 * var0).ln(),
+                    ln_range0 + f.ln(),
+                    nu0.ln(),
+                ]
+            })
+        })
+        .collect();
+    let (xb, neg_ll) = nelder_mead_multistart(objective, &starts, 0.3, 1200);
+    let model = VariogramModel::new(
+        xb[0] * xb[0],
+        vec![Structure::new(ModelKind::Matern(xb[3].exp()), xb[1].exp(), xb[2].exp())],
+    )?;
+    Ok(VecchiaFit {
+        model,
+        loglik: -neg_ll,
+    })
+}
+
 /// All monomial exponent tuples over `D` dimensions with total degree
 /// `<= degree` (includes the constant term).
 fn monomials<const D: usize>(degree: u8) -> Vec<[u8; D]> {
@@ -1629,6 +1714,29 @@ mod tests {
                 .unwrap();
         let ll_wrong = vecchia_loglik(&data, &wrong, 15, None).unwrap();
         assert!(fit.loglik > ll_wrong, "{} vs wrong {ll_wrong}", fit.loglik);
+    }
+
+    #[test]
+    fn vecchia_mle_matern_matches_or_beats_a_fixed_nu_fit() {
+        let data = field(30, 9);
+        let m = 8;
+        // nu=1.5 is directly representable in the joint search (one of the
+        // multi-start seeds), so the joint optimum's likelihood must be at
+        // least as good as fixing nu at that same value.
+        let fixed = vecchia_mle(&data, ModelKind::Matern15, m, None).unwrap();
+        let joint = vecchia_mle_matern(&data, m, None).unwrap();
+        assert!(
+            joint.loglik >= fixed.loglik - 1e-6,
+            "joint {} vs fixed-nu=1.5 {}",
+            joint.loglik,
+            fixed.loglik
+        );
+        let s = joint.model.structures[0];
+        let ModelKind::Matern(nu) = s.kind else {
+            panic!("expected Matern, got {:?}", s.kind)
+        };
+        assert!(nu > 0.0 && nu.is_finite(), "nu = {nu}");
+        assert!(s.sill > 0.0 && s.range > 0.0 && joint.model.nugget >= 0.0);
     }
 
     #[test]

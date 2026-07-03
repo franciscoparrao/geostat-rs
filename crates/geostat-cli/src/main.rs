@@ -12,7 +12,8 @@ use geostat_core::{
     KrigingMethod, ModelKind, PointSet, SgsConfig, SisConfig, Tails, VariogramConfig,
     VariogramModel, cell_declustering_weights, decluster_scan, detrend_external,
     detrend_polynomial, experimental_variogram, fit_anisotropic, fit_best, fit_indicator_models,
-    fit_lmc_collocated, indicator_kriging, k_fold, leave_one_out, leave_one_out_with_drift,
+    fit_lmc_collocated, fit_median_indicator_model, indicator_kriging, k_fold, leave_one_out,
+    leave_one_out_with_drift,
     sequential_gaussian_simulation, sequential_indicator_simulation, variogram_map, vecchia_mle,
     vecchia_predict, vecchia_reml,
 };
@@ -531,6 +532,15 @@ struct SisCmd {
     /// utail; hyperbolic is capped at --tail-max)
     #[arg(long, default_value = "linear")]
     utail: String,
+    /// Median IK (GSLIB mik=1): fit and krige with a single shared
+    /// indicator variogram (the median cutoff's) instead of one per
+    /// cutoff — amortizes one factorization across all cutoffs
+    #[arg(long)]
+    mik: bool,
+    /// Ordinary indicator kriging (Σw=1) instead of simple IK (global
+    /// proportion as the known mean)
+    #[arg(long)]
+    ordinary: bool,
     /// Output CSV file (x,y,sim1..simN)
     #[arg(short, long)]
     output: PathBuf,
@@ -572,6 +582,16 @@ struct IkCmd {
     /// utail; hyperbolic is capped at --tail-max)
     #[arg(long, default_value = "linear")]
     utail: String,
+    /// Median IK (GSLIB mik=1): fit and krige with a single shared
+    /// indicator variogram (the median cutoff's) instead of one per
+    /// cutoff — amortizes one factorization across all cutoffs. Ignored
+    /// when --models is given explicitly.
+    #[arg(long)]
+    mik: bool,
+    /// Ordinary indicator kriging (Σw=1) instead of simple IK (global
+    /// proportion as the known mean)
+    #[arg(long)]
+    ordinary: bool,
     /// Output CSV file (x,y,F1..FK,e_type,cond_var)
     #[arg(short, long)]
     output: PathBuf,
@@ -1781,18 +1801,28 @@ fn run_sis(cmd: SisCmd) -> Result<()> {
             .join(", ")
     );
 
-    // Fit an indicator variogram model per cutoff.
+    // Fit an indicator variogram model per cutoff (or one shared model at
+    // the median cutoff for --mik).
     let kinds = parse_kinds(&cmd.fit)?;
     let cfg_v = cmd.vario.config(&data);
-    let models = fit_indicator_models(&data, &cutoffs, &kinds, &cfg_v)?;
-    for (c, m) in cutoffs.iter().zip(&models) {
-        println!("Indicator model at cutoff {c:.4}: {m}");
+    let models = if cmd.mik {
+        fit_median_indicator_model(&data, &cutoffs, &kinds, &cfg_v)?
+    } else {
+        fit_indicator_models(&data, &cutoffs, &kinds, &cfg_v)?
+    };
+    if cmd.mik {
+        println!("Median IK: shared model {}", models[0]);
+    } else {
+        for (c, m) in cutoffs.iter().zip(&models) {
+            println!("Indicator model at cutoff {c:.4}: {m}");
+        }
     }
 
     let grid = cmd.grid.build(&data)?;
     let cfg = SisConfig {
         cutoffs,
         models,
+        ordinary: cmd.ordinary,
         n_realizations: cmd.realizations,
         seed: cmd.seed,
         max_neighbors: cmd.max_neighbors,
@@ -1868,11 +1898,17 @@ fn run_ik(cmd: IkCmd) -> Result<()> {
         None => {
             let kinds = parse_kinds(&cmd.fit)?;
             let cfg_v = cmd.vario.config(&data);
-            let models = fit_indicator_models(&data, &cutoffs, &kinds, &cfg_v)?;
-            for (c, m) in cutoffs.iter().zip(&models) {
-                println!("Indicator model at cutoff {c:.4}: {m}");
+            if cmd.mik {
+                let models = fit_median_indicator_model(&data, &cutoffs, &kinds, &cfg_v)?;
+                println!("Median IK: shared model {}", models[0]);
+                models
+            } else {
+                let models = fit_indicator_models(&data, &cutoffs, &kinds, &cfg_v)?;
+                for (c, m) in cutoffs.iter().zip(&models) {
+                    println!("Indicator model at cutoff {c:.4}: {m}");
+                }
+                models
             }
-            models
         }
     };
 
@@ -1881,6 +1917,7 @@ fn run_ik(cmd: IkCmd) -> Result<()> {
     let cfg = IkConfig {
         cutoffs,
         models,
+        ordinary: cmd.ordinary,
         max_neighbors: cmd.neighbors.max_neighbors,
         search_radius: cmd.neighbors.radius,
         tail_min: cmd.tail_min,

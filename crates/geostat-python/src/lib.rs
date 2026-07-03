@@ -1053,14 +1053,18 @@ fn sgs(
 }
 
 /// Conditional sequential indicator simulation. Indicator variogram models
-/// are fitted automatically at each cutoff (spherical/exponential).
+/// are fitted automatically at each cutoff (spherical/exponential), or a
+/// single shared model at the median cutoff when `mik=True` (GSLIB `mik=1`
+/// median IK — amortizes one factorization across every cutoff).
 /// `ltail`/`utail` ("linear", "power:<w>", "hyper:<w>") set the GSLIB tail
 /// interpolation between `tail_min`/`tail_max` (default: data extremes) and
 /// the extreme cutoffs; hyperbolic upper tails are capped at `tail_max`.
+/// `ordinary=True` uses ordinary (Σw=1) instead of simple indicator kriging.
 #[pyfunction]
 #[pyo3(signature = (x, y, values, cutoffs, bbox, nx, ny, n_realizations = 10,
     seed = 42, max_neighbors = 16, radius = None, n_lags = 15, max_dist = None,
-    ltail = "linear", utail = "linear", tail_min = None, tail_max = None))]
+    ltail = "linear", utail = "linear", tail_min = None, tail_max = None,
+    mik = false, ordinary = false))]
 #[allow(clippy::too_many_arguments)]
 fn sis(
     x: Vec<f64>,
@@ -1080,15 +1084,22 @@ fn sis(
     utail: &str,
     tail_min: Option<f64>,
     tail_max: Option<f64>,
+    mik: bool,
+    ordinary: bool,
 ) -> PyResult<Vec<Vec<f64>>> {
     let data = point_set(x, y, values)?;
     let grid = Grid2D::from_bbox([bbox.0, bbox.1], [bbox.2, bbox.3], nx, ny).map_err(err)?;
     let cfg_v = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
     let kinds = [core::ModelKind::Spherical, core::ModelKind::Exponential];
-    let models = core::fit_indicator_models(&data, &cutoffs, &kinds, &cfg_v).map_err(err)?;
+    let models = if mik {
+        core::fit_median_indicator_model(&data, &cutoffs, &kinds, &cfg_v).map_err(err)?
+    } else {
+        core::fit_indicator_models(&data, &cutoffs, &kinds, &cfg_v).map_err(err)?
+    };
     let cfg = SisConfig {
         cutoffs,
         models,
+        ordinary,
         n_realizations,
         seed,
         max_neighbors,
@@ -1212,13 +1223,16 @@ fn krige_3d(
 
 /// Indicator kriging at arbitrary target locations. Returns a dict with
 /// `ccdf` (list of per-target ccdf lists), `e_type` and `cond_var`.
-/// Indicator variogram models are fitted automatically per cutoff.
-/// `ltail`/`utail` ("linear", "power:<w>", "hyper:<w>") set the GSLIB tail
-/// interpolation used for the E-type and conditional-variance integrals.
+/// Indicator variogram models are fitted automatically per cutoff, or a
+/// single shared model at the median cutoff when `mik=True` (GSLIB `mik=1`
+/// median IK). `ltail`/`utail` ("linear", "power:<w>", "hyper:<w>") set the
+/// GSLIB tail interpolation used for the E-type and conditional-variance
+/// integrals. `ordinary=True` uses ordinary (Σw=1) instead of simple IK.
 #[pyfunction]
 #[pyo3(signature = (x, y, values, cutoffs, target_x, target_y,
     max_neighbors = None, radius = None, n_lags = 15, max_dist = None,
-    ltail = "linear", utail = "linear", tail_min = None, tail_max = None))]
+    ltail = "linear", utail = "linear", tail_min = None, tail_max = None,
+    mik = false, ordinary = false))]
 #[allow(clippy::too_many_arguments)]
 fn indicator_kriging(
     py: Python<'_>,
@@ -1236,6 +1250,8 @@ fn indicator_kriging(
     utail: &str,
     tail_min: Option<f64>,
     tail_max: Option<f64>,
+    mik: bool,
+    ordinary: bool,
 ) -> PyResult<Py<PyDict>> {
     if target_x.len() != target_y.len() {
         return Err(PyValueError::new_err(
@@ -1245,10 +1261,15 @@ fn indicator_kriging(
     let data = point_set(x, y, values)?;
     let cfg_v = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
     let kinds = [core::ModelKind::Spherical, core::ModelKind::Exponential];
-    let models = core::fit_indicator_models(&data, &cutoffs, &kinds, &cfg_v).map_err(err)?;
+    let models = if mik {
+        core::fit_median_indicator_model(&data, &cutoffs, &kinds, &cfg_v).map_err(err)?
+    } else {
+        core::fit_indicator_models(&data, &cutoffs, &kinds, &cfg_v).map_err(err)?
+    };
     let cfg = core::IkConfig {
         cutoffs,
         models,
+        ordinary,
         max_neighbors,
         search_radius: radius,
         tail_min,

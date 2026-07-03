@@ -9,7 +9,7 @@
 use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
 use crate::search::KdTree;
-use crate::sis::{indicator_sk, order_corrections};
+use crate::sis::{indicator_ccdf, order_corrections};
 use crate::tails::TailModel;
 use crate::variogram::VariogramModel;
 
@@ -18,8 +18,14 @@ use crate::variogram::VariogramModel;
 pub struct IkConfig {
     /// Indicator cutoffs, strictly ascending, inside the data value range.
     pub cutoffs: Vec<f64>,
-    /// Indicator variogram model per cutoff.
+    /// Indicator variogram model(s): either one per cutoff (full IK), or a
+    /// single shared model for all cutoffs (**median IK**, GSLIB `mik=1`) —
+    /// see [`crate::sis::SisConfig::models`] for why this amortizes the
+    /// factorization cost across cutoffs.
     pub models: Vec<VariogramModel>,
+    /// Ordinary indicator kriging (`Σw=1`, no assumed known mean) instead of
+    /// the default simple IK (global proportion as the known mean).
+    pub ordinary: bool,
     /// Maximum nearest conditioning points per target (all when unset).
     pub max_neighbors: Option<usize>,
     /// Optional search radius.
@@ -65,9 +71,9 @@ pub fn indicator_kriging<const D: usize>(
             "cutoffs must be strictly ascending".into(),
         ));
     }
-    if cfg.models.len() != nc {
+    if cfg.models.len() != nc && cfg.models.len() != 1 {
         return Err(GeostatError::DimensionMismatch(format!(
-            "{} models for {nc} cutoffs",
+            "{} models for {nc} cutoffs (expected {nc}, or 1 for median IK)",
             cfg.models.len()
         )));
     }
@@ -131,17 +137,17 @@ pub fn indicator_kriging<const D: usize>(
         if nb.is_empty() {
             ccdf.copy_from_slice(&props);
         } else {
-            for k in 0..nc {
-                ccdf[k] = indicator_sk(
-                    data.coords(),
-                    data.values(),
-                    &nb,
-                    cfg.cutoffs[k],
-                    props[k],
-                    &cfg.models[k],
-                    target,
-                )?;
-            }
+            indicator_ccdf(
+                data.coords(),
+                data.values(),
+                &nb,
+                &cfg.cutoffs,
+                &props,
+                &cfg.models,
+                target,
+                cfg.ordinary,
+                &mut ccdf,
+            )?;
             order_corrections(&mut ccdf);
         }
         let (e_type, cond_var) = ccdf_moments(
@@ -258,6 +264,7 @@ mod tests {
         let cfg = IkConfig {
             cutoffs,
             models,
+            ordinary: false,
             max_neighbors: None,
             search_radius: None,
             tail_min: None,
@@ -299,6 +306,70 @@ mod tests {
             }
             assert!(best > 0.5, "class probability {best} at datum");
         }
+    }
+
+    #[test]
+    fn median_ik_matches_full_ik_when_models_coincide() {
+        // `setup()` already uses the identical model for every cutoff, so
+        // full IK (one system per cutoff) and median IK (`models.len()==1`,
+        // one shared factorization) must agree exactly -- the whole point
+        // of the optimization is that it changes *how* the same weights are
+        // computed, never the result.
+        let (data, full_cfg) = setup();
+        let mut median_cfg = full_cfg.clone();
+        median_cfg.models = vec![full_cfg.models[0].clone()];
+
+        let targets: Vec<[f64; 2]> = (0..15).map(|i| [i as f64 * 6.0, 40.0]).collect();
+        let full = indicator_kriging(&data, &targets, &full_cfg).unwrap();
+        let median = indicator_kriging(&data, &targets, &median_cfg).unwrap();
+        for (f, m) in full.iter().zip(&median) {
+            for (fc, mc) in f.ccdf.iter().zip(&m.ccdf) {
+                assert!((fc - mc).abs() < 1e-10, "{fc} vs {mc}");
+            }
+            assert!((f.e_type - m.e_type).abs() < 1e-10);
+            assert!((f.cond_var - m.cond_var).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn ordinary_ik_is_bounded_monotone_and_exact_at_data() {
+        let (data, mut cfg) = setup();
+        cfg.ordinary = true;
+        let targets: Vec<[f64; 2]> = (0..10).map(|i| data.coord(i * 7)).collect();
+        let est = indicator_kriging(&data, &targets, &cfg).unwrap();
+        for (e, t) in est.iter().zip(&targets) {
+            assert!(e.ccdf.windows(2).all(|w| w[0] <= w[1] + 1e-12));
+            assert!(e.ccdf.iter().all(|&f| (0.0..=1.0).contains(&f)));
+            assert!(e.cond_var >= 0.0);
+            let v = data.value(data.coords().iter().position(|c| c == t).unwrap());
+            let mut f_lo = 0.0;
+            let mut best = 0.0;
+            for (k, &f) in e.ccdf.iter().enumerate() {
+                let p = f - f_lo;
+                let in_class = if k == 0 {
+                    v <= cfg.cutoffs[0]
+                } else {
+                    v > cfg.cutoffs[k - 1] && v <= cfg.cutoffs[k]
+                };
+                if in_class {
+                    best = p;
+                }
+                f_lo = f;
+            }
+            if v > *cfg.cutoffs.last().unwrap() {
+                best = 1.0 - f_lo;
+            }
+            assert!(best > 0.5, "class probability {best} at datum");
+        }
+    }
+
+    #[test]
+    fn rejects_bad_model_count() {
+        let (data, cfg) = setup();
+        let targets: Vec<[f64; 2]> = vec![[50.0, 50.0]];
+        let mut bad = cfg.clone();
+        bad.models = vec![cfg.models[0].clone(), cfg.models[0].clone()]; // 2 for 3 cutoffs
+        assert!(indicator_kriging(&data, &targets, &bad).is_err());
     }
 
     #[test]

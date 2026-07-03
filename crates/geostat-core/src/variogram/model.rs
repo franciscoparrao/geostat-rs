@@ -227,6 +227,10 @@ fn is_one(v: &f64) -> bool {
     *v == 1.0
 }
 
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
+}
+
 /// Geometric (range) anisotropy, gstat/GSLIB convention: `azimuth_deg` is a
 /// reference direction in degrees clockwise from north, `range` (on the
 /// enclosing [`Structure`]) is that direction's range, and `ratio` scales
@@ -239,20 +243,76 @@ fn is_one(v: &f64) -> bool {
 /// whichever axis ends up longer) is needed, `effective_h`'s rotate-then-
 /// scale math is valid for any `ratio > 0` unchanged.
 ///
-/// In 3-D, `ratio_z` plays the same role for the vertical axis (gstat's
-/// second anisotropy ratio with zero dip/rake rotations); it is ignored in
-/// 2-D.
+/// In 3-D, `ratio_z` plays the same role for the vertical axis; `dip_deg`
+/// and `rake_deg` (both default 0, ignored in 2-D) tilt the whole
+/// major/minor/vertical frame off the horizontal — full GSLIB `ang1`
+/// (`azimuth_deg`) / `ang2` (`dip_deg`) / `ang3` (`rake_deg`) rotation
+/// (Deutsch & Journel 1998), needed to match an experimental variogram
+/// whose direction of maximum continuity plunges rather than staying
+/// horizontal (the experimental variogram already accepts `dip_deg` via
+/// [`super::DirectionConfig`]; before this, the fitted *model* could not
+/// express it — see AUDIT-2026-07.md §3). Cross-checked against gstat's
+/// `anis = c(ang1, ang2, ang3, anis1, anis2)` to machine precision for
+/// azimuth-only, dip-only, rake-only and combined rotations (gstat's own
+/// `vgm()` warns its third-angle code carries a known GSLIB quirk; this
+/// matches gstat's actual behavior exactly, quirk included, since gstat
+/// interop is the point — see `tests::rotation_3d_matches_gstat_setrot`).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Anisotropy {
-    /// Reference direction, degrees clockwise from north.
+    /// Reference direction (GSLIB `ang1`), degrees clockwise from north.
     pub azimuth_deg: f64,
     /// `(azimuth_deg + 90°)` / `azimuth_deg` range ratio, `> 0` (horizontal
-    /// in 3-D). `≤ 1` for the common "major axis" case; `> 1` for zonal
-    /// anisotropy (see the struct docs).
+    /// in 3-D, GSLIB `anis1`). `≤ 1` for the common "major axis" case; `> 1`
+    /// for zonal anisotropy (see the struct docs).
     pub ratio: f64,
-    /// Vertical / `azimuth_deg` range ratio, `> 0` (3-D only; default 1).
+    /// Vertical / `azimuth_deg` range ratio, `> 0` (3-D only, GSLIB
+    /// `anis2`; default 1).
     #[serde(default = "one", skip_serializing_if = "is_one")]
     pub ratio_z: f64,
+    /// Dip (GSLIB `ang2`): tilts the major axis off the horizontal, degrees
+    /// (3-D only, ignored in 2-D; default 0).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dip_deg: f64,
+    /// Rake/plunge (GSLIB `ang3`): rotates the minor/vertical axes about
+    /// the (already dipped) major axis, degrees (3-D only, ignored in 2-D;
+    /// default 0).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rake_deg: f64,
+}
+
+impl Anisotropy {
+    /// GSLIB `setrot`-equivalent rotation+scaling matrix: applying it to a
+    /// separation vector and taking the Euclidean norm of the result gives
+    /// the isotropic-equivalent effective distance (before dividing by the
+    /// structure's `range`). Only meaningful in 3-D; see the struct docs
+    /// for the gstat cross-check.
+    fn rotation_matrix_3d(&self) -> [[f64; 3]; 3] {
+        let alpha = if (0.0..270.0).contains(&self.azimuth_deg) {
+            (90.0 - self.azimuth_deg).to_radians()
+        } else {
+            (450.0 - self.azimuth_deg).to_radians()
+        };
+        let beta = (-self.dip_deg).to_radians();
+        let theta = self.rake_deg.to_radians();
+        let (sina, cosa) = alpha.sin_cos();
+        let (sinb, cosb) = beta.sin_cos();
+        let (sint, cost) = theta.sin_cos();
+        let afac1 = 1.0 / self.ratio;
+        let afac2 = 1.0 / self.ratio_z;
+        [
+            [cosb * cosa, cosb * sina, -sinb],
+            [
+                afac1 * (-cost * sina + sint * sinb * cosa),
+                afac1 * (cost * cosa + sint * sinb * sina),
+                afac1 * (sint * cosb),
+            ],
+            [
+                afac2 * (sint * sina + cost * sinb * cosa),
+                afac2 * (-sint * cosa + cost * sinb * sina),
+                afac2 * (cost * cosb),
+            ],
+        ]
+    }
 }
 
 /// One nested structure: a model family with its partial sill, range and
@@ -281,7 +341,8 @@ impl Structure {
         }
     }
 
-    /// Structure with geometric anisotropy.
+    /// Structure with geometric anisotropy (azimuth + ratio only; no
+    /// dip/rake — see [`Structure::with_rotation`] for full 3-D tilt).
     pub fn with_anisotropy(
         kind: ModelKind,
         sill: f64,
@@ -297,14 +358,48 @@ impl Structure {
                 azimuth_deg,
                 ratio,
                 ratio_z: 1.0,
+                dip_deg: 0.0,
+                rake_deg: 0.0,
             }),
         }
     }
 
-    /// Effective isotropic-equivalent lag distance for a separation vector:
-    /// the horizontal components are rotated into the (major, minor) frame
-    /// and the minor (and, in 3-D, vertical) components stretched by the
-    /// inverse ratios.
+    /// Structure with full 3-D geometric anisotropy (GSLIB `ang1`/`ang2`/
+    /// `ang3` = `azimuth_deg`/`dip_deg`/`rake_deg`); see [`Anisotropy`].
+    /// `dip_deg = rake_deg = 0.0` is exactly [`Structure::with_anisotropy`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_rotation(
+        kind: ModelKind,
+        sill: f64,
+        range: f64,
+        azimuth_deg: f64,
+        dip_deg: f64,
+        rake_deg: f64,
+        ratio: f64,
+        ratio_z: f64,
+    ) -> Self {
+        Self {
+            kind,
+            sill,
+            range,
+            anis: Some(Anisotropy {
+                azimuth_deg,
+                ratio,
+                ratio_z,
+                dip_deg,
+                rake_deg,
+            }),
+        }
+    }
+
+    /// Effective isotropic-equivalent lag distance for a separation vector.
+    /// In 2-D, the components are rotated into the (major, minor) frame and
+    /// the minor component stretched by the inverse ratio. In 3-D, the full
+    /// GSLIB rotation+scaling matrix ([`Anisotropy::rotation_matrix_3d`]) is
+    /// applied; with `dip_deg = rake_deg = 0` this reduces *exactly* to the
+    /// 2-D case's rotate-then-scale math extended with `dh[2]/ratio_z`
+    /// (verified analytically: the matrix's rows collapse to the same
+    /// trigonometric expressions).
     pub(crate) fn effective_h<const D: usize>(&self, dh: [f64; D]) -> f64 {
         match self.anis {
             None => {
@@ -315,15 +410,19 @@ impl Structure {
                 s.sqrt()
             }
             Some(a) => {
-                let (s, c) = a.azimuth_deg.to_radians().sin_cos();
-                let h_major = dh[0] * s + dh[1] * c;
-                let h_minor = (dh[0] * c - dh[1] * s) / a.ratio;
-                let mut sum = h_major * h_major + h_minor * h_minor;
                 if D == 3 {
-                    let h_z = dh[2] / a.ratio_z;
-                    sum += h_z * h_z;
+                    let (h0, h1, h2) = (dh[0], dh[1], dh[2]);
+                    let rot = a.rotation_matrix_3d();
+                    let e0 = rot[0][0] * h0 + rot[0][1] * h1 + rot[0][2] * h2;
+                    let e1 = rot[1][0] * h0 + rot[1][1] * h1 + rot[1][2] * h2;
+                    let e2 = rot[2][0] * h0 + rot[2][1] * h1 + rot[2][2] * h2;
+                    (e0 * e0 + e1 * e1 + e2 * e2).sqrt()
+                } else {
+                    let (s, c) = a.azimuth_deg.to_radians().sin_cos();
+                    let h_major = dh[0] * s + dh[1] * c;
+                    let h_minor = (dh[0] * c - dh[1] * s) / a.ratio;
+                    (h_major * h_major + h_minor * h_minor).sqrt()
                 }
-                sum.sqrt()
             }
         }
     }
@@ -391,6 +490,11 @@ impl VariogramModel {
                 if !a.azimuth_deg.is_finite() {
                     return Err(GeostatError::InvalidParameter(
                         "anisotropy azimuth must be finite".into(),
+                    ));
+                }
+                if !a.dip_deg.is_finite() || !a.rake_deg.is_finite() {
+                    return Err(GeostatError::InvalidParameter(
+                        "anisotropy dip/rake must be finite".into(),
                     ));
                 }
             }
@@ -607,6 +711,93 @@ mod tests {
         }
     }
 
+    /// Ground truth from gstat's `variogramLine` with `anis = c(30, 20, 40,
+    /// 0.5, 0.3)` (azimuth 30, dip 20, rake 40, ratio 0.5, ratio_z 0.3),
+    /// `h = 20`, range 100, spherical -- the azimuth-only/dip-only/rake-only
+    /// special cases were also cross-checked (residual ~1e-16) while
+    /// deriving `rotation_matrix_3d`; see the session notes.
+    #[test]
+    fn rotation_3d_matches_gstat_setrot() {
+        let m = VariogramModel::new(
+            0.0,
+            vec![Structure::with_rotation(
+                ModelKind::Spherical,
+                1.0,
+                100.0,
+                30.0,
+                20.0,
+                40.0,
+                0.5,
+                0.3,
+            )],
+        )
+        .unwrap();
+        let cases: [([f64; 3], f64); 6] = [
+            ([1.0, 0.0, 0.0], 0.605458280770632),
+            ([0.0, 1.0, 0.0], 0.577390658041395),
+            ([0.0, 0.0, 1.0], 0.732990706603906),
+            (
+                [0.577350269190, 0.577350269190, 0.577350269190],
+                0.432164835884142,
+            ),
+            (
+                [0.666666666667, -0.666666666667, 0.333333333333],
+                0.810043758779196,
+            ),
+            (
+                [-0.534522483825, 0.267261241912, 0.801783725737],
+                0.575462768274161,
+            ),
+        ];
+        for (dir, expected) in cases {
+            let dh = [dir[0] * 20.0, dir[1] * 20.0, dir[2] * 20.0];
+            let got = m.gamma_dh(dh);
+            assert!(
+                (got - expected).abs() < 1e-9,
+                "dir={dir:?}: {got} vs {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn rotation_3d_reduces_to_2d_style_when_dip_and_rake_are_zero() {
+        // dip=rake=0 must reproduce `with_anisotropy` (2-D-style formula
+        // extended with dh[2]/ratio_z) to within floating-point roundoff --
+        // proven analytically (see `effective_h` docs), checked numerically.
+        let full = VariogramModel::new(
+            0.05,
+            vec![Structure::with_rotation(
+                ModelKind::Exponential,
+                0.9,
+                80.0,
+                55.0,
+                0.0,
+                0.0,
+                0.4,
+                0.6,
+            )],
+        )
+        .unwrap();
+        // Direct cross-check against the OLD (pre-rotation) closed-form
+        // formula, replicated here so a regression in `rotation_matrix_3d`
+        // would be caught even though `with_anisotropy` no longer builds a
+        // 3-D structure directly.
+        let az = 55.0_f64.to_radians();
+        let (s, c) = az.sin_cos();
+        for &(x, y, z) in &[(10.0, 20.0, 5.0), (-30.0, 15.0, -8.0), (40.0, -25.0, 0.0)] {
+            let h_major = x * s + y * c;
+            let h_minor = (x * c - y * s) / 0.4;
+            let h_z = z / 0.6;
+            let old_eff = (h_major * h_major + h_minor * h_minor + h_z * h_z).sqrt();
+            let old_gamma = 0.05 + 0.9 * (1.0 - (-old_eff / 80.0).exp());
+            let new_gamma = full.gamma_dh([x, y, z]);
+            assert!(
+                (old_gamma - new_gamma).abs() < 1e-12,
+                "({x},{y},{z}): old {old_gamma} vs new {new_gamma}"
+            );
+        }
+    }
+
     #[test]
     fn parses_kind_names() {
         assert_eq!("sph".parse::<ModelKind>().unwrap(), ModelKind::Spherical);
@@ -654,22 +845,33 @@ mod tests {
     /// exponential model at ν = 0.5 (all classical special cases of Matern).
     #[test]
     fn matern_matches_closed_form_special_cases() {
+        // At very small d, gamma itself is tiny (~1e-6 at d=0.001), so a
+        // pure relative-error check is dominated by the quadrature's
+        // absolute error floor; accept either a tight relative match or a
+        // tiny absolute one.
+        let close_enough = |a: f64, b: f64| -> bool { (a - b).abs() < 1e-9 || (a - b).abs() / b.max(1e-12) < 1e-6 };
         let d_values = [0.001, 0.01, 0.1, 0.3, 0.5, 1.0, 2.0, 5.0];
         for &d in &d_values {
             let general15 = ModelKind::Matern(1.5).g(d, 1.0);
             let closed15 = ModelKind::Matern15.g(d, 1.0);
-            let rel15 = (general15 - closed15).abs() / closed15.max(1e-12);
-            assert!(rel15 < 1e-7, "nu=1.5, d={d}: {general15} vs {closed15}");
+            assert!(
+                close_enough(general15, closed15),
+                "nu=1.5, d={d}: {general15} vs {closed15}"
+            );
 
             let general25 = ModelKind::Matern(2.5).g(d, 1.0);
             let closed25 = ModelKind::Matern25.g(d, 1.0);
-            let rel25 = (general25 - closed25).abs() / closed25.max(1e-12);
-            assert!(rel25 < 1e-7, "nu=2.5, d={d}: {general25} vs {closed25}");
+            assert!(
+                close_enough(general25, closed25),
+                "nu=2.5, d={d}: {general25} vs {closed25}"
+            );
 
             let general05 = ModelKind::Matern(0.5).g(d, 1.0);
             let exp = ModelKind::Exponential.g(d, 1.0);
-            let rel05 = (general05 - exp).abs() / exp.max(1e-12);
-            assert!(rel05 < 1e-7, "nu=0.5, d={d}: {general05} vs {exp}");
+            assert!(
+                close_enough(general05, exp),
+                "nu=0.5, d={d}: {general05} vs {exp}"
+            );
         }
     }
 

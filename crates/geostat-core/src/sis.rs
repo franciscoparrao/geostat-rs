@@ -24,8 +24,16 @@ use crate::variogram::VariogramModel;
 pub struct SisConfig {
     /// Indicator cutoffs, strictly ascending, inside the data value range.
     pub cutoffs: Vec<f64>,
-    /// Indicator variogram model per cutoff (sill ≈ p(1-p)).
+    /// Indicator variogram model(s): either one per cutoff (full IK), or a
+    /// single shared model for all cutoffs (**median IK**, GSLIB `mik=1`) —
+    /// the same spatial structure fit to the median cutoff's indicator and
+    /// reused everywhere, which amortizes one factorization across every
+    /// cutoff at each node instead of paying for `nc` (an ~nc× saving in
+    /// the hot loop; see [`indicator_ccdf`]). Sill ≈ p(1-p) either way.
     pub models: Vec<VariogramModel>,
+    /// Ordinary indicator kriging (`Σw=1`, no assumed known mean) instead of
+    /// the default simple IK (global proportion as the known mean).
+    pub ordinary: bool,
     /// Number of realizations.
     pub n_realizations: usize,
     /// Base seed.
@@ -51,6 +59,7 @@ impl Default for SisConfig {
         Self {
             cutoffs: Vec::new(),
             models: Vec::new(),
+            ordinary: false,
             n_realizations: 1,
             seed: 42,
             max_neighbors: 16,
@@ -93,9 +102,9 @@ pub fn sis_at<const D: usize>(
             "cutoffs must be strictly ascending".into(),
         ));
     }
-    if cfg.models.len() != nc {
+    if cfg.models.len() != nc && cfg.models.len() != 1 {
         return Err(GeostatError::DimensionMismatch(format!(
-            "{} models for {nc} cutoffs",
+            "{} models for {nc} cutoffs (expected {nc}, or 1 for median IK)",
             cfg.models.len()
         )));
     }
@@ -197,17 +206,17 @@ fn simulate_one<const D: usize>(
         if nb.is_empty() {
             ccdf.copy_from_slice(props);
         } else {
-            for k in 0..nc {
-                ccdf[k] = indicator_sk(
-                    &cond_coords,
-                    &cond_vals,
-                    &nb,
-                    cfg.cutoffs[k],
-                    props[k],
-                    &cfg.models[k],
-                    target,
-                )?;
-            }
+            indicator_ccdf(
+                &cond_coords,
+                &cond_vals,
+                &nb,
+                &cfg.cutoffs,
+                props,
+                &cfg.models,
+                target,
+                cfg.ordinary,
+                &mut ccdf,
+            )?;
             order_corrections(&mut ccdf);
         }
 
@@ -228,21 +237,32 @@ fn simulate_one<const D: usize>(
     Ok(sim)
 }
 
-/// Simple indicator kriging at one cutoff: `F = p + sum(w_i (i_i - p))`.
-pub(crate) fn indicator_sk<const D: usize>(
+/// Indicator-kriging weights for one target's neighbourhood under a single
+/// covariance model — the expensive part (build + factorize + solve an
+/// `n×n`, or `(n+1)×(n+1)` for ordinary, system). Shared across every
+/// cutoff when the *same* model is used for all of them (median IK, GSLIB
+/// `mik=1`): the weights depend only on the spatial covariance structure,
+/// not on which cutoff's indicator data they are dotted with, so one
+/// factorization serves all `nc` cutoffs — an ~nc× saving in the hot loop
+/// this function is called from (see [`indicator_ccdf`]).
+///
+/// `ordinary` adds the `Σw=1` (Lagrange) row/column — ordinary indicator
+/// kriging instead of simple IK with the global proportion as the known
+/// mean. The returned vector has `nb.len()` entries for simple, one more
+/// (the Lagrange multiplier) for ordinary.
+fn indicator_weights<const D: usize>(
     coords: &[[f64; D]],
-    vals: &[f64],
     nb: &[usize],
-    cutoff: f64,
-    p: f64,
     model: &VariogramModel,
     target: [f64; D],
-) -> Result<f64> {
+    ordinary: bool,
+) -> Result<Vec<f64>> {
     let n = nb.len();
     let c0 = model.covariance_dh([0.0; D]);
     let stabilizer = c0 * 1e-9;
-    let mut a = Array2::<f64>::zeros((n, n));
-    let mut b = vec![0.0; n];
+    let dim = if ordinary { n + 1 } else { n };
+    let mut a = Array2::<f64>::zeros((dim, dim));
+    let mut b = vec![0.0; dim];
     let sep = |a: [f64; D], b: [f64; D]| {
         let mut dh = [0.0; D];
         for d in 0..D {
@@ -259,14 +279,77 @@ pub(crate) fn indicator_sk<const D: usize>(
             a[[jj, ii]] = c;
         }
         b[ii] = c0 - model.gamma_dh(sep(pi, target));
+        if ordinary {
+            a[[ii, n]] = 1.0;
+            a[[n, ii]] = 1.0;
+        }
     }
-    let w = solve(a, b)?;
-    let mut est = p;
-    for (ii, &i) in nb.iter().enumerate() {
-        let ind = if vals[i] <= cutoff { 1.0 } else { 0.0 };
-        est += w[ii] * (ind - p);
+    if ordinary {
+        b[n] = 1.0;
     }
-    Ok(est)
+    solve(a, b)
+}
+
+/// Indicator/ccdf estimate at one cutoff from precomputed weights (see
+/// [`indicator_weights`]): `Σ w_i·i_i` for ordinary (no known mean needed —
+/// that is the point of the unbiasedness constraint), `p + Σ w_i·(i_i - p)`
+/// for simple.
+fn indicator_estimate(
+    w: &[f64],
+    nb: &[usize],
+    vals: &[f64],
+    cutoff: f64,
+    p: f64,
+    ordinary: bool,
+) -> f64 {
+    if ordinary {
+        nb.iter()
+            .enumerate()
+            .map(|(ii, &i)| {
+                let ind = if vals[i] <= cutoff { 1.0 } else { 0.0 };
+                w[ii] * ind
+            })
+            .sum()
+    } else {
+        let mut est = p;
+        for (ii, &i) in nb.iter().enumerate() {
+            let ind = if vals[i] <= cutoff { 1.0 } else { 0.0 };
+            est += w[ii] * (ind - p);
+        }
+        est
+    }
+}
+
+/// ccdf at every cutoff for one target: shares one factorization across all
+/// cutoffs when `models.len() == 1` (median IK), or uses one model per
+/// cutoff (`models.len() == cutoffs.len()`, full IK) otherwise. `ordinary`
+/// selects ordinary vs simple indicator kriging (see [`indicator_weights`]).
+/// This is the single entry point [`crate::sis::simulate_one`] and
+/// [`crate::ik::indicator_kriging`] both call.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn indicator_ccdf<const D: usize>(
+    coords: &[[f64; D]],
+    vals: &[f64],
+    nb: &[usize],
+    cutoffs: &[f64],
+    props: &[f64],
+    models: &[VariogramModel],
+    target: [f64; D],
+    ordinary: bool,
+    ccdf: &mut [f64],
+) -> Result<()> {
+    if models.len() == 1 {
+        let w = indicator_weights(coords, nb, &models[0], target, ordinary)?;
+        for k in 0..cutoffs.len() {
+            ccdf[k] = indicator_estimate(&w, nb, vals, cutoffs[k], props[k], ordinary);
+        }
+    } else {
+        for k in 0..cutoffs.len() {
+            let w = indicator_weights(coords, nb, &models[k], target, ordinary)?;
+            ccdf[k] = indicator_estimate(&w, nb, vals, cutoffs[k], props[k], ordinary);
+        }
+    }
+    Ok(())
 }
 
 /// GSLIB-style order-relation corrections: clamp to [0, 1], then average an
@@ -385,6 +468,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn median_ik_matches_full_ik_when_models_coincide() {
+        // `setup()` uses the identical model for every cutoff, so full IK
+        // and median IK (`models.len()==1`, one shared factorization per
+        // node instead of one per cutoff) must produce byte-identical
+        // realizations for the same seed.
+        let (data, full_cfg, grid) = setup();
+        let mut median_cfg = full_cfg.clone();
+        median_cfg.models = vec![full_cfg.models[0].clone()];
+
+        let full = sequential_indicator_simulation(&data, &grid, &full_cfg).unwrap();
+        let median = sequential_indicator_simulation(&data, &grid, &median_cfg).unwrap();
+        assert_eq!(full.realizations, median.realizations);
+    }
+
+    #[test]
+    fn ordinary_sis_is_reproducible_and_bounded() {
+        let (data, mut cfg, grid) = setup();
+        cfg.ordinary = true;
+        let a = sequential_indicator_simulation(&data, &grid, &cfg).unwrap();
+        let b = sequential_indicator_simulation(&data, &grid, &cfg).unwrap();
+        assert_eq!(a.realizations, b.realizations);
+        let (dmin, dmax) = data
+            .values()
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+                (lo.min(v), hi.max(v))
+            });
+        for real in &a.realizations {
+            for &v in real {
+                assert!(
+                    v >= dmin - 1e-9 && v <= dmax + 1e-9,
+                    "value {v} out of range"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_bad_model_count() {
+        let (data, cfg, grid) = setup();
+        let mut bad = cfg.clone();
+        bad.models = vec![cfg.models[0].clone(), cfg.models[0].clone()]; // 2 for 3 cutoffs
+        assert!(sequential_indicator_simulation(&data, &grid, &bad).is_err());
     }
 
     #[test]

@@ -9,11 +9,16 @@
 //! `K_ν(x)` is evaluated via its integral representation
 //! `K_ν(x) = ∫₀^∞ exp(-x cosh t) cosh(ν t) dt` (valid for any real `ν`,
 //! `x > 0`, no special-casing for integer/half-integer order), using
-//! composite Gauss–Legendre quadrature on `[0, 1] ∪ [1, T]`. The integrand is
-//! smooth and strictly positive (no cancellation), and `T` is chosen so the
-//! tail past it is numerically negligible. Validated against R's `besselK`
-//! across `ν ∈ [0.05, 15]`, `x ∈ [1e-6, 150]` to a relative error ≤ ~1e-9 (≤
-//! ~1e-14 over the practically relevant fitting range); see
+//! composite Gauss–Legendre quadrature on `[0, 1] ∪ [1, T]` (60 + 40 nodes —
+//! sized down from an initial 120 + 40 after profiling showed the joint
+//! (nugget, sill, range, ν) Vecchia MLE fit, which evaluates `K_ν` inside
+//! every neighbourhood pair of every likelihood call, was impractically slow
+//! at the higher node count; 100 nodes keeps <=~2e-8 relative error, far
+//! below what fitting itself needs). The integrand is smooth and strictly
+//! positive (no cancellation), and `T` is chosen so the tail past it is
+//! numerically negligible. Validated against R's `besselK` across `ν ∈
+//! [0.05, 15]`, `x ∈ [1e-6, 150]` to a relative error ≤ ~2e-8 (≤ ~1e-9 over
+//! the practically relevant fitting range); see
 //! `variogram::model::tests::matern_matches_closed_form_special_cases`.
 
 use std::sync::OnceLock;
@@ -52,12 +57,12 @@ fn gauss_legendre(n: usize) -> (Vec<f64>, Vec<f64>) {
 
 fn gl_near() -> &'static (Vec<f64>, Vec<f64>) {
     static CELL: OnceLock<(Vec<f64>, Vec<f64>)> = OnceLock::new();
-    CELL.get_or_init(|| gauss_legendre(120))
+    CELL.get_or_init(|| gauss_legendre(60))
 }
 
 fn gl_far() -> &'static (Vec<f64>, Vec<f64>) {
     static CELL: OnceLock<(Vec<f64>, Vec<f64>)> = OnceLock::new();
-    CELL.get_or_init(|| gauss_legendre(80))
+    CELL.get_or_init(|| gauss_legendre(40))
 }
 
 /// `K_ν(x)`, the modified Bessel function of the second kind, for `x > 0`

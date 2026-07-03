@@ -973,6 +973,8 @@ mod tests {
                     azimuth_deg: 30.0,
                     ratio: 0.5,
                     ratio_z: 1.0,
+                    dip_deg: 0.0,
+                    rake_deg: 0.0,
                 }),
             }],
         )

@@ -126,6 +126,8 @@ fn vertical_anisotropy_shortens_z_range() {
                 azimuth_deg: 0.0,
                 ratio: 1.0,
                 ratio_z: 0.25,
+                dip_deg: 0.0,
+                rake_deg: 0.0,
             }),
         }],
     )

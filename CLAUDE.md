@@ -176,14 +176,129 @@ Computers & Geosciences.
    ~0.07% relativo, `Cressie` cae dentro del mismo rango de variabilidad que
    gstat muestra entre corridas con `fit.method=2` (~1-2%, el propio gstat
    no es perfectamente autoconsistente en este esquema no lineal).
+   **Rotación 3-D completa**: `Anisotropy` gana `dip_deg`/`rake_deg`
+   (GSLIB `ang2`/`ang3`, default 0, ignorados en 2-D) +
+   `rotation_matrix_3d` (matriz `setrot` de GSLIB/Deutsch & Journel 1998) +
+   `Structure::with_rotation`; cierra la asimetría que señalaba el audit
+   (el variograma experimental ya aceptaba dip vía `DirectionConfig`, pero
+   el modelo ajustado no podía representarlo). Fórmula verificada contra
+   `gstat::variogramLine()` con `anis=c(ang1,ang2,ang3,anis1,anis2)` a
+   precisión de máquina (resid ~1e-16) en azimuth-solo/dip-solo/rake-solo/
+   combinado, incl. casos límite del branch `ang1≥270°` y ángulos
+   negativos-equivalentes (`rotation_3d_matches_gstat_setrot`). Con
+   `dip=rake=0` se probó analítica y numéricamente que reduce exacto a la
+   fórmula 2-D anterior (`rotation_3d_reduces_to_2d_style...`) — cero
+   riesgo para el código 2-D/3-D-sin-dip ya validado.
 
-   Pendiente del ítem #16: familia `Power` (no estacionaria — requeriría
-   krigear en forma-γ en vez de forma-covarianza, cambio de arquitectura
-   real, no solo una fórmula; documentado, no implementado), rotación 3-D
-   completa (ang1/ang2/ang3 estilo GSLIB; hoy `Anisotropy` solo tiene
-   azimuth + `ratio_z` sin rotar dip/rake), ajuste conjunto de ν/α por
-   MLE/WLS (hoy se fijan, no se estiman), anidamiento multi-estructura en
-   el fit WLS (`fit_model` sigue siendo nugget + 1 estructura). Quedan
-   además los ítems #17 (collocated cokriging MM1/MM2, median/ordinary IK,
-   Markov-Bayes), #18 (block CV espacial, accuracy plots de Deutsch), #19
-   (trait de covarianza, rust-numpy, proptest, publicación crates.io/PyPI).
+   **Ajuste conjunto de ν/α por WLS y MLE**: `fit_matern`/`fit_stable`
+   (WLS, nugget+sill+range+ν/α optimizados juntos vía Nelder-Mead
+   multistart) y `vecchia_mle_matern` (MLE Vecchia, mismo conjunto de
+   parámetros). Ambos con la advertencia honesta de la confusión ν-range
+   bien conocida en Matérn (un modelo más liso y de rango largo puede
+   ajustar casi tan bien como uno más rugoso de rango corto — por eso ν se
+   multi-arranca junto al rango, no se trata como parámetro fijo).
+   Recuperan ν/α verdaderos desde curvas sintéticas sin ruido
+   (`fit_matern_recovers_true_nu_and_range`,
+   `fit_stable_recovers_true_alpha_and_range`). **Nota de rendimiento**: el
+   primer `vecchia_mle_matern` (9 arranques × 2000 iters, cada evaluación
+   de verosimilitud llamando `K_ν` de Bessel por cada par de covarianza)
+   tardaba >5 min en debug para n=60/m=12 — impracticable. Se redujo la
+   cuadratura de Bessel de 120+80 a 60+40 puntos (error sube de ~1e-9 a
+   ~2e-8, todavía muy por debajo de lo que necesita el fitting) y el
+   multistart de `vecchia_mle_matern` de 9 a 4 arranques (2000→1200 iters);
+   con eso el test pasa en ~50s en debug. Un test de casos especiales tuvo
+   que cambiar de tolerancia relativa pura a relativa-o-absoluta (a
+   d=0.001 gamma es ~1e-6, así que el error relativo se infla con
+   denominador casi cero — artefacto de la métrica, no una regresión
+   real). Paridad gstat (Meuse+Matérn fijo) re-confirmada sin cambios tras
+   la reducción de cuadratura.
+
+   **Anidamiento multi-estructura**: `fit_nested(exp_v, kinds: &[ModelKind])`
+   — nugget + una estructura por elemento de `kinds` (p.ej.
+   `&[Spherical, Spherical]` para corto+largo alcance), ajustadas juntas
+   por WLS (parametrización log/multistart igual que el resto);
+   `kinds.len()==1` es exactamente `fit_model`. Nota honesta igual que
+   ν/α: el anidamiento es propenso a óptimos casi-degenerados cuando el
+   variograma no necesita en realidad más de una escala (una estructura
+   absorbe casi todo el sill) — confirmado que gstat's `fit.variogram`
+   tiene el mismo problema (warning "No convergence") al anidar 2
+   esféricas sobre el variograma de Meuse, que ya es bien explicado por 1
+   sola estructura. Validado por autoconsistencia (recupera 2 estructuras
+   verdaderas con escalas bien separadas — corto alcance 50 + largo
+   alcance 400 — desde una curva sintética sin ruido:
+   `fit_nested_recovers_two_structures`), no por paridad gstat dado ese
+   problema de identificabilidad compartido.
+
+   **Con esto el ítem #16 queda cerrado salvo `Power`** (no estacionaria —
+   requeriría krigear en forma-γ en vez de forma-covarianza, cambio de
+   arquitectura real que tocaría kriging/vecchia/sis/simulation, no solo
+   una fórmula nueva; documentado, deliberadamente no implementado esta
+   sesión).
+
+10. **Ítem #17 en curso** (2026-07-03): **collocated cokriging MM1/MM2**
+    hecho — nuevo módulo `crates/geostat-core/src/collocated.rs`,
+    `CollocatedCokriging<D>` (forma simple-kriging, media conocida; la
+    forma ordinaria del sistema colocalizado es notoriamente inestable —
+    pesos negativos por la ecuación extra de la secundaria — así que GSLIB
+    y SGeMS también usan SK por defecto ahí). Resuelve el gap "más
+    citable" del audit frente a GSLIB2/SGeMS: predicción condicionada al
+    vecindario móvil de la primaria + **un solo** valor de la secundaria
+    colocalizado con el target (no necesita la secundaria en cada dato
+    primario, viable con secundaria exhaustiva tipo ráster/sísmica).
+    `MarkovModel::Mm1` (`C12(h)=ρ12(σ2/σ1)C1(h)`, solo necesita el
+    variograma de la primaria) / `Mm2{secondary_model}`
+    (`C12(h)=ρ12(σ1/σ2)C2(h)`, necesita el variograma propio de la
+    secundaria) — Journel (1999). `estimate_collocated_stats` calcula
+    ρ12/σ1/σ2 desde pares colocalizados. Validado por: reduce a SK puro
+    con ρ12=0; exactitud en un dato primario propio (con ρ12/σ no
+    degenerados); MM1 y MM2 coinciden exactamente cuando C2(h)=k·C1(h) con
+    σ2²=k·σ1² (chequeo de consistencia interna entre los dos caminos de
+    código); varianza decrece monótonamente con ρ12 creciente.
+    **Hallazgo documentado, no bug**: con ρ12=1 y σ1==σ2 exactos, MM1 hace
+    C12(h)≡C1(h) — la secundaria se vuelve un duplicado informacional
+    exacto de la primaria, el sistema queda casi-singular, y el LU con
+    pivoteo parcial da una solución inesperada (todo el peso a la
+    secundaria) en vez de fallar; fijado como test de regresión
+    (`mm1_perfectly_collinear_secondary_can_be_singular`) — en la práctica
+    ρ12 es una correlación muestral y nunca es exactamente 1.0. Sin
+    paridad gstat (gstat no tiene collocated cokriging nativo) — validado
+    por autoconsistencia y propiedades teóricas, igual que el resto de
+    fitting con problemas de identificabilidad conocidos de esta sesión.
+    168 tests, clippy limpio. **Sin exponer aún en CLI/Python** (alcance
+    de esta sesión: el núcleo del motor).
+
+    **Median/ordinary IK** hecho — `sis.rs`/`ik.rs` compartían ya
+    `indicator_sk` (kriging simple de indicador); se dividió en
+    `indicator_weights` (la parte cara: arma + factoriza + resuelve el
+    sistema) + `indicator_estimate` (barato: producto punto), unificadas en
+    `indicator_ccdf`. **Median IK** (GSLIB `mik=1`): `SisConfig::models`/
+    `IkConfig::models` ahora aceptan `len()==1` (un solo modelo compartido
+    para todos los cutoffs, adivinado automáticamente por longitud, sin
+    campo nuevo) en vez de exigir `len()==nc` — cuando hay un solo modelo,
+    `indicator_ccdf` factoriza el sistema **una sola vez** por nodo/target
+    y reusa los pesos para los `nc` cutoffs, el ahorro ~nc× del hot loop
+    que señalaba el audit. Nuevo `fit_median_indicator_model` (fit.rs) para
+    ajustar ese único modelo en el cutoff mediano. **Ordinary IK**: nuevo
+    campo `ordinary: bool` en ambos configs (default `false`, sin cambiar
+    el comportamiento SK previo) — agrega la fila/columna de Lagrange
+    (Σw=1) al sistema existente, mismo patrón que `Kriging<D>` ya usa para
+    OK. Validado por: **igualdad exacta** median-vs-full IK cuando los
+    modelos coinciden (`median_ik_matches_full_ik_when_models_coincide` en
+    ik.rs, y el mismo test en sis.rs comparando **realizaciones byte a
+    byte** con la misma semilla — prueba fuerte de que el refactor no
+    cambia el resultado, solo cómo se calcula); ordinary IK acotado/
+    monótono/exacto en datos propios. Expuesto en CLI (`sis`/`ik --mik
+    --ordinary`) y Python (`sis(mik=, ordinary=)`, `indicator_kriging(mik=,
+    ordinary=)`), probado end-to-end con Meuse. 175 tests, clippy limpio,
+    paridad gstat re-confirmada sin regresiones.
+
+    **Con esto el ítem #17 queda cerrado salvo Markov-Bayes** (datos
+    blandos/probabilidades calibradas — sin infraestructura previa
+    alguna: necesitaría tipo de dato nuevo para indicadores blandos,
+    calibración de coeficientes B(k), y cambios en el sistema de kriging
+    para mezclar datos duros+blandos; alcance comparable al de MM1/MM2
+    pero para indicadores, deliberadamente no abordado esta sesión).
+
+    Quedan además los ítems #18 (block CV espacial, accuracy plots de
+    Deutsch), #19
+    (trait de covarianza, rust-numpy, proptest, publicación crates.io/PyPI).
