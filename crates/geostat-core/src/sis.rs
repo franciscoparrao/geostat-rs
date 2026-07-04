@@ -108,6 +108,13 @@ pub fn sis_at<const D: usize>(
             cfg.models.len()
         )));
     }
+    if cfg.models.iter().any(VariogramModel::has_power) {
+        return Err(GeostatError::InvalidParameter(
+            "SIS needs a valid indicator covariance function and cannot use the unbounded \
+             Power model"
+                .into(),
+        ));
+    }
     if cfg.n_realizations == 0 || cfg.max_neighbors == 0 {
         return Err(GeostatError::InvalidParameter(
             "n_realizations and max_neighbors must be at least 1".into(),
@@ -663,6 +670,16 @@ mod tests {
         let mut bad = cfg.clone();
         bad.models = vec![cfg.models[0].clone(), cfg.models[0].clone()]; // 2 for 3 cutoffs
         assert!(sequential_indicator_simulation(&data, &grid, &bad).is_err());
+    }
+
+    #[test]
+    fn rejects_power_model() {
+        let (data, mut cfg, grid) = setup();
+        cfg.models = vec![
+            VariogramModel::new(0.0, vec![Structure::new(ModelKind::Power(1.0), 1.0, 1.0)])
+                .unwrap(),
+        ];
+        assert!(sequential_indicator_simulation(&data, &grid, &cfg).is_err());
     }
 
     #[test]

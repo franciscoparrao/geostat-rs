@@ -321,7 +321,45 @@ Computers & Geosciences.
 
     **Con esto el ítem #17 queda completo.**
 
-    Quedan además los ítems #18 (block CV espacial, accuracy plots de
-    Deutsch), #19
-    (trait de covarianza, rust-numpy, proptest, publicación crates.io/PyPI),
-    y del #16 solo `Power` (no estacionaria, cambio de arquitectura real).
+11. **`Power` (2026-07-03)**, el único pendiente del ítem #16, hecho —
+    `ModelKind::Power(θ)` (θ∈(0,2), `γ(h)=sill·h^θ`, matchea la convención
+    de gstat `vgm(psill,"Pow",range)` exactamente, donde su "range" dobla
+    como exponente; el campo `range` de `Structure` queda **ignorado** para
+    Power, ya que no hay escala de longitud que fijar — sin meseta, sin
+    covarianza). La resolución arquitectónica: Power es un IRF-0
+    (intrinsic random function de orden 0), y OK/UK se pueden escribir
+    **directamente en forma-γ** (`Σw_jγ(i,j)+μ=γ(i,0)`, restricción
+    Σw=1) sin necesitar nunca C(0) — la derivación clásica de Cressie
+    §3.4.5 / GSLIB `kt3d`. La sustitución resultó más simple de lo
+    esperado: **`build_lhs`/`predict_inner` en `kriging.rs` usan la MISMA
+    plantilla de código** con un closure `entry(h)` que devuelve `γ(h)`
+    (Power) o `c0-γ(h)` (resto) — y la varianza en forma-γ resulta ser
+    exactamente `reduction` (sin `c0 -`), derivado y verificado a mano
+    contra la fórmula de kriging variance estándar. Kriging simple queda
+    **rechazado** para Power (necesita covarianza real, no solo γ; Σw=1 es
+    lo que hace funcionar la sustitución) — solo Ordinary/Universal/
+    ExternalDrift lo soportan. Block kriging con Power también rechazado
+    (necesitaría γ̄(B,B) block-averaged, no implementado). **Validado
+    exacto contra gstat**: `krige(z~1, d, target, model=vgm(2.0,"Pow",1.2))`
+    en 5 puntos sintéticos reproducido a <1e-6 en valor y varianza
+    (`validation/power_gstat.R`, embebido como referencia hardcodeada en
+    el test — no hay script `compare_power.py` separado dado lo acotado
+    del caso). **Guards explícitos** (rechazo con error claro, no NaN
+    silencioso) en cada camino basado en covarianza que es irreconciliable
+    con un modelo sin meseta: Vecchia (los 10 puntos de entrada públicos:
+    `vecchia_predict/loglik(_grouped)/mle(_grouped)/reml(_grouped)/
+    reml_drift(_grouped)/param_se` — Vecchia necesita factorizar Cholesky
+    una covarianza real, imposible con varianza infinita), SIS/SGS
+    (`sis_at`, `sgs_at_with_levels`), IK (`indicator_kriging`,
+    `indicator_kriging_soft`), co-kriging LMC (`Lmc::new`) y collocated
+    cokriging (`CollocatedCokriging::new`, ambos MM1/MM2). El ajuste WLS
+    (`fit_model`) funciona con Power **sin ningún cambio** — solo toca
+    `gamma()`, nunca covarianza — verificado recuperando nugget/pendiente
+    desde una curva sintética. **Con esto el ítem #16 queda 100%
+    completo.** 189 tests, clippy limpio, paridad gstat re-confirmada.
+
+    Quedan los ítems #18 (block CV espacial, accuracy plots de Deutsch),
+    #19 (trait de covarianza, rust-numpy, proptest, publicación
+    crates.io/PyPI), y exponer collocated cokriging/Markov-Bayes/block IRF-0
+    en CLI/Python (todo deliberadamente diferido, alcance de esta sesión: el
+    núcleo del motor).

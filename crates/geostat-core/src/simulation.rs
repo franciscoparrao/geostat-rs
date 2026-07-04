@@ -151,6 +151,12 @@ fn sgs_at_with_levels<const D: usize>(
     levels: Option<&[u8]>,
     cfg: &SgsConfig,
 ) -> Result<Vec<Vec<f64>>> {
+    if model_ns.has_power() {
+        return Err(GeostatError::InvalidParameter(
+            "SGS needs a valid covariance function and cannot use the unbounded Power model"
+                .into(),
+        ));
+    }
     if cfg.n_realizations == 0 {
         return Err(GeostatError::InvalidParameter(
             "n_realizations must be at least 1".into(),
@@ -561,5 +567,15 @@ mod tests {
             ..Default::default()
         };
         assert!(sequential_gaussian_simulation(&data, &model, &grid, &cfg).is_err());
+    }
+
+    #[test]
+    fn rejects_power_model() {
+        let (data, _model, grid) = setup();
+        let power_model =
+            VariogramModel::new(0.0, vec![Structure::new(ModelKind::Power(1.0), 1.0, 1.0)])
+                .unwrap();
+        let cfg = SgsConfig::default();
+        assert!(sequential_gaussian_simulation(&data, &power_model, &grid, &cfg).is_err());
     }
 }

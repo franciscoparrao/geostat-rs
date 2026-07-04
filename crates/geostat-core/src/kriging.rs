@@ -231,6 +231,14 @@ impl<'a, const D: usize> Kriging<'a, D> {
                 "universal kriging drift degree must be 1 or 2, got {degree}"
             )));
         }
+        if model.has_power() && matches!(config.method, KrigingMethod::Simple { .. }) {
+            return Err(GeostatError::InvalidParameter(
+                "Power (unbounded) models have no covariance function, so simple kriging \
+                 cannot use them; use Ordinary, Universal or ExternalDrift instead (kriged \
+                 directly in semivariogram form, the classical IRF-0 generalization)"
+                    .into(),
+            ));
+        }
         if let Some(r) = config.search_radius
             && !(r > 0.0)
         {
@@ -441,18 +449,32 @@ impl<'a, const D: usize> Kriging<'a, D> {
         let m = self.config.method.n_drift(D);
         let n = nb.len();
         let dim = n + m;
+        // Power models have no covariance (unbounded variance): the system
+        // is built directly in semivariogram form instead, `entry(h) =
+        // gamma(h)` rather than `c0 - gamma(h)` (`c0` unused, `entry(0) =
+        // 0`) -- see `VariogramModel::has_power` and `predict_inner` for the
+        // matching change to the right-hand side/variance formula. This is
+        // the standard IRF-0 generalization of ordinary/universal kriging
+        // (Cressie 1993 §3.4.5, GSLIB `kt3d`'s linear/power option): valid
+        // because OK/UK's derivation only needs the *unbiasedness*
+        // constraint `sum(w)=1`, never a finite C(0), unlike simple kriging.
+        let power = self.model.has_power();
         let c0 = self.model.covariance_dh([0.0; D]);
+        let entry = |h: [f64; D]| {
+            if power {
+                self.model.gamma_dh(h)
+            } else {
+                c0 - self.model.gamma_dh(h)
+            }
+        };
         let mut a = Array2::<f64>::zeros((dim, dim));
         let mut f = vec![0.0; m];
         for (ii, &i) in nb.iter().enumerate() {
             let pi = self.data.coord(i);
-            a[[ii, ii]] = c0 + self.measurement_error.get(i).copied().unwrap_or(0.0);
+            a[[ii, ii]] = entry([0.0; D]) + self.measurement_error.get(i).copied().unwrap_or(0.0);
             for (jj, &j) in nb.iter().enumerate().skip(ii + 1) {
                 let pj = self.data.coord(j);
-                // `c0 - gamma_dh(..)` instead of `covariance_dh(..)`: the
-                // latter recomputes `total_sill()` on every pair; `c0` above
-                // already has it.
-                let c = c0 - self.model.gamma_dh(sep(pi, pj));
+                let c = entry(sep(pi, pj));
                 a[[ii, jj]] = c;
                 a[[jj, ii]] = c;
             }
@@ -482,12 +504,19 @@ impl<'a, const D: usize> Kriging<'a, D> {
             )));
         }
         let dim = n + m;
+        let power = self.model.has_power();
         let c0 = self.model.covariance_dh([0.0; D]);
 
-        // Right-hand side: covariances to the target, then its drift basis.
+        // Right-hand side: covariances to the target, then its drift basis
+        // (semivariances for a Power model — see `build_lhs`).
         let mut b = vec![0.0; dim];
         for (ii, &i) in nb.iter().enumerate() {
-            b[ii] = c0 - self.model.gamma_dh(sep(self.data.coord(i), target));
+            let h = sep(self.data.coord(i), target);
+            b[ii] = if power {
+                self.model.gamma_dh(h)
+            } else {
+                c0 - self.model.gamma_dh(h)
+            };
         }
         let mut f = vec![0.0; m];
         self.fill_basis(target, target_drift, &mut f);
@@ -519,7 +548,12 @@ impl<'a, const D: usize> Kriging<'a, D> {
                 let reduction: f64 = (0..dim).map(|i| w[i] * b0[i]).sum();
                 // w[n] is the multiplier on the constant basis function (the
                 // first drift term), i.e. the OK unbiasedness constraint.
-                (v, c0 - reduction, Some(w[n]))
+                // In semivariogram form the textbook variance is exactly
+                // `sum(w_i*gamma(i,0)) + mu` (Isaaks & Srivastava eq.
+                // 12.19), i.e. `reduction` with no `c0 -` -- `c0` isn't a
+                // meaningful quantity for Power in the first place.
+                let variance = if power { reduction } else { c0 - reduction };
+                (v, variance, Some(w[n]))
             }
         };
 
@@ -570,6 +604,13 @@ impl<'a, const D: usize> Kriging<'a, D> {
                     "block kriging supports simple and ordinary kriging only".into(),
                 ));
             }
+        }
+        if self.model.has_power() {
+            return Err(GeostatError::InvalidParameter(
+                "block kriging with a Power model is not supported yet (needs a block-averaged \
+                 semivariogram gamma-bar(B,B), not implemented) -- use point kriging instead"
+                    .into(),
+            ));
         }
         if offsets.is_empty() {
             return Err(GeostatError::InvalidParameter(
@@ -918,6 +959,104 @@ mod tests {
             );
             assert!(est.variance < 1e-8, "point {i}: var {}", est.variance);
         }
+    }
+
+    #[test]
+    fn power_model_matches_gstat_ordinary_kriging() {
+        // gstat reference (R): vgm(2.0, "Pow", 1.2) is gamma(h) = 2.0*h^1.2
+        // (gstat's Pow psill/range double as the slope/exponent directly,
+        // no length-scale). d/m/target coords match validation/power_gstat.R
+        // exactly.
+        //   d <- data.frame(x=c(0,10,0,10,5), y=c(0,0,10,10,5),
+        //                   z=c(1.0,2.0,1.5,2.5,1.8))
+        //   krige(z~1, d, target, model=vgm(2.0,"Pow",1.2))
+        let data = PointSet::new(
+            vec![[0.0, 0.0], [10.0, 0.0], [0.0, 10.0], [10.0, 10.0], [5.0, 5.0]],
+            vec![1.0, 2.0, 1.5, 2.5, 1.8],
+        )
+        .unwrap();
+        let m = VariogramModel::new(0.0, vec![Structure::new(ModelKind::Power(1.2), 2.0, 1.0)])
+            .unwrap();
+        let k = Kriging::new(&data, &m, KrigingConfig::default()).unwrap();
+
+        let cases = [
+            ([3.0, 4.0], 1.5252052569, 6.4437897810),
+            ([7.0, 8.0], 2.1366210000, 7.7780140000),
+        ];
+        for (target, exp_value, exp_var) in cases {
+            let est = k.predict(target).unwrap();
+            assert!(
+                (est.value - exp_value).abs() < 1e-6,
+                "value {} vs gstat {}",
+                est.value,
+                exp_value
+            );
+            assert!(
+                (est.variance - exp_var).abs() < 1e-5,
+                "variance {} vs gstat {}",
+                est.variance,
+                exp_var
+            );
+        }
+        // Exact at a datum (5,5) -> z=1.8, ~zero variance.
+        let at_datum = k.predict([5.0, 5.0]).unwrap();
+        assert!((at_datum.value - 1.8).abs() < 1e-6);
+        assert!(at_datum.variance < 1e-6);
+    }
+
+    #[test]
+    fn power_model_rejects_simple_kriging() {
+        let data = sample_data();
+        let m = VariogramModel::new(0.0, vec![Structure::new(ModelKind::Power(1.0), 1.0, 1.0)])
+            .unwrap();
+        let cfg = KrigingConfig {
+            method: KrigingMethod::Simple { mean: 1.5 },
+            ..Default::default()
+        };
+        assert!(Kriging::new(&data, &m, cfg).is_err());
+    }
+
+    #[test]
+    fn power_model_rejects_block_kriging() {
+        let data = sample_data();
+        let m = VariogramModel::new(0.0, vec![Structure::new(ModelKind::Power(1.0), 1.0, 1.0)])
+            .unwrap();
+        let k = Kriging::new(&data, &m, KrigingConfig::default()).unwrap();
+        let offsets = vec![[0.0, 0.0], [0.1, 0.0], [0.0, 0.1], [0.1, 0.1]];
+        assert!(k.predict_block([0.5, 0.5], &offsets).is_err());
+    }
+
+    #[test]
+    fn power_model_universal_kriging_recovers_linear_trend() {
+        // With a genuinely linear field, universal kriging with a Power
+        // (IRF-0) model plus a linear drift should reproduce the trend
+        // almost exactly away from data, same invariant as the bounded-model
+        // universal kriging test above.
+        let coords = vec![
+            [0.0, 0.0],
+            [10.0, 0.0],
+            [0.0, 10.0],
+            [10.0, 10.0],
+            [5.0, 2.0],
+            [2.0, 8.0],
+            [8.0, 3.0],
+        ];
+        let values: Vec<f64> = coords.iter().map(|p| 2.0 + 0.3 * p[0] - 0.1 * p[1]).collect();
+        let data = PointSet::new(coords, values).unwrap();
+        let m = VariogramModel::new(0.01, vec![Structure::new(ModelKind::Power(1.0), 0.5, 1.0)])
+            .unwrap();
+        let cfg = KrigingConfig {
+            method: KrigingMethod::Universal { degree: 1 },
+            ..Default::default()
+        };
+        let k = Kriging::new(&data, &m, cfg).unwrap();
+        let est = k.predict([6.0, 4.0]).unwrap();
+        let expected = 2.0 + 0.3 * 6.0 - 0.1 * 4.0;
+        assert!(
+            (est.value - expected).abs() < 0.05,
+            "{} vs {expected}",
+            est.value
+        );
     }
 
     #[test]

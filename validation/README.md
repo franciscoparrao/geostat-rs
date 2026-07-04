@@ -197,6 +197,32 @@ $BIN variogram -i validation/out/meuse_lzinc.csv --value-col lzinc \
 python3 validation/compare_matern.py
 ```
 
+## Fase 3: Power / IRF-0 model (`ModelKind::Power`)
+
+Power has no plateau (infinite variance, no covariance function), so it can
+only be kriged directly in semivariogram form — ordinary/universal/
+external-drift kriging's Lagrangian only needs the `sum(w)=1` unbiasedness
+constraint, never `C(0)`, so `kriging.rs` builds the same linear system with
+`gamma(h)` in place of `c0 - gamma(h)` (see `Kriging::build_lhs`/
+`predict_inner`, gated on `VariogramModel::has_power`). Simple kriging,
+Vecchia, SIS/SGS, co-kriging and collocated co-kriging all reject models
+containing `Power` explicitly (they are irreducibly covariance-based).
+
+gstat's `"Pow"` has the same no-length-scale convention: `gamma(h) =
+psill * h^range`, `range` doubling as the exponent — matched exactly by
+`Structure{kind: Power(theta), sill, range}` where `range` is ignored
+(`gamma(h) = sill * h^theta`).
+
+| Check | Max difference | Verdict |
+|---|---|---|
+| Ordinary kriging value, 3 targets vs `krige(z~1, d, targets, model=vgm(2.0,"Pow",1.2))` | <1e-9 | matches to solver precision |
+| Ordinary kriging variance, same | <1e-9 | matches to solver precision |
+
+Reproduce: `Rscript validation/power_gstat.R`, then compare the printed
+`var1.pred`/`var1.var` against
+`cargo test -p geostat-core power_model_matches_gstat_ordinary_kriging` (the
+gstat reference values are hardcoded in the test as a small, fixed dataset).
+
 ## Reproduce
 
 ```sh

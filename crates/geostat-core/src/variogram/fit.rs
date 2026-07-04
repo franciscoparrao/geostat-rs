@@ -650,6 +650,31 @@ mod tests {
     }
 
     #[test]
+    fn fit_model_recovers_power_nugget_and_slope() {
+        // fit_model only ever touches gamma() (pure WLS on the
+        // semivariogram curve), never a covariance -- so it works for the
+        // unbounded Power model exactly as-is, with no special-casing
+        // needed. theta is fixed (part of the requested ModelKind, like
+        // Matern's nu), only nugget/slope are fit; range is ignored (see
+        // ModelKind::Power docs) so any positive placeholder recovers.
+        let truth =
+            VariogramModel::new(0.2, vec![Structure::new(ModelKind::Power(1.2), 1.5, 1.0)])
+                .unwrap();
+        let ev = synthetic_bins(&truth, 20.0, 15);
+        let fit = fit_model(&ev, ModelKind::Power(1.2)).unwrap();
+        assert!(
+            (fit.model.nugget - 0.2).abs() < 0.05,
+            "nugget {}",
+            fit.model.nugget
+        );
+        assert!(
+            (fit.model.structures[0].sill - 1.5).abs() < 0.1,
+            "slope {}",
+            fit.model.structures[0].sill
+        );
+    }
+
+    #[test]
     fn all_weight_schemes_recover_the_true_model() {
         let truth =
             VariogramModel::new(0.1, vec![Structure::new(ModelKind::Spherical, 0.9, 300.0)])

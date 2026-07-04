@@ -32,6 +32,28 @@ use crate::optim::nelder_mead_multistart;
 use crate::search::BucketGrid;
 use crate::variogram::{ModelKind, Structure, VariogramModel};
 
+/// Vecchia needs a genuine covariance function to Cholesky-factor each
+/// conditioning set; the unbounded [`ModelKind::Power`] has none (infinite
+/// variance), unlike ordinary/universal kriging's semivariogram-form system
+/// (see `crate::kriging::Kriging`, which does support it).
+const POWER_UNSUPPORTED: &str = "Vecchia needs a valid covariance function and cannot use the \
+     unbounded Power model (use crate::kriging::Kriging with Ordinary/Universal/ExternalDrift \
+     instead, which krige directly in semivariogram form)";
+
+fn reject_power_model(model: &VariogramModel) -> Result<()> {
+    if model.has_power() {
+        return Err(GeostatError::InvalidParameter(POWER_UNSUPPORTED.into()));
+    }
+    Ok(())
+}
+
+fn reject_power_kind(kind: ModelKind) -> Result<()> {
+    if matches!(kind, ModelKind::Power(_)) {
+        return Err(GeostatError::InvalidParameter(POWER_UNSUPPORTED.into()));
+    }
+    Ok(())
+}
+
 /// Squared Euclidean distance between two points.
 fn dist2<const D: usize>(a: &[f64; D], b: &[f64; D]) -> f64 {
     let mut s = 0.0;
@@ -461,6 +483,7 @@ pub fn vecchia_predict<const D: usize>(
     targets: &[[f64; D]],
     m: usize,
 ) -> Result<Vec<VecchiaEstimate>> {
+    reject_power_model(model)?;
     if m == 0 {
         return Err(GeostatError::InvalidParameter(
             "conditioning size m must be at least 1".into(),
@@ -580,6 +603,7 @@ pub fn vecchia_loglik<const D: usize>(
     m: usize,
     order: Option<&[usize]>,
 ) -> Result<f64> {
+    reject_power_model(model)?;
     let plan = vecchia_plan(data.coords(), m, order)?;
     loglik_with_plan(data, model, &plan)
 }
@@ -596,6 +620,7 @@ pub fn vecchia_loglik_grouped<const D: usize>(
     order: Option<&[usize]>,
     group_size: usize,
 ) -> Result<f64> {
+    reject_power_model(model)?;
     let plan = vecchia_plan(data.coords(), m, order)?;
     loglik_with_plan_grouped(data, model, &plan, group_size)
 }
@@ -623,6 +648,7 @@ pub fn vecchia_mle<const D: usize>(
     m: usize,
     order: Option<&[usize]>,
 ) -> Result<VecchiaFit> {
+    reject_power_kind(kind)?;
     let plan = vecchia_plan(data.coords(), m, order)?;
     mle_fit_with_plan(data, kind, &plan, 1)
 }
@@ -640,6 +666,7 @@ pub fn vecchia_mle_grouped<const D: usize>(
     order: Option<&[usize]>,
     group_size: usize,
 ) -> Result<VecchiaFit> {
+    reject_power_kind(kind)?;
     let plan = vecchia_plan(data.coords(), m, order)?;
     mle_fit_with_plan(data, kind, &plan, group_size)
 }
@@ -1057,6 +1084,7 @@ pub fn vecchia_reml<const D: usize>(
     drift_degree: u8,
     order: Option<&[usize]>,
 ) -> Result<VecchiaFit> {
+    reject_power_kind(kind)?;
     let plan = vecchia_plan(data.coords(), m, order)?;
     let basis = poly_basis(data.coords(), drift_degree);
     reml_fit_with_basis(data, kind, &plan, &basis, 1)
@@ -1074,6 +1102,7 @@ pub fn vecchia_reml_grouped<const D: usize>(
     order: Option<&[usize]>,
     group_size: usize,
 ) -> Result<VecchiaFit> {
+    reject_power_kind(kind)?;
     let plan = vecchia_plan(data.coords(), m, order)?;
     let basis = poly_basis(data.coords(), drift_degree);
     reml_fit_with_basis(data, kind, &plan, &basis, group_size)
@@ -1093,6 +1122,7 @@ pub fn vecchia_reml_drift<const D: usize>(
     drift: &[Vec<f64>],
     order: Option<&[usize]>,
 ) -> Result<VecchiaFit> {
+    reject_power_kind(kind)?;
     let n = data.len();
     if drift.len() != n {
         return Err(GeostatError::DimensionMismatch(format!(
@@ -1137,6 +1167,7 @@ pub fn vecchia_reml_drift_grouped<const D: usize>(
     order: Option<&[usize]>,
     group_size: usize,
 ) -> Result<VecchiaFit> {
+    reject_power_kind(kind)?;
     let n = data.len();
     if drift.len() != n {
         return Err(GeostatError::DimensionMismatch(format!(
@@ -1266,6 +1297,7 @@ pub fn vecchia_param_se<const D: usize>(
     m: usize,
     order: Option<&[usize]>,
 ) -> Result<[f64; 3]> {
+    reject_power_model(model)?;
     if model.structures.len() != 1 {
         return Err(GeostatError::InvalidParameter(
             "standard errors are defined for a single-structure model".into(),
@@ -1381,6 +1413,27 @@ mod tests {
         let x = lu.solve(z.clone());
         let quad: f64 = z.iter().zip(&x).map(|(&zi, &xi)| zi * xi).sum();
         -0.5 * (n as f64 * (2.0 * PI).ln() + lu.ln_det_abs() + quad)
+    }
+
+    #[test]
+    fn power_model_is_rejected_everywhere() {
+        let data = field(20, 1);
+        let power_model =
+            VariogramModel::new(0.0, vec![Structure::new(ModelKind::Power(1.0), 1.0, 1.0)])
+                .unwrap();
+        assert!(vecchia_predict(&data, &power_model, &[[1.0, 1.0]], 5).is_err());
+        assert!(vecchia_loglik(&data, &power_model, 5, None).is_err());
+        assert!(vecchia_loglik_grouped(&data, &power_model, 5, None, 2).is_err());
+        assert!(vecchia_param_se(&data, &power_model, 5, None).is_err());
+        assert!(vecchia_mle(&data, ModelKind::Power(1.0), 5, None).is_err());
+        assert!(vecchia_mle_grouped(&data, ModelKind::Power(1.0), 5, None, 2).is_err());
+        assert!(vecchia_reml(&data, ModelKind::Power(1.0), 5, 1, None).is_err());
+        assert!(vecchia_reml_grouped(&data, ModelKind::Power(1.0), 5, 1, None, 2).is_err());
+        let drift = vec![vec![1.0]; data.len()];
+        assert!(vecchia_reml_drift(&data, ModelKind::Power(1.0), 5, &drift, None).is_err());
+        assert!(
+            vecchia_reml_drift_grouped(&data, ModelKind::Power(1.0), 5, &drift, None, 2).is_err()
+        );
     }
 
     #[test]

@@ -77,6 +77,13 @@ pub fn indicator_kriging<const D: usize>(
             cfg.models.len()
         )));
     }
+    if cfg.models.iter().any(VariogramModel::has_power) {
+        return Err(GeostatError::InvalidParameter(
+            "indicator kriging needs a valid indicator covariance function and cannot use the \
+             unbounded Power model"
+                .into(),
+        ));
+    }
     if cfg.max_neighbors == Some(0) {
         return Err(GeostatError::InvalidParameter(
             "max_neighbors must be at least 1".into(),
@@ -208,6 +215,13 @@ pub fn indicator_kriging_soft<const D: usize>(
             "{} models for {nc} cutoffs (expected {nc}, or 1 for median IK)",
             cfg.models.len()
         )));
+    }
+    if cfg.models.iter().any(VariogramModel::has_power) {
+        return Err(GeostatError::InvalidParameter(
+            "indicator kriging needs a valid indicator covariance function and cannot use the \
+             unbounded Power model"
+                .into(),
+        ));
     }
     if soft.len() != targets.len() {
         return Err(GeostatError::DimensionMismatch(format!(
@@ -530,6 +544,17 @@ mod tests {
         let mut bad = cfg.clone();
         bad.models = vec![cfg.models[0].clone(), cfg.models[0].clone()]; // 2 for 3 cutoffs
         assert!(indicator_kriging(&data, &targets, &bad).is_err());
+    }
+
+    #[test]
+    fn rejects_power_model() {
+        let (data, mut cfg) = setup();
+        let targets: Vec<[f64; 2]> = vec![[50.0, 50.0]];
+        cfg.models = vec![
+            VariogramModel::new(0.0, vec![Structure::new(ModelKind::Power(1.0), 1.0, 1.0)])
+                .unwrap(),
+        ];
+        assert!(indicator_kriging(&data, &targets, &cfg).is_err());
     }
 
     #[test]

@@ -65,6 +65,20 @@ pub enum ModelKind {
     /// covariance's first zero-crossing sits exactly at `h = range`.
     /// Matches gstat's `"Wav"` model exactly.
     Wave,
+    /// Power (intrinsic random function of order 0), unbounded:
+    /// `γ(h) = h^θ`, `θ ∈ (0, 2)`; the structure's `sill` is the slope
+    /// coefficient `c` (`γ(h) = c·h^θ`) and `range` is **ignored** (Power
+    /// has no plateau, so no length-scale is needed — matches gstat's
+    /// `"Pow"` exactly, which has the same `psill·h^range` convention with
+    /// `range` doubling as the exponent). No covariance function exists for
+    /// this model (infinite variance): [`VariogramModel::covariance_dh`]/
+    /// [`VariogramModel::total_sill`] are meaningless on a model containing
+    /// it. Only [`crate::kriging::Kriging`] with `Ordinary`/`Universal`/
+    /// `ExternalDrift` supports it (kriged directly in variogram form, the
+    /// classical IRF-0 generalization); every covariance-based path
+    /// (`Simple` kriging, Vecchia, SIS, SGS, co-kriging) rejects it — see
+    /// [`VariogramModel::has_power`].
+    Power(f64),
 }
 
 impl ModelKind {
@@ -123,6 +137,7 @@ impl ModelKind {
                     1.0 - d.sin() / d
                 }
             }
+            ModelKind::Power(theta) => h.abs().powf(theta),
             ModelKind::Wave => {
                 if d <= 0.0 {
                     0.0
@@ -158,6 +173,7 @@ impl ModelKind {
             ModelKind::Stable(alpha) => format!("Stable(α={alpha:.3})"),
             ModelKind::Hole => "Hol".to_string(),
             ModelKind::Wave => "Wav".to_string(),
+            ModelKind::Power(theta) => format!("Pow(θ={theta:.3})"),
         }
     }
 }
@@ -205,9 +221,22 @@ impl std::str::FromStr for ModelKind {
             }
             return Ok(ModelKind::Stable(alpha));
         }
+        // Power: "power:<theta>" (e.g. "power:1.2"), theta in (0, 2). Range
+        // on the enclosing Structure is ignored (see ModelKind::Power docs).
+        if let Some(theta_str) = lower.strip_prefix("power:") {
+            let theta: f64 = theta_str.parse().map_err(|_| {
+                GeostatError::InvalidParameter(format!("invalid Power theta '{theta_str}'"))
+            })?;
+            if !(theta > 0.0) || theta >= 2.0 {
+                return Err(GeostatError::InvalidParameter(format!(
+                    "Power theta must be in (0, 2), got {theta}"
+                )));
+            }
+            return Ok(ModelKind::Power(theta));
+        }
         Err(GeostatError::InvalidParameter(format!(
             "unknown model kind '{s}' (expected spherical, exponential, gaussian, matern15, \
-             matern25, matern:<nu>, circular, hole, wave or stable:<alpha>)"
+             matern25, matern:<nu>, circular, hole, wave, stable:<alpha> or power:<theta>)"
         )))
     }
 }
@@ -471,6 +500,12 @@ impl VariogramModel {
                         "Stable alpha must be in (0, 2], got {alpha}"
                     )));
                 }
+            if let ModelKind::Power(theta) = s.kind
+                && (!(theta > 0.0) || theta >= 2.0) {
+                    return Err(GeostatError::InvalidParameter(format!(
+                        "Power theta must be in (0, 2), got {theta}"
+                    )));
+                }
             if let Some(a) = s.anis {
                 // ratio > 1 is valid (zonal anisotropy: the orthogonal axis
                 // is longer than the labeled one; see `Anisotropy` docs) --
@@ -538,17 +573,36 @@ impl VariogramModel {
     }
 
     /// Total sill: nugget plus all partial sills.
+    ///
+    /// **Meaningless if [`VariogramModel::has_power`]**: a `Power`
+    /// structure has no plateau (infinite variance), so this sums a
+    /// slope coefficient as if it were a true sill. Every covariance-based
+    /// code path (this method, [`VariogramModel::covariance`]/
+    /// [`VariogramModel::covariance_dh`], and everything built on them —
+    /// simple kriging, Vecchia, SIS, SGS, co-kriging) rejects models
+    /// containing `Power` at their public entry points instead of silently
+    /// computing a wrong number here.
     pub fn total_sill(&self) -> f64 {
         self.nugget + self.structures.iter().map(|s| s.sill).sum::<f64>()
     }
 
+    /// `true` if any structure is [`ModelKind::Power`] (no covariance
+    /// function exists for this model — see [`VariogramModel::total_sill`]).
+    pub fn has_power(&self) -> bool {
+        self.structures
+            .iter()
+            .any(|s| matches!(s.kind, ModelKind::Power(_)))
+    }
+
     /// Covariance at scalar lag `h` under second-order stationarity:
-    /// `C(h) = total_sill - gamma(h)`, with `C(0) = total_sill`.
+    /// `C(h) = total_sill - gamma(h)`, with `C(0) = total_sill`. See the
+    /// [`VariogramModel::has_power`] caveat.
     pub fn covariance(&self, h: f64) -> f64 {
         self.total_sill() - self.gamma(h)
     }
 
-    /// Covariance for a separation vector `dh`, honoring anisotropy.
+    /// Covariance for a separation vector `dh`, honoring anisotropy. See the
+    /// [`VariogramModel::has_power`] caveat.
     pub fn covariance_dh<const D: usize>(&self, dh: [f64; D]) -> f64 {
         self.total_sill() - self.gamma_dh(dh)
     }

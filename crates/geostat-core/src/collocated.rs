@@ -102,6 +102,15 @@ impl<'a, const D: usize> CollocatedCokriging<'a, D> {
         markov: MarkovModel,
         config: CollocatedConfig,
     ) -> Result<Self> {
+        if model1.has_power()
+            || matches!(&markov, MarkovModel::Mm2 { secondary_model } if secondary_model.has_power())
+        {
+            return Err(GeostatError::InvalidParameter(
+                "collocated co-kriging needs a valid covariance function and cannot use the \
+                 unbounded Power model"
+                    .into(),
+            ));
+        }
         if !rho12.is_finite() || !(-1.0..=1.0).contains(&rho12) {
             return Err(GeostatError::InvalidParameter(format!(
                 "rho12 must be finite and in [-1, 1], got {rho12}"
@@ -525,6 +534,45 @@ mod tests {
             )
             .is_err(),
             "sigma1 <= 0 must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_power_model() {
+        let data = primary();
+        let power_model =
+            VariogramModel::new(0.0, vec![Structure::new(ModelKind::Power(1.0), 1.0, 1.0)])
+                .unwrap();
+        assert!(
+            CollocatedCokriging::new(
+                &data,
+                &power_model,
+                0.0,
+                0.0,
+                0.5,
+                1.0,
+                1.0,
+                MarkovModel::Mm1,
+                CollocatedConfig::default()
+            )
+            .is_err()
+        );
+        let bounded = model1();
+        assert!(
+            CollocatedCokriging::new(
+                &data,
+                &bounded,
+                0.0,
+                0.0,
+                0.5,
+                1.0,
+                1.0,
+                MarkovModel::Mm2 {
+                    secondary_model: power_model
+                },
+                CollocatedConfig::default()
+            )
+            .is_err()
         );
     }
 }

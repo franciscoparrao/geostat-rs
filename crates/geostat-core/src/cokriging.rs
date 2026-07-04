@@ -106,6 +106,12 @@ impl Lmc {
         }
         check_psd(&nugget, n, "nugget")?;
         for (s, st) in structures.iter().enumerate() {
+            if matches!(st.kind, ModelKind::Power(_)) {
+                return Err(GeostatError::InvalidParameter(format!(
+                    "structure {s}: co-kriging needs a valid cross-covariance function and \
+                     cannot use the unbounded Power model"
+                )));
+            }
             if !(st.range > 0.0) || !st.range.is_finite() {
                 return Err(GeostatError::InvalidParameter(format!(
                     "structure {s}: range must be finite and > 0, got {}",
@@ -775,6 +781,20 @@ mod tests {
         let m = lmc(0.8);
         let d0 = m.direct_model(0).unwrap();
         assert!((d0.total_sill() - 1.05).abs() < 1e-12);
+        // Power (unbounded) rejected -- co-kriging needs a real
+        // cross-covariance.
+        assert!(
+            Lmc::new(
+                vec![vec![0.0, 0.0], vec![0.0, 0.0]],
+                vec![LmcStructure {
+                    kind: ModelKind::Power(1.0),
+                    range: 1.0,
+                    anis: None,
+                    sills: vec![vec![1.0, 0.5], vec![0.5, 1.0]],
+                }]
+            )
+            .is_err()
+        );
     }
 
     #[test]
