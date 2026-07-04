@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "geostat-rs"
+version = "0.6.0"
+description = "Geostatistics engine (variography, kriging, co-kriging, sequential simulation) — Python bindings for the geostat-rs Rust core"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: GIS",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+dependencies = ["numpy>=1.20"]
+
+[project.urls]
+Repository = "https://github.com/franciscoparrao/geostat-rs"
+
+[tool.maturin]
+module-name = "geostat_rs"
+features = ["pyo3/extension-module"]

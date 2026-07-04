@@ -403,7 +403,104 @@ Computers & Geosciences.
     también, consistente con la teoría). 196 tests, clippy limpio, paridad
     gstat general re-confirmada sin regresiones.
 
-    Quedan el ítem #19 (trait de covarianza, rust-numpy, proptest,
-    publicación crates.io/PyPI), y exponer collocated cokriging/
+13. **Ítem #19 en curso (2026-07-03): trait público de covarianza** hecho —
+    `covariance::Covariance<const D: usize = 2>` (`Send + Sync` porque
+    kriging paraleliza la predicción internamente), con `gamma_dh`/
+    `covariance_dh` obligatorios y `nugget()`/`has_power()` con default
+    (`0.0`/`false`, correctos para cualquier covarianza continua normal;
+    `VariogramModel` los sobreescribe delegando a sus métodos inherentes ya
+    existentes, así que `impl Covariance for VariogramModel` no cambia
+    ningún comportamiento). `Kriging<'a, const D: usize = 2, M: Covariance<D>
+    = VariogramModel>` — el segundo parámetro const-generic (`D`) queda en
+    la MISMA posición de siempre y `M` se agrega al final con default, así
+    que **cero cambios** en firmas existentes (`Kriging<'_, 3>` sigue
+    significando exactamente lo mismo) — confirmado compilando el workspace
+    completo (CLI/Python/WASM) sin tocar un solo call site fuera de
+    `kriging.rs`. Dentro de `kriging.rs` solo hubo que generificar el único
+    `impl` block (`build_lhs`/`predict_inner`/`predict_block`/etc. ya solo
+    tocaban `covariance_dh`/`gamma_dh`/`has_power`/`nugget` — verificado por
+    grep antes de tocar nada) y cambiar el único acceso a campo concreto
+    (`model.nugget` → `model.nugget()`). Validado por: **igualdad exacta**
+    (`<1e-12`) entre una covarianza exponencial hecha a mano (sin tocar
+    `VariogramModel`/`ModelKind` en absoluto) krigeada vía el trait y el
+    `VariogramModel` matemáticamente equivalente krigeado por el camino
+    concreto de siempre — la prueba fuerte de que el camino genérico
+    computa exactamente lo mismo, no solo "compila". Kriging simple/OK/UK
+    con la covarianza custom exacto en datos propios. 199 tests, clippy
+    limpio, **paridad gstat re-confirmada sin regresiones** (Meuse
+    completo — el área más sensible tocada esta sesión).
+
+    Pendiente del ítem #19: rust-numpy + `allow_threads` + stubs (Python),
+    proptest + fuzzing, y la publicación real a crates.io/PyPI (acción
+    externa irreversible, requiere confirmación explícita y credenciales —
+    deliberadamente pospuesta a un paso separado).
+
+    **rust-numpy + allow_threads + stubs** (mismo día) hecho — `numpy` como
+    dependencia nueva de `geostat-python`; los resultados de forma arreglo
+    (grillas, realizaciones SGS/SIS, arrays de CV, ccdf de IK) ahora se
+    devuelven como arrays numpy (`arr1`/`arr2`, movidos sin copia extra vía
+    `into_pyarray`) en vez de listas de Python: `krige`/`krige_grid`/
+    `krige_3d`/`vecchia_krige`/`lognormal_kriging`/`co_kriging`/`idw`/`knn`/
+    `regression_kriging` (predictions+variances), `sgs`/`sis` (arrays 2-D
+    n_realizaciones×n_celdas), `loo_cv` (predicted/variance),
+    `indicator_kriging` (ccdf 2-D), `decluster_weights` (weights). Cada
+    función que hace cómputo Rust no trivial (29 de 30) libera el GIL
+    durante ese cómputo vía `Python::allow_threads` — un colisión de
+    nombres real (`co_kriging` ya usaba `py` como nombre del parámetro de
+    coordenadas y de la secundaria) resuelto renombrando el token GIL a
+    `gil` solo en esa función. Stubs `.pyi` completos (las 30 funciones +
+    la clase `VariogramModel`) + marcador `py.typed` (PEP 561) +
+    `pyproject.toml` nuevo (metadata real de paquete: nombre `geostat-rs`,
+    dependencias, clasificadores — preparación para la publicación a PyPI).
+    **Validado con un build real de maturin** (no solo `cargo build`):
+    `maturin develop --release` en un venv limpio, luego smoke tests en
+    Python real importando el módulo, verificando que los arrays devueltos
+    son efectivamente `numpy.ndarray` con el dtype/forma correctos
+    (`krige_grid`, `krige`, `loo_cv` con `blocks=`, `sgs`/`sis` con forma
+    `(n_realizations, n_cells)`, `indicator_kriging` con ccdf `(n_targets,
+    n_cutoffs)`, `idw`/`knn`/`decluster_weights`/`vecchia_krige`), y que
+    maturin efectivamente empaqueta el stub (`📖 Found type stub file at
+    geostat_rs.pyi`). Sin regresión en paridad gstat (el núcleo Rust no se
+    tocó, solo el binding). 199 tests, clippy limpio en todo el workspace.
+
+    **proptest + fuzzing** (2026-07-04) hecho — `proptest` como
+    dev-dependency de `geostat-core`, 6 property tests nuevos cubriendo
+    invariantes matemáticos que las ~205 pruebas unitarias existentes solo
+    verifican en casos puntuales: `variogram::model` (`gamma(0)==0` y
+    `gamma>=0` para cualquier (nugget,sill,range) válido de los 6 kinds
+    acotados; `covariance = total_sill - gamma` como identidad; ningún kind
+    acotado excede su sill — 3 tests), `sis::order_corrections` (para
+    cualquier `Vec<f64>` de entrada, incluso con basura fuera de [0,1], el
+    resultado siempre es monótono y acotado), `kriging` (OK es exacto en
+    los datos para CUALQUIER configuración de 3-8 puntos bien separados +
+    cualquier sill/range válido — no solo el dataset fijo de los tests
+    existentes) y `linalg::solve` (reproduce el lado derecho para cualquier
+    sistema SPD bien condicionado vía `MᵀM + 0.5·I`). Todos corridos con
+    los defaults de proptest (256 casos c/u, shrinking automático si algo
+    falla) sin encontrar contraejemplos.
+
+    **Fuzzing**: `crates/geostat-core/fuzz/` (cargo-fuzz + libFuzzer,
+    workspace propio vía `[workspace]` vacío en su `Cargo.toml` para no
+    interferir con el workspace principal — ya excluido de sus `members`).
+    Dos targets sobre la superficie de ataque más apropiada para fuzzing
+    (parseo de strings/bytes arbitrarios, no álgebra numérica — para eso ya
+    está proptest): `model_kind_parse` (`ModelKind::from_str`/
+    `parse_list` — strings de CLI/Python arbitrarios nunca deben paniquear)
+    y `variogram_model_json` (deserialización JSON de `VariogramModel` +
+    re-validación — archivos de modelo adversariales/corruptos, mismo
+    argumento). Corridos ~900k iteraciones cada uno (25s con
+    `+nightly cargo fuzz run`) sin encontrar crashes; `artifacts/`/`corpus/`
+    quedan vacíos y ya excluidos por el `.gitignore` que genera `cargo fuzz
+    init`. Sin cambios en el workspace principal (`cargo build/test
+    --workspace` no toca `fuzz/`), 205 tests, clippy limpio, paridad gstat
+    re-confirmada.
+
+    **Con esto el ítem #19 queda completo salvo la publicación real** a
+    crates.io/PyPI (acción externa irreversible, requiere confirmación
+    explícita y credenciales — deliberadamente pospuesta a un paso
+    separado, no intentada esta sesión).
+
+    Quedan el ítem #18's "CV para cokriging/IK" (no implementado — solo CV
+    de kriging simple/OK/UK/KED), y exponer collocated cokriging/
     Markov-Bayes/block IRF-0 en CLI/Python (deliberadamente diferido,
     alcance de esas sesiones: el núcleo del motor).

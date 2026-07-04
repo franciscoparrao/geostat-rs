@@ -2,6 +2,7 @@
 
 use ndarray::Array2;
 
+use crate::covariance::Covariance;
 use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
 use crate::grid::Grid2D;
@@ -103,12 +104,15 @@ const NAN_ESTIMATE: KrigingEstimate = KrigingEstimate {
     lagrange: None,
 };
 
-/// Kriging predictor bound to a dataset and variogram model (2-D by
-/// default; `Kriging<'_, 3>` for 3-D data).
+/// Kriging predictor bound to a dataset and covariance/variogram model
+/// (2-D by default; `Kriging<'_, 3>` for 3-D data). The model defaults to
+/// [`VariogramModel`], but any type implementing [`Covariance<D>`] works
+/// (`Kriging<'_, 2, MyCovariance>`) — see [`Covariance`] for the seam this
+/// opens for custom, non-catalog covariance functions.
 #[derive(Debug)]
-pub struct Kriging<'a, const D: usize = 2> {
+pub struct Kriging<'a, const D: usize = 2, M: Covariance<D> = VariogramModel> {
     data: &'a PointSet<D>,
-    model: &'a VariogramModel,
+    model: &'a M,
     config: KrigingConfig,
     tree: Option<KdTree<D>>,
     // Coordinate normalization for numerically stable polynomial drift.
@@ -128,13 +132,9 @@ pub struct Kriging<'a, const D: usize = 2> {
     global_lu: Option<Lu>,
 }
 
-impl<'a, const D: usize> Kriging<'a, D> {
+impl<'a, const D: usize, M: Covariance<D>> Kriging<'a, D, M> {
     /// Builds a predictor for simple/ordinary/universal kriging.
-    pub fn new(
-        data: &'a PointSet<D>,
-        model: &'a VariogramModel,
-        config: KrigingConfig,
-    ) -> Result<Self> {
+    pub fn new(data: &'a PointSet<D>, model: &'a M, config: KrigingConfig) -> Result<Self> {
         if matches!(config.method, KrigingMethod::ExternalDrift { .. }) {
             return Err(GeostatError::InvalidParameter(
                 "external drift kriging requires Kriging::with_external_drift".into(),
@@ -151,7 +151,7 @@ impl<'a, const D: usize> Kriging<'a, D> {
     /// smoothed instead of honored.
     pub fn with_measurement_error(
         data: &'a PointSet<D>,
-        model: &'a VariogramModel,
+        model: &'a M,
         config: KrigingConfig,
         errors: Vec<f64>,
     ) -> Result<Self> {
@@ -180,7 +180,7 @@ impl<'a, const D: usize> Kriging<'a, D> {
     /// matching `KrigingMethod::ExternalDrift`.
     pub fn with_external_drift(
         data: &'a PointSet<D>,
-        model: &'a VariogramModel,
+        model: &'a M,
         config: KrigingConfig,
         drift_data: Vec<Vec<f64>>,
     ) -> Result<Self> {
@@ -219,7 +219,7 @@ impl<'a, const D: usize> Kriging<'a, D> {
 
     fn build(
         data: &'a PointSet<D>,
-        model: &'a VariogramModel,
+        model: &'a M,
         config: KrigingConfig,
         drift_data: Vec<Vec<f64>>,
         measurement_error: Vec<f64>,
@@ -659,7 +659,7 @@ impl<'a, const D: usize> Kriging<'a, D> {
         // Within-block covariance C̄(B,B). For coincident discretization
         // points (u = v) the nugget is excluded: it is a measure-zero
         // discontinuity in the block integral (gstat/GSLIB convention).
-        let c0_continuous = c0 - self.model.nugget;
+        let c0_continuous = c0 - self.model.nugget();
         let mut cbb = 0.0;
         for (ui, u) in offsets.iter().enumerate() {
             for (vi, v) in offsets.iter().enumerate() {
@@ -698,7 +698,7 @@ impl<'a, const D: usize> Kriging<'a, D> {
     }
 }
 
-impl Kriging<'_, 2> {
+impl<M: Covariance<2>> Kriging<'_, 2, M> {
     /// Kriging over all cell centers of a grid. Returns `(values, variances)`
     /// in grid storage order.
     pub fn predict_grid(&self, grid: &Grid2D) -> (Vec<f64>, Vec<f64>) {
@@ -1318,5 +1318,62 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// 3-8 points in [0,100]^2 with every pair at least 2 units apart
+        /// (duplicate/near-duplicate coordinates make the kriging system
+        /// singular for reasons unrelated to the property under test), each
+        /// carrying an arbitrary value.
+        fn well_spaced_points() -> impl Strategy<Value = Vec<(f64, f64, f64)>> {
+            prop::collection::vec((0.0f64..100.0, 0.0f64..100.0, -10.0f64..10.0), 3..8).prop_filter(
+                "points must be pairwise well separated",
+                |pts| {
+                    for i in 0..pts.len() {
+                        for j in (i + 1)..pts.len() {
+                            let dx = pts[i].0 - pts[j].0;
+                            let dy = pts[i].1 - pts[j].1;
+                            if (dx * dx + dy * dy).sqrt() < 2.0 {
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                },
+            )
+        }
+
+        proptest! {
+            #[test]
+            fn ordinary_kriging_is_exact_at_data_points_for_any_well_spaced_field(
+                pts in well_spaced_points(),
+                sill in 0.1f64..5.0,
+                range in 5.0f64..200.0,
+            ) {
+                let coords: Vec<[f64; 2]> = pts.iter().map(|p| [p.0, p.1]).collect();
+                let values: Vec<f64> = pts.iter().map(|p| p.2).collect();
+                let data = PointSet::new(coords, values).unwrap();
+                // Nugget-free: with a nugget OK smooths instead of
+                // interpolating exactly, which would break this property
+                // by design (see `measurement_error_smooths_instead_of_honoring`).
+                let model = VariogramModel::new(
+                    0.0,
+                    vec![Structure::new(ModelKind::Exponential, sill, range)],
+                )
+                .unwrap();
+                let k = Kriging::new(&data, &model, KrigingConfig::default()).unwrap();
+                for i in 0..data.len() {
+                    let est = k.predict(data.coord(i)).unwrap();
+                    prop_assert!(
+                        (est.value - data.value(i)).abs() < 1e-6,
+                        "point {i}: {} vs {}", est.value, data.value(i)
+                    );
+                    prop_assert!(est.variance < 1e-6, "point {i}: var {}", est.variance);
+                }
+            }
+        }
     }
 }

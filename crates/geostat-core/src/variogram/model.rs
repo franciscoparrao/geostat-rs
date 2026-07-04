@@ -1052,4 +1052,67 @@ mod tests {
         assert!(hol.gamma(500.0) > 1.0, "Hol should overshoot by h=500");
         assert!(hol.covariance(500.0) < 0.0);
     }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// The bounded, monotone kinds (matches [`ModelKind::ALL`] plus the
+        /// closed-form Materns) -- the ones expected to plateau at the sill
+        /// and never exceed it, unlike Power (unbounded) or Hole/Wave
+        /// (deliberately oscillating).
+        fn bounded_kind() -> impl Strategy<Value = ModelKind> {
+            prop_oneof![
+                Just(ModelKind::Spherical),
+                Just(ModelKind::Exponential),
+                Just(ModelKind::Gaussian),
+                Just(ModelKind::Matern15),
+                Just(ModelKind::Matern25),
+                Just(ModelKind::Circular),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn gamma_is_zero_at_the_origin_and_nonnegative(
+                kind in bounded_kind(),
+                nugget in 0.0f64..5.0,
+                sill in 1e-3f64..5.0,
+                range in 1e-3f64..500.0,
+                h in 0.0f64..2000.0,
+            ) {
+                let m = VariogramModel::new(nugget, vec![Structure::new(kind, sill, range)]).unwrap();
+                prop_assert_eq!(m.gamma(0.0), 0.0);
+                prop_assert!(m.gamma(h) >= 0.0, "{kind}: gamma({h}) = {}", m.gamma(h));
+            }
+
+            #[test]
+            fn covariance_equals_total_sill_minus_gamma(
+                kind in bounded_kind(),
+                nugget in 0.0f64..5.0,
+                sill in 1e-3f64..5.0,
+                range in 1e-3f64..500.0,
+                h in 0.0f64..2000.0,
+            ) {
+                let m = VariogramModel::new(nugget, vec![Structure::new(kind, sill, range)]).unwrap();
+                let lhs = m.covariance(h);
+                let rhs = m.total_sill() - m.gamma(h);
+                prop_assert!((lhs - rhs).abs() < 1e-9, "{lhs} vs {rhs}");
+            }
+
+            #[test]
+            fn bounded_kind_never_exceeds_its_sill(
+                kind in bounded_kind(),
+                sill in 1e-3f64..5.0,
+                range in 1e-3f64..500.0,
+                h in 0.0f64..5000.0,
+            ) {
+                let m = VariogramModel::new(0.0, vec![Structure::new(kind, sill, range)]).unwrap();
+                prop_assert!(
+                    m.gamma(h) <= sill * (1.0 + 1e-9),
+                    "{kind}: gamma({h}) = {} > sill {sill}", m.gamma(h)
+                );
+            }
+        }
+    }
 }

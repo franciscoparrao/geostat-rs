@@ -1,9 +1,15 @@
 //! Python bindings for geostat-core (module name: `geostat_rs`).
 //!
 //! Inputs are plain sequences of floats (lists, tuples or 1-D numpy
-//! arrays), so the module has no numpy dependency. Build with maturin
-//! (`maturin develop`) or copy the cdylib as `geostat_rs.so`.
+//! arrays). Array-shaped outputs (grid predictions, simulation
+//! realizations, cross-validation arrays) are returned as owned numpy
+//! arrays (via the `numpy` crate) rather than Python lists. Every function
+//! doing non-trivial computation releases the GIL for that part
+//! (`Python::allow_threads`), so other Python threads keep running while a
+//! krige/vecchia/SGS/SIS call is in flight. Build with maturin (`maturin
+//! develop`) or copy the cdylib as `geostat_rs.so`.
 
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -14,8 +20,32 @@ use geostat_core::{
     VariogramConfig,
 };
 
+/// A pair of same-length 1-D numpy arrays (predictions, variances).
+type ArrayPair = (Py<PyArray1<f64>>, Py<PyArray1<f64>>);
+
 fn err<E: std::fmt::Display>(e: E) -> PyErr {
     PyValueError::new_err(e.to_string())
+}
+
+/// Moves a `Vec<f64>` into an owned 1-D numpy array with no extra copy.
+fn arr1(py: Python<'_>, v: Vec<f64>) -> Py<PyArray1<f64>> {
+    v.into_pyarray(py).unbind()
+}
+
+/// Stacks `rows` (all the same length) into an owned `rows.len() x
+/// rows[0].len()` numpy array (e.g. simulation realizations, one row each).
+fn arr2(py: Python<'_>, rows: Vec<Vec<f64>>) -> PyResult<Py<PyArray2<f64>>> {
+    let nrows = rows.len();
+    let ncols = rows.first().map_or(0, Vec::len);
+    let flat: Vec<f64> = rows.into_iter().flatten().collect();
+    if flat.len() != nrows * ncols {
+        return Err(err("all rows must have the same length"));
+    }
+    Ok(flat
+        .into_pyarray(py)
+        .reshape([nrows, ncols])
+        .map_err(err)?
+        .unbind())
 }
 
 fn point_set(x: Vec<f64>, y: Vec<f64>, values: Vec<f64>) -> PyResult<PointSet> {
@@ -147,6 +177,7 @@ fn maybe_detrend(
     detrend = None, detrend_drift = None))]
 #[allow(clippy::too_many_arguments)]
 fn experimental_variogram(
+    py: Python<'_>,
     x: Vec<f64>,
     y: Vec<f64>,
     values: Vec<f64>,
@@ -158,17 +189,19 @@ fn experimental_variogram(
     detrend_drift: Option<Vec<Vec<f64>>>,
 ) -> PyResult<(Vec<f64>, Vec<f64>, Vec<usize>)> {
     let data = maybe_detrend(point_set(x, y, values)?, detrend, detrend_drift)?;
-    let cfg = vario_config(&data, n_lags, max_dist, azimuth, 0.0, tolerance);
-    let ev = core::experimental_variogram(&data, &cfg).map_err(err)?;
-    let mut h = Vec::new();
-    let mut gamma = Vec::new();
-    let mut np = Vec::new();
-    for b in &ev.bins {
-        h.push(b.h);
-        gamma.push(b.gamma);
-        np.push(b.n_pairs);
-    }
-    Ok((h, gamma, np))
+    py.allow_threads(|| {
+        let cfg = vario_config(&data, n_lags, max_dist, azimuth, 0.0, tolerance);
+        let ev = core::experimental_variogram(&data, &cfg).map_err(err)?;
+        let mut h = Vec::new();
+        let mut gamma = Vec::new();
+        let mut np = Vec::new();
+        for b in &ev.bins {
+            h.push(b.h);
+            gamma.push(b.gamma);
+            np.push(b.n_pairs);
+        }
+        Ok((h, gamma, np))
+    })
 }
 
 /// 2-D variogram map (lag-space semivariance surface) for spotting anisotropy.
@@ -186,15 +219,18 @@ fn variogram_map(
     lag_width: f64,
 ) -> PyResult<Py<PyDict>> {
     let data = point_set(x, y, values)?;
-    let m = core::variogram_map(&data, n_lags, lag_width).map_err(err)?;
-    let (mut hx, mut hy) = (Vec::new(), Vec::new());
-    for iy in 0..m.size {
-        for ix in 0..m.size {
-            let (lx, ly) = m.lag(ix, iy);
-            hx.push(lx);
-            hy.push(ly);
+    let (m, hx, hy) = py.allow_threads(|| {
+        let m = core::variogram_map(&data, n_lags, lag_width).map_err(err)?;
+        let (mut hx, mut hy) = (Vec::new(), Vec::new());
+        for iy in 0..m.size {
+            for ix in 0..m.size {
+                let (lx, ly) = m.lag(ix, iy);
+                hx.push(lx);
+                hy.push(ly);
+            }
         }
-    }
+        Ok::<_, PyErr>((m, hx, hy))
+    })?;
     let out = PyDict::new(py);
     out.set_item("size", m.size)?;
     out.set_item("lag_width", m.lag_width)?;
@@ -215,6 +251,7 @@ fn variogram_map(
     detrend = None, detrend_drift = None))]
 #[allow(clippy::too_many_arguments)]
 fn fit_variogram(
+    py: Python<'_>,
     x: Vec<f64>,
     y: Vec<f64>,
     values: Vec<f64>,
@@ -225,10 +262,13 @@ fn fit_variogram(
     detrend_drift: Option<Vec<Vec<f64>>>,
 ) -> PyResult<VariogramModel> {
     let data = maybe_detrend(point_set(x, y, values)?, detrend, detrend_drift)?;
-    let cfg = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
-    let ev = core::experimental_variogram(&data, &cfg).map_err(err)?;
-    let fit = core::fit_best(&ev, &parse_kinds(kinds)?).map_err(err)?;
-    Ok(VariogramModel { inner: fit.model })
+    let kinds = parse_kinds(kinds)?;
+    let model = py.allow_threads(|| {
+        let cfg = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
+        let ev = core::experimental_variogram(&data, &cfg).map_err(err)?;
+        core::fit_best(&ev, &kinds).map_err(err)
+    })?;
+    Ok(VariogramModel { inner: model.model })
 }
 
 /// Fits a geometrically anisotropic variogram model: estimates the major-axis
@@ -237,7 +277,9 @@ fn fit_variogram(
 /// model carries the anisotropy; `model.anisotropy()` exposes (azimuth, ratio).
 #[pyfunction]
 #[pyo3(signature = (x, y, values, n_dirs = 4, n_lags = 15, max_dist = None, kinds = "best"))]
+#[allow(clippy::too_many_arguments)]
 fn fit_anisotropic(
+    py: Python<'_>,
     x: Vec<f64>,
     y: Vec<f64>,
     values: Vec<f64>,
@@ -248,8 +290,10 @@ fn fit_anisotropic(
 ) -> PyResult<VariogramModel> {
     let data = point_set(x, y, values)?;
     let cfg = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
-    let fit = core::fit_anisotropic(&data, &parse_kinds(kinds)?, n_dirs, n_lags, cfg.max_dist)
-        .map_err(err)?;
+    let kinds = parse_kinds(kinds)?;
+    let fit = py.allow_threads(|| {
+        core::fit_anisotropic(&data, &kinds, n_dirs, n_lags, cfg.max_dist).map_err(err)
+    })?;
     Ok(VariogramModel { inner: fit.model })
 }
 
@@ -261,6 +305,7 @@ fn fit_anisotropic(
 #[pyfunction]
 #[pyo3(signature = (x, y, values, kind = "exponential", m = 20))]
 fn vecchia_mle(
+    py: Python<'_>,
     x: Vec<f64>,
     y: Vec<f64>,
     values: Vec<f64>,
@@ -271,7 +316,7 @@ fn vecchia_mle(
     let k = *parse_kinds(kind)?
         .first()
         .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("no model kind given"))?;
-    let fit = core::vecchia_mle(&data, k, m, None).map_err(err)?;
+    let fit = py.allow_threads(|| core::vecchia_mle(&data, k, m, None).map_err(err))?;
     Ok(VariogramModel { inner: fit.model })
 }
 
@@ -283,6 +328,7 @@ fn vecchia_mle(
 #[pyfunction]
 #[pyo3(signature = (x, y, values, kind = "exponential", m = 20, drift_degree = 1))]
 fn vecchia_reml(
+    py: Python<'_>,
     x: Vec<f64>,
     y: Vec<f64>,
     values: Vec<f64>,
@@ -294,7 +340,8 @@ fn vecchia_reml(
     let k = *parse_kinds(kind)?
         .first()
         .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("no model kind given"))?;
-    let fit = core::vecchia_reml(&data, k, m, drift_degree, None).map_err(err)?;
+    let fit =
+        py.allow_threads(|| core::vecchia_reml(&data, k, m, drift_degree, None).map_err(err))?;
     Ok(VariogramModel { inner: fit.model })
 }
 
@@ -306,6 +353,7 @@ fn vecchia_reml(
 #[pyfunction]
 #[pyo3(signature = (x, y, values, covariates, kind = "exponential", m = 20))]
 fn vecchia_reml_drift(
+    py: Python<'_>,
     x: Vec<f64>,
     y: Vec<f64>,
     values: Vec<f64>,
@@ -317,7 +365,8 @@ fn vecchia_reml_drift(
     let k = *parse_kinds(kind)?
         .first()
         .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("no model kind given"))?;
-    let fit = core::vecchia_reml_drift(&data, k, m, &covariates, None).map_err(err)?;
+    let fit = py
+        .allow_threads(|| core::vecchia_reml_drift(&data, k, m, &covariates, None).map_err(err))?;
     Ok(VariogramModel { inner: fit.model })
 }
 
@@ -328,6 +377,7 @@ fn vecchia_reml_drift(
 #[pyfunction]
 #[pyo3(signature = (x, y, values, model, m = 20))]
 fn vecchia_param_se(
+    py: Python<'_>,
     x: Vec<f64>,
     y: Vec<f64>,
     values: Vec<f64>,
@@ -335,7 +385,7 @@ fn vecchia_param_se(
     m: usize,
 ) -> PyResult<(f64, f64, f64)> {
     let data = point_set(x, y, values)?;
-    let se = core::vecchia_param_se(&data, &model.inner, m, None).map_err(err)?;
+    let se = py.allow_threads(|| core::vecchia_param_se(&data, &model.inner, m, None).map_err(err))?;
     Ok((se[0], se[1], se[2]))
 }
 
@@ -349,6 +399,7 @@ fn vecchia_param_se(
 #[pyo3(signature = (x, y, values, model, target_x, target_y, m = 30))]
 #[allow(clippy::too_many_arguments)]
 fn vecchia_krige(
+    py: Python<'_>,
     x: Vec<f64>,
     y: Vec<f64>,
     values: Vec<f64>,
@@ -356,7 +407,7 @@ fn vecchia_krige(
     target_x: Vec<f64>,
     target_y: Vec<f64>,
     m: usize,
-) -> PyResult<(Vec<f64>, Vec<f64>)> {
+) -> PyResult<ArrayPair> {
     if target_x.len() != target_y.len() {
         return Err(PyValueError::new_err(
             "target_x and target_y differ in length",
@@ -368,8 +419,11 @@ fn vecchia_krige(
         .zip(target_y)
         .map(|(tx, ty)| [tx, ty])
         .collect();
-    let ests = core::vecchia_predict(&data, &model.inner, &targets, m).map_err(err)?;
-    Ok(ests.into_iter().map(|e| (e.value, e.variance)).unzip())
+    let (values, variances) = py.allow_threads(|| {
+        let ests = core::vecchia_predict(&data, &model.inner, &targets, m).map_err(err)?;
+        Ok::<_, PyErr>(ests.into_iter().map(|e| (e.value, e.variance)).unzip())
+    })?;
+    Ok((arr1(py, values), arr1(py, variances)))
 }
 
 /// Vecchia-approximated Gaussian log-likelihood of the data under `model`, with
@@ -377,6 +431,7 @@ fn vecchia_krige(
 #[pyfunction]
 #[pyo3(signature = (x, y, values, model, m = 20))]
 fn vecchia_loglik(
+    py: Python<'_>,
     x: Vec<f64>,
     y: Vec<f64>,
     values: Vec<f64>,
@@ -384,7 +439,7 @@ fn vecchia_loglik(
     m: usize,
 ) -> PyResult<f64> {
     let data = point_set(x, y, values)?;
-    core::vecchia_loglik(&data, &model.inner, m, None).map_err(err)
+    py.allow_threads(|| core::vecchia_loglik(&data, &model.inner, m, None).map_err(err))
 }
 
 /// Kriging at arbitrary target locations. Returns `(predictions, variances)`;
@@ -397,6 +452,7 @@ fn vecchia_loglik(
     min_neighbors = None, octant = None, measurement_error = None))]
 #[allow(clippy::too_many_arguments)]
 fn krige(
+    py: Python<'_>,
     x: Vec<f64>,
     y: Vec<f64>,
     values: Vec<f64>,
@@ -411,7 +467,7 @@ fn krige(
     min_neighbors: Option<usize>,
     octant: Option<usize>,
     measurement_error: Option<Vec<f64>>,
-) -> PyResult<(Vec<f64>, Vec<f64>)> {
+) -> PyResult<ArrayPair> {
     if target_x.len() != target_y.len() {
         return Err(PyValueError::new_err(
             "target_x and target_y differ in length",
@@ -425,19 +481,22 @@ fn krige(
         min_neighbors,
         max_per_octant: octant,
     };
-    let kriging = match measurement_error {
-        Some(errors) => {
-            Kriging::with_measurement_error(&data, &model.inner, config, errors).map_err(err)?
-        }
-        None => Kriging::new(&data, &model.inner, config).map_err(err)?,
-    };
     let targets: Vec<[f64; 2]> = target_x
         .into_iter()
         .zip(target_y)
         .map(|(tx, ty)| [tx, ty])
         .collect();
-    let ests = kriging.predict_many(&targets);
-    Ok(ests.into_iter().map(|e| (e.value, e.variance)).unzip())
+    let (values, variances) = py.allow_threads(|| {
+        let kriging = match measurement_error {
+            Some(errors) => {
+                Kriging::with_measurement_error(&data, &model.inner, config, errors).map_err(err)?
+            }
+            None => Kriging::new(&data, &model.inner, config).map_err(err)?,
+        };
+        let ests = kriging.predict_many(&targets);
+        Ok::<_, PyErr>(ests.into_iter().map(|e| (e.value, e.variance)).unzip())
+    })?;
+    Ok((arr1(py, values), arr1(py, variances)))
 }
 
 /// Ordinary/simple lognormal kriging. `values` are the original (positive)
@@ -450,6 +509,7 @@ fn krige(
     method = "ordinary", mean = None, max_neighbors = None, radius = None))]
 #[allow(clippy::too_many_arguments)]
 fn lognormal_kriging(
+    py: Python<'_>,
     x: Vec<f64>,
     y: Vec<f64>,
     values: Vec<f64>,
@@ -460,7 +520,7 @@ fn lognormal_kriging(
     mean: Option<f64>,
     max_neighbors: Option<usize>,
     radius: Option<f64>,
-) -> PyResult<(Vec<f64>, Vec<f64>)> {
+) -> PyResult<ArrayPair> {
     if target_x.len() != target_y.len() {
         return Err(PyValueError::new_err(
             "target_x and target_y differ in length",
@@ -491,8 +551,16 @@ fn lognormal_kriging(
         .zip(target_y)
         .map(|(tx, ty)| [tx, ty])
         .collect();
-    let ests = core::lognormal_kriging(&data, &targets, &log_model.inner, &config).map_err(err)?;
-    Ok(ests.into_iter().map(|e| (e.value, e.log_variance)).unzip())
+    let (values, variances) = py.allow_threads(|| {
+        let ests =
+            core::lognormal_kriging(&data, &targets, &log_model.inner, &config).map_err(err)?;
+        Ok::<_, PyErr>(
+            ests.into_iter()
+                .map(|e| (e.value, e.log_variance))
+                .unzip(),
+        )
+    })?;
+    Ok((arr1(py, values), arr1(py, variances)))
 }
 
 /// Kriging over a regular grid (`bbox = (xmin, ymin, xmax, ymax)`), row-major
@@ -503,6 +571,7 @@ fn lognormal_kriging(
     min_neighbors = None, octant = None))]
 #[allow(clippy::too_many_arguments)]
 fn krige_grid(
+    py: Python<'_>,
     x: Vec<f64>,
     y: Vec<f64>,
     values: Vec<f64>,
@@ -519,7 +588,7 @@ fn krige_grid(
     block_discr: (usize, usize),
     min_neighbors: Option<usize>,
     octant: Option<usize>,
-) -> PyResult<(Vec<f64>, Vec<f64>)> {
+) -> PyResult<ArrayPair> {
     let data = point_set(x, y, values)?;
     let grid = Grid2D::from_bbox([bbox.0, bbox.1], [bbox.2, bbox.3], nx, ny).map_err(err)?;
     let config = KrigingConfig {
@@ -529,13 +598,16 @@ fn krige_grid(
         min_neighbors,
         max_per_octant: octant,
     };
-    let kriging = Kriging::new(&data, &model.inner, config).map_err(err)?;
-    match block {
-        Some((bw, bh)) => kriging
-            .predict_block_grid(&grid, [bw, bh], [block_discr.0, block_discr.1])
-            .map_err(err),
-        None => Ok(kriging.predict_grid(&grid)),
-    }
+    let (values, variances) = py.allow_threads(|| {
+        let kriging = Kriging::new(&data, &model.inner, config).map_err(err)?;
+        match block {
+            Some((bw, bh)) => kriging
+                .predict_block_grid(&grid, [bw, bh], [block_discr.0, block_discr.1])
+                .map_err(err),
+            None => Ok(kriging.predict_grid(&grid)),
+        }
+    })?;
+    Ok((arr1(py, values), arr1(py, variances)))
 }
 
 /// Cross-validation. Leave-one-out by default; pass `folds=k` for `k`-fold
@@ -578,11 +650,11 @@ fn loo_cv(
     if blocks.is_some() && folds.is_some() {
         return Err(PyValueError::new_err("blocks and folds are mutually exclusive"));
     }
-    let cv = match (blocks, folds) {
-        (Some((nx, ny)), _) => core::block_cv(&data, &model.inner, &config, [nx, ny]).map_err(err)?,
-        (None, Some(k)) => core::k_fold(&data, &model.inner, &config, k, seed).map_err(err)?,
-        (None, None) => core::leave_one_out(&data, &model.inner, &config).map_err(err)?,
-    };
+    let cv = py.allow_threads(|| match (blocks, folds) {
+        (Some((nx, ny)), _) => core::block_cv(&data, &model.inner, &config, [nx, ny]).map_err(err),
+        (None, Some(k)) => core::k_fold(&data, &model.inner, &config, k, seed).map_err(err),
+        (None, None) => core::leave_one_out(&data, &model.inner, &config).map_err(err),
+    })?;
     let out = PyDict::new(py);
     out.set_item("me", cv.mean_error())?;
     out.set_item("mae", cv.mae())?;
@@ -594,8 +666,8 @@ fn loo_cv(
     out.set_item("rrmse", cv.rrmse())?;
     out.set_item("vecv", cv.vecv())?;
     out.set_item("e1", cv.e1())?;
-    out.set_item("predicted", &cv.predicted)?;
-    out.set_item("variance", &cv.variance)?;
+    out.set_item("predicted", arr1(py, cv.predicted))?;
+    out.set_item("variance", arr1(py, cv.variance))?;
     Ok(out.into())
 }
 
@@ -695,25 +767,28 @@ fn regression_kriging(
         }
     };
 
-    let rk = RegressionKriging::new(&data, &trend_data).map_err(err)?;
-    let cfg = vario_config(rk.residuals(), n_lags, max_dist, None, 0.0, 22.5);
-    let ev = core::experimental_variogram(rk.residuals(), &cfg).map_err(err)?;
-    let resid_model = core::fit_best(&ev, &core::ModelKind::ALL)
-        .map_err(err)?
-        .model;
     let config = KrigingConfig {
         method: KrigingMethod::Ordinary,
         max_neighbors,
         search_radius: radius,
         ..Default::default()
     };
-    let ests = rk
-        .predict(&targets, &trend_targets, &resid_model, &config)
-        .map_err(err)?;
-    let prediction: Vec<f64> = ests.iter().map(|e| e.value).collect();
-    let variance: Vec<f64> = ests.iter().map(|e| e.variance).collect();
-    out.set_item("prediction", prediction)?;
-    out.set_item("variance", variance)?;
+    let (prediction, variance) = py.allow_threads(|| {
+        let rk = RegressionKriging::new(&data, &trend_data).map_err(err)?;
+        let cfg = vario_config(rk.residuals(), n_lags, max_dist, None, 0.0, 22.5);
+        let ev = core::experimental_variogram(rk.residuals(), &cfg).map_err(err)?;
+        let resid_model = core::fit_best(&ev, &core::ModelKind::ALL)
+            .map_err(err)?
+            .model;
+        let ests = rk
+            .predict(&targets, &trend_targets, &resid_model, &config)
+            .map_err(err)?;
+        let prediction: Vec<f64> = ests.iter().map(|e| e.value).collect();
+        let variance: Vec<f64> = ests.iter().map(|e| e.variance).collect();
+        Ok::<_, PyErr>((prediction, variance))
+    })?;
+    out.set_item("prediction", arr1(py, prediction))?;
+    out.set_item("variance", arr1(py, variance))?;
     Ok(out.into())
 }
 
@@ -731,6 +806,7 @@ fn regression_kriging(
     n_lags = 15, max_dist = None, max_neighbors = None, radius = None, ridge = 0.0))]
 #[allow(clippy::too_many_arguments)]
 fn co_kriging(
+    gil: Python<'_>,
     px: Vec<f64>,
     py: Vec<f64>,
     pv: Vec<f64>,
@@ -744,7 +820,7 @@ fn co_kriging(
     max_neighbors: Option<usize>,
     radius: Option<f64>,
     ridge: f64,
-) -> PyResult<(Vec<f64>, Vec<f64>)> {
+) -> PyResult<ArrayPair> {
     if target_x.len() != target_y.len() {
         return Err(PyValueError::new_err(
             "target_x and target_y differ in length",
@@ -752,22 +828,25 @@ fn co_kriging(
     }
     let primary = point_set(px, py, pv)?;
     let secondary = point_set(sx, sy, sv)?;
-    let cfg = vario_config(&primary, n_lags, max_dist, None, 0.0, 22.5);
-    let lmc =
-        core::fit_lmc_collocated(&primary, &secondary, &cfg, &core::ModelKind::ALL).map_err(err)?;
-    let config = core::CoKrigingConfig {
-        max_neighbors,
-        search_radius: radius,
-        ridge,
-    };
-    let ck = core::CoKriging::new(vec![&primary, &secondary], &lmc, config).map_err(err)?;
     let targets: Vec<[f64; 2]> = target_x
         .iter()
         .zip(&target_y)
         .map(|(&a, &b)| [a, b])
         .collect();
-    let ests = ck.predict_many(&targets);
-    Ok(ests.into_iter().map(|e| (e.value, e.variance)).unzip())
+    let (values, variances) = gil.allow_threads(|| {
+        let cfg = vario_config(&primary, n_lags, max_dist, None, 0.0, 22.5);
+        let lmc = core::fit_lmc_collocated(&primary, &secondary, &cfg, &core::ModelKind::ALL)
+            .map_err(err)?;
+        let config = core::CoKrigingConfig {
+            max_neighbors,
+            search_radius: radius,
+            ridge,
+        };
+        let ck = core::CoKriging::new(vec![&primary, &secondary], &lmc, config).map_err(err)?;
+        let ests = ck.predict_many(&targets);
+        Ok::<_, PyErr>(ests.into_iter().map(|e| (e.value, e.variance)).unzip())
+    })?;
+    Ok((arr1(gil, values), arr1(gil, variances)))
 }
 
 /// Inverse-distance weighting at the targets. `power` controls locality
@@ -777,6 +856,7 @@ fn co_kriging(
     max_neighbors = None, radius = None))]
 #[allow(clippy::too_many_arguments)]
 fn idw(
+    py: Python<'_>,
     x: Vec<f64>,
     y: Vec<f64>,
     values: Vec<f64>,
@@ -785,7 +865,7 @@ fn idw(
     power: f64,
     max_neighbors: Option<usize>,
     radius: Option<f64>,
-) -> PyResult<Vec<f64>> {
+) -> PyResult<Py<PyArray1<f64>>> {
     if target_x.len() != target_y.len() {
         return Err(PyValueError::new_err(
             "target_x and target_y differ in length",
@@ -797,15 +877,20 @@ fn idw(
         .zip(&target_y)
         .map(|(&a, &b)| [a, b])
         .collect();
-    let pred = core::Idw::new(&data, power, max_neighbors, radius).map_err(err)?;
-    Ok(pred.predict_many(&targets))
+    let pred = py.allow_threads(|| {
+        let pred = core::Idw::new(&data, power, max_neighbors, radius).map_err(err)?;
+        Ok::<_, PyErr>(pred.predict_many(&targets))
+    })?;
+    Ok(arr1(py, pred))
 }
 
 /// k-nearest-neighbor averaging at the targets (`k = 1` is nearest-neighbor).
 /// Returns a list of predictions.
 #[pyfunction]
 #[pyo3(signature = (x, y, values, target_x, target_y, k = 8, radius = None))]
+#[allow(clippy::too_many_arguments)]
 fn knn(
+    py: Python<'_>,
     x: Vec<f64>,
     y: Vec<f64>,
     values: Vec<f64>,
@@ -813,7 +898,7 @@ fn knn(
     target_y: Vec<f64>,
     k: usize,
     radius: Option<f64>,
-) -> PyResult<Vec<f64>> {
+) -> PyResult<Py<PyArray1<f64>>> {
     if target_x.len() != target_y.len() {
         return Err(PyValueError::new_err(
             "target_x and target_y differ in length",
@@ -825,8 +910,11 @@ fn knn(
         .zip(&target_y)
         .map(|(&a, &b)| [a, b])
         .collect();
-    let pred = core::Knn::new(&data, k, radius).map_err(err)?;
-    Ok(pred.predict_many(&targets))
+    let pred = py.allow_threads(|| {
+        let pred = core::Knn::new(&data, k, radius).map_err(err)?;
+        Ok::<_, PyErr>(pred.predict_many(&targets))
+    })?;
+    Ok(arr1(py, pred))
 }
 
 /// Compares interpolation methods by leave-one-out cross-validation, ranked by
@@ -849,11 +937,6 @@ fn compare_methods(
     knn_k: usize,
 ) -> PyResult<Py<PyDict>> {
     let data = point_set(x, y, values)?;
-    let cfg = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
-    let ev = core::experimental_variogram(&data, &cfg).map_err(err)?;
-    let model = core::fit_best(&ev, &core::ModelKind::ALL)
-        .map_err(err)?
-        .model;
     let ok_config = KrigingConfig {
         method: KrigingMethod::Ordinary,
         max_neighbors,
@@ -861,24 +944,31 @@ fn compare_methods(
         ..Default::default()
     };
 
-    let entries = [
-        (
-            "ordinary_kriging".to_string(),
-            core::leave_one_out(&data, &model, &ok_config).map_err(err)?,
-        ),
-        (
-            "idw".to_string(),
-            core::idw_cross_validate(&data, idw_power, max_neighbors, radius).map_err(err)?,
-        ),
-        (
-            "knn".to_string(),
-            core::knn_cross_validate(&data, knn_k, radius).map_err(err)?,
-        ),
-        (
-            "nearest_neighbor".to_string(),
-            core::knn_cross_validate(&data, 1, radius).map_err(err)?,
-        ),
-    ];
+    let entries = py.allow_threads(|| {
+        let cfg = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
+        let ev = core::experimental_variogram(&data, &cfg).map_err(err)?;
+        let model = core::fit_best(&ev, &core::ModelKind::ALL)
+            .map_err(err)?
+            .model;
+        Ok::<_, PyErr>([
+            (
+                "ordinary_kriging".to_string(),
+                core::leave_one_out(&data, &model, &ok_config).map_err(err)?,
+            ),
+            (
+                "idw".to_string(),
+                core::idw_cross_validate(&data, idw_power, max_neighbors, radius).map_err(err)?,
+            ),
+            (
+                "knn".to_string(),
+                core::knn_cross_validate(&data, knn_k, radius).map_err(err)?,
+            ),
+            (
+                "nearest_neighbor".to_string(),
+                core::knn_cross_validate(&data, 1, radius).map_err(err)?,
+            ),
+        ])
+    })?;
 
     let out = PyDict::new(py);
     for (name, cv) in &entries {
@@ -907,7 +997,9 @@ fn tune_idw_power(
     radius: Option<f64>,
 ) -> PyResult<Py<PyDict>> {
     let data = point_set(x, y, values)?;
-    let res = core::tune_idw_power(&data, &powers, max_neighbors, radius).map_err(err)?;
+    let res =
+        py.allow_threads(|| core::tune_idw_power(&data, &powers, max_neighbors, radius))
+            .map_err(err)?;
     let out = PyDict::new(py);
     out.set_item("best", res.best)?;
     out.set_item("best_vecv", res.best_vecv)?;
@@ -928,7 +1020,7 @@ fn tune_knn_k(
     radius: Option<f64>,
 ) -> PyResult<Py<PyDict>> {
     let data = point_set(x, y, values)?;
-    let res = core::tune_knn_k(&data, &ks, radius).map_err(err)?;
+    let res = py.allow_threads(|| core::tune_knn_k(&data, &ks, radius)).map_err(err)?;
     let out = PyDict::new(py);
     out.set_item("best", res.best)?;
     out.set_item("best_vecv", res.best_vecv)?;
@@ -954,14 +1046,15 @@ fn tune_kriging_neighbors(
     radius: Option<f64>,
 ) -> PyResult<Py<PyDict>> {
     let data = point_set(x, y, values)?;
-    let cfg = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
-    let ev = core::experimental_variogram(&data, &cfg).map_err(err)?;
-    let model = core::fit_best(&ev, &core::ModelKind::ALL)
-        .map_err(err)?
-        .model;
-    let res =
+    let res = py.allow_threads(|| {
+        let cfg = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
+        let ev = core::experimental_variogram(&data, &cfg).map_err(err)?;
+        let model = core::fit_best(&ev, &core::ModelKind::ALL)
+            .map_err(err)?
+            .model;
         core::tune_kriging_neighbors(&data, &model, KrigingMethod::Ordinary, &candidates, radius)
-            .map_err(err)?;
+            .map_err(err)
+    })?;
     let out = PyDict::new(py);
     out.set_item("best", res.best)?;
     out.set_item("best_vecv", res.best_vecv)?;
@@ -999,32 +1092,73 @@ fn decluster_weights(
     minimize: bool,
 ) -> PyResult<Py<PyDict>> {
     let data = point_set(x, y, values)?;
+    enum Res {
+        Cell {
+            weights: Vec<f64>,
+            size: f64,
+            mean: f64,
+        },
+        Scan {
+            weights: Vec<f64>,
+            size: f64,
+            mean: f64,
+            trace: Vec<(f64, f64)>,
+        },
+    }
+    let res = py.allow_threads(|| -> PyResult<Res> {
+        match cell_size {
+            Some(size) => {
+                let w = core::cell_declustering_weights(&data, size, n_offsets).map_err(err)?;
+                let mean = w
+                    .iter()
+                    .zip(data.values())
+                    .map(|(&wi, &v)| wi * v)
+                    .sum::<f64>()
+                    / data.len() as f64;
+                Ok(Res::Cell {
+                    weights: w,
+                    size,
+                    mean,
+                })
+            }
+            None => {
+                let (min, max) = data.bbox();
+                let diag = ((max[0] - min[0]).powi(2) + (max[1] - min[1]).powi(2)).sqrt();
+                let lo = min_size.unwrap_or(diag / 50.0);
+                let hi = max_size.unwrap_or(diag / 5.0);
+                let scan = core::decluster_scan(&data, lo, hi, n_sizes, n_offsets, minimize)
+                    .map_err(err)?;
+                Ok(Res::Scan {
+                    weights: scan.weights,
+                    size: scan.best_size,
+                    mean: scan.best_mean,
+                    trace: scan.trace,
+                })
+            }
+        }
+    })?;
     let out = PyDict::new(py);
-    match cell_size {
-        Some(size) => {
-            let w = core::cell_declustering_weights(&data, size, n_offsets).map_err(err)?;
-            let mean = w
-                .iter()
-                .zip(data.values())
-                .map(|(&wi, &v)| wi * v)
-                .sum::<f64>()
-                / data.len() as f64;
-            out.set_item("weights", w)?;
+    match res {
+        Res::Cell {
+            weights,
+            size,
+            mean,
+        } => {
+            out.set_item("weights", arr1(py, weights))?;
             out.set_item("cell_size", size)?;
             out.set_item("declustered_mean", mean)?;
             out.set_item("trace", Vec::<(f64, f64)>::new())?;
         }
-        None => {
-            let (min, max) = data.bbox();
-            let diag = ((max[0] - min[0]).powi(2) + (max[1] - min[1]).powi(2)).sqrt();
-            let lo = min_size.unwrap_or(diag / 50.0);
-            let hi = max_size.unwrap_or(diag / 5.0);
-            let scan =
-                core::decluster_scan(&data, lo, hi, n_sizes, n_offsets, minimize).map_err(err)?;
-            out.set_item("weights", scan.weights)?;
-            out.set_item("cell_size", scan.best_size)?;
-            out.set_item("declustered_mean", scan.best_mean)?;
-            out.set_item("trace", scan.trace)?;
+        Res::Scan {
+            weights,
+            size,
+            mean,
+            trace,
+        } => {
+            out.set_item("weights", arr1(py, weights))?;
+            out.set_item("cell_size", size)?;
+            out.set_item("declustered_mean", mean)?;
+            out.set_item("trace", trace)?;
         }
     }
     Ok(out.into())
@@ -1047,6 +1181,7 @@ fn decluster_weights(
     decluster_cell = None, max_node_neighbors = None, multigrid = 0))]
 #[allow(clippy::too_many_arguments)]
 fn sgs(
+    py: Python<'_>,
     x: Vec<f64>,
     y: Vec<f64>,
     values: Vec<f64>,
@@ -1065,31 +1200,35 @@ fn sgs(
     decluster_cell: Option<f64>,
     max_node_neighbors: Option<usize>,
     multigrid: u8,
-) -> PyResult<Vec<Vec<f64>>> {
+) -> PyResult<Py<PyArray2<f64>>> {
     let data = point_set(x, y, values)?;
     let grid = Grid2D::from_bbox([bbox.0, bbox.1], [bbox.2, bbox.3], nx, ny).map_err(err)?;
     let decluster_weights = match decluster_cell {
         Some(size) => Some(core::cell_declustering_weights(&data, size, 4).map_err(err)?),
         None => None,
     };
+    let tails = core::Tails {
+        lower: parse_tail(lower_tail)?,
+        upper: parse_tail(upper_tail)?,
+        lower_bound: zmin,
+        upper_bound: zmax,
+    };
     let cfg = SgsConfig {
         n_realizations,
         seed,
         max_neighbors,
         search_radius: radius,
-        tails: core::Tails {
-            lower: parse_tail(lower_tail)?,
-            upper: parse_tail(upper_tail)?,
-            lower_bound: zmin,
-            upper_bound: zmax,
-        },
+        tails,
         decluster_weights,
         max_node_neighbors,
         multigrid,
     };
-    let res =
-        core::sequential_gaussian_simulation(&data, &model_ns.inner, &grid, &cfg).map_err(err)?;
-    Ok(res.realizations)
+    let realizations = py.allow_threads(|| {
+        core::sequential_gaussian_simulation(&data, &model_ns.inner, &grid, &cfg)
+            .map_err(err)
+            .map(|res| res.realizations)
+    })?;
+    arr2(py, realizations)
 }
 
 /// Conditional sequential indicator simulation. Indicator variogram models
@@ -1107,6 +1246,7 @@ fn sgs(
     mik = false, ordinary = false))]
 #[allow(clippy::too_many_arguments)]
 fn sis(
+    py: Python<'_>,
     x: Vec<f64>,
     y: Vec<f64>,
     values: Vec<f64>,
@@ -1126,7 +1266,7 @@ fn sis(
     tail_max: Option<f64>,
     mik: bool,
     ordinary: bool,
-) -> PyResult<Vec<Vec<f64>>> {
+) -> PyResult<Py<PyArray2<f64>>> {
     let data = point_set(x, y, values)?;
     let grid = Grid2D::from_bbox([bbox.0, bbox.1], [bbox.2, bbox.3], nx, ny).map_err(err)?;
     let cfg_v = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
@@ -1136,6 +1276,8 @@ fn sis(
     } else {
         core::fit_indicator_models(&data, &cutoffs, &kinds, &cfg_v).map_err(err)?
     };
+    let lower_tail = parse_tail(ltail)?;
+    let upper_tail = parse_tail(utail)?;
     let cfg = SisConfig {
         cutoffs,
         models,
@@ -1146,11 +1288,15 @@ fn sis(
         search_radius: radius,
         tail_min,
         tail_max,
-        lower_tail: parse_tail(ltail)?,
-        upper_tail: parse_tail(utail)?,
+        lower_tail,
+        upper_tail,
     };
-    let res = core::sequential_indicator_simulation(&data, &grid, &cfg).map_err(err)?;
-    Ok(res.realizations)
+    let realizations = py.allow_threads(|| {
+        core::sequential_indicator_simulation(&data, &grid, &cfg)
+            .map_err(err)
+            .map(|res| res.realizations)
+    })?;
+    arr2(py, realizations)
 }
 
 /// 3-D experimental semivariogram. Returns `(h, gamma, n_pairs)` lists.
@@ -1161,6 +1307,7 @@ fn sis(
     azimuth = None, dip = 0.0, tolerance = 22.5))]
 #[allow(clippy::too_many_arguments)]
 fn experimental_variogram_3d(
+    py: Python<'_>,
     x: Vec<f64>,
     y: Vec<f64>,
     z: Vec<f64>,
@@ -1172,23 +1319,27 @@ fn experimental_variogram_3d(
     tolerance: f64,
 ) -> PyResult<(Vec<f64>, Vec<f64>, Vec<usize>)> {
     let data = point_set_3d(x, y, z, values)?;
-    let cfg = vario_config(&data, n_lags, max_dist, azimuth, dip, tolerance);
-    let ev = core::experimental_variogram(&data, &cfg).map_err(err)?;
-    let mut h = Vec::new();
-    let mut gamma = Vec::new();
-    let mut np = Vec::new();
-    for b in &ev.bins {
-        h.push(b.h);
-        gamma.push(b.gamma);
-        np.push(b.n_pairs);
-    }
-    Ok((h, gamma, np))
+    py.allow_threads(|| {
+        let cfg = vario_config(&data, n_lags, max_dist, azimuth, dip, tolerance);
+        let ev = core::experimental_variogram(&data, &cfg).map_err(err)?;
+        let mut h = Vec::new();
+        let mut gamma = Vec::new();
+        let mut np = Vec::new();
+        for b in &ev.bins {
+            h.push(b.h);
+            gamma.push(b.gamma);
+            np.push(b.n_pairs);
+        }
+        Ok((h, gamma, np))
+    })
 }
 
 /// Fits a variogram model to 3-D data by weighted least squares.
 #[pyfunction]
 #[pyo3(signature = (x, y, z, values, n_lags = 15, max_dist = None, kinds = "best"))]
+#[allow(clippy::too_many_arguments)]
 fn fit_variogram_3d(
+    py: Python<'_>,
     x: Vec<f64>,
     y: Vec<f64>,
     z: Vec<f64>,
@@ -1198,9 +1349,12 @@ fn fit_variogram_3d(
     kinds: &str,
 ) -> PyResult<VariogramModel> {
     let data = point_set_3d(x, y, z, values)?;
-    let cfg = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
-    let ev = core::experimental_variogram(&data, &cfg).map_err(err)?;
-    let fit = core::fit_best(&ev, &parse_kinds(kinds)?).map_err(err)?;
+    let kinds = parse_kinds(kinds)?;
+    let fit = py.allow_threads(|| {
+        let cfg = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
+        let ev = core::experimental_variogram(&data, &cfg).map_err(err)?;
+        core::fit_best(&ev, &kinds).map_err(err)
+    })?;
     Ok(VariogramModel { inner: fit.model })
 }
 
@@ -1212,6 +1366,7 @@ fn fit_variogram_3d(
     method = "ordinary", mean = None, degree = 1, max_neighbors = None, radius = None))]
 #[allow(clippy::too_many_arguments)]
 fn krige_3d(
+    py: Python<'_>,
     x: Vec<f64>,
     y: Vec<f64>,
     z: Vec<f64>,
@@ -1225,7 +1380,7 @@ fn krige_3d(
     degree: u8,
     max_neighbors: Option<usize>,
     radius: Option<f64>,
-) -> PyResult<(Vec<f64>, Vec<f64>)> {
+) -> PyResult<ArrayPair> {
     if target_x.len() != target_y.len() || target_x.len() != target_z.len() {
         return Err(PyValueError::new_err(
             "target_x, target_y and target_z differ in length",
@@ -1250,15 +1405,18 @@ fn krige_3d(
         search_radius: radius,
         ..Default::default()
     };
-    let kriging: Kriging<'_, 3> = Kriging::new(&data, &model.inner, config).map_err(err)?;
     let targets: Vec<[f64; 3]> = target_x
         .into_iter()
         .zip(target_y)
         .zip(target_z)
         .map(|((tx, ty), tz)| [tx, ty, tz])
         .collect();
-    let ests = kriging.predict_many(&targets);
-    Ok(ests.into_iter().map(|e| (e.value, e.variance)).unzip())
+    let (values, variances) = py.allow_threads(|| {
+        let kriging: Kriging<'_, 3> = Kriging::new(&data, &model.inner, config).map_err(err)?;
+        let ests = kriging.predict_many(&targets);
+        Ok::<_, PyErr>(ests.into_iter().map(|e| (e.value, e.variance)).unzip())
+    })?;
+    Ok((arr1(py, values), arr1(py, variances)))
 }
 
 /// Indicator kriging at arbitrary target locations. Returns a dict with
@@ -1299,37 +1457,42 @@ fn indicator_kriging(
         ));
     }
     let data = point_set(x, y, values)?;
-    let cfg_v = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
-    let kinds = [core::ModelKind::Spherical, core::ModelKind::Exponential];
-    let models = if mik {
-        core::fit_median_indicator_model(&data, &cutoffs, &kinds, &cfg_v).map_err(err)?
-    } else {
-        core::fit_indicator_models(&data, &cutoffs, &kinds, &cfg_v).map_err(err)?
-    };
-    let cfg = core::IkConfig {
-        cutoffs,
-        models,
-        ordinary,
-        max_neighbors,
-        search_radius: radius,
-        tail_min,
-        tail_max,
-        lower_tail: parse_tail(ltail)?,
-        upper_tail: parse_tail(utail)?,
-    };
+    let lower_tail = parse_tail(ltail)?;
+    let upper_tail = parse_tail(utail)?;
     let targets: Vec<[f64; 2]> = target_x
         .into_iter()
         .zip(target_y)
         .map(|(tx, ty)| [tx, ty])
         .collect();
-    let ests = core::indicator_kriging(&data, &targets, &cfg).map_err(err)?;
+    let (ccdf, e_type, cond_var) = py.allow_threads(|| {
+        let cfg_v = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
+        let kinds = [core::ModelKind::Spherical, core::ModelKind::Exponential];
+        let models = if mik {
+            core::fit_median_indicator_model(&data, &cutoffs, &kinds, &cfg_v).map_err(err)?
+        } else {
+            core::fit_indicator_models(&data, &cutoffs, &kinds, &cfg_v).map_err(err)?
+        };
+        let cfg = core::IkConfig {
+            cutoffs,
+            models,
+            ordinary,
+            max_neighbors,
+            search_radius: radius,
+            tail_min,
+            tail_max,
+            lower_tail,
+            upper_tail,
+        };
+        let ests = core::indicator_kriging(&data, &targets, &cfg).map_err(err)?;
+        let ccdf: Vec<Vec<f64>> = ests.iter().map(|e| e.ccdf.clone()).collect();
+        let e_type: Vec<f64> = ests.iter().map(|e| e.e_type).collect();
+        let cond_var: Vec<f64> = ests.iter().map(|e| e.cond_var).collect();
+        Ok::<_, PyErr>((ccdf, e_type, cond_var))
+    })?;
     let out = PyDict::new(py);
-    let ccdf: Vec<Vec<f64>> = ests.iter().map(|e| e.ccdf.clone()).collect();
-    let e_type: Vec<f64> = ests.iter().map(|e| e.e_type).collect();
-    let cond_var: Vec<f64> = ests.iter().map(|e| e.cond_var).collect();
-    out.set_item("ccdf", ccdf)?;
-    out.set_item("e_type", e_type)?;
-    out.set_item("cond_var", cond_var)?;
+    out.set_item("ccdf", arr2(py, ccdf)?)?;
+    out.set_item("e_type", arr1(py, e_type))?;
+    out.set_item("cond_var", arr1(py, cond_var))?;
     Ok(out.into())
 }
 #[pymodule]

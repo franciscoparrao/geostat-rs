@@ -726,4 +726,20 @@ mod tests {
         bad.models.pop();
         assert!(sequential_indicator_simulation(&data, &grid, &bad).is_err());
     }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn order_corrections_are_always_monotone_and_bounded(
+                mut raw in prop::collection::vec(-5.0f64..5.0, 1..15),
+            ) {
+                order_corrections(&mut raw);
+                prop_assert!(raw.windows(2).all(|w| w[0] <= w[1] + 1e-12), "{raw:?}");
+                prop_assert!(raw.iter().all(|&f| (0.0..=1.0).contains(&f)), "{raw:?}");
+            }
+        }
+    }
 }

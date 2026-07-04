@@ -275,4 +275,40 @@ mod tests {
         // Weights sum to 1 (unbiasedness row).
         assert!((x[0] + x[1] - 1.0).abs() < 1e-12);
     }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// A random well-conditioned SPD system `(A, b)`: `A = MᵀM +
+        /// 0.5·I` is SPD for any `M` (Gram matrix plus a positive diagonal
+        /// shift keeps it away from singular), so `solve` should always
+        /// succeed and reproduce `b`.
+        fn spd_system() -> impl Strategy<Value = (Array2<f64>, Vec<f64>)> {
+            (2usize..6).prop_flat_map(|n| {
+                (
+                    prop::collection::vec(-2.0f64..2.0, n * n),
+                    prop::collection::vec(-5.0f64..5.0, n),
+                    Just(n),
+                )
+                    .prop_map(|(raw, b, n)| {
+                        let m = Array2::from_shape_vec((n, n), raw).unwrap();
+                        let a = m.t().dot(&m) + Array2::<f64>::eye(n) * 0.5;
+                        (a, b)
+                    })
+            })
+        }
+
+        proptest! {
+            #[test]
+            fn solve_reproduces_the_right_hand_side((a, b) in spd_system()) {
+                let n = b.len();
+                let x = solve(a.clone(), b.clone()).unwrap();
+                for i in 0..n {
+                    let r: f64 = (0..n).map(|j| a[[i, j]] * x[j]).sum::<f64>() - b[i];
+                    prop_assert!(r.abs() < 1e-6, "residual {r} at row {i}");
+                }
+            }
+        }
+    }
 }

@@ -27,6 +27,7 @@ bench = false
 
 [dev-dependencies]
 criterion = "0.5"
+proptest = "1"
 
 [[bench]]
 name = "engine"

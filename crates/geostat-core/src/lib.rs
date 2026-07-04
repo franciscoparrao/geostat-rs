@@ -45,6 +45,7 @@
 
 pub mod cokriging;
 pub mod collocated;
+pub mod covariance;
 pub mod data;
 pub mod declustering;
 pub mod error;
@@ -70,6 +71,7 @@ pub mod vecchia;
 
 pub use cokriging::{CoKriging, CoKrigingConfig, Lmc, LmcStructure, fit_lmc, fit_lmc_collocated};
 pub use collocated::{CollocatedCokriging, CollocatedConfig, MarkovModel, estimate_collocated_stats};
+pub use covariance::Covariance;
 pub use data::PointSet;
 pub use declustering::{DeclusterScan, cell_declustering_weights, decluster_scan};
 pub use error::{GeostatError, Result};
