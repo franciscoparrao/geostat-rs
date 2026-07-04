@@ -7,13 +7,16 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+# A cdylib Python extension module has no use as a crates.io library crate;
+# it ships to PyPI instead (see pyproject.toml / `maturin build`).
+publish = false
 
 [lib]
 name = "geostat_rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-geostat-core = { path = "../geostat-core" }
+geostat-core = { path = "../geostat-core", version = "0.7.0" }
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
 numpy = "0.23"
 serde_json = { workspace = true }

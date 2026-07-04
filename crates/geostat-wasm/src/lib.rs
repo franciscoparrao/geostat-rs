@@ -123,13 +123,14 @@ pub fn sgs_grid(
     let parsed: VariogramModel = serde_json::from_str(model_ns_json).map_err(err)?;
     let model = VariogramModel::new(parsed.nugget, parsed.structures).map_err(err)?;
     let grid = Grid2D::from_bbox([xmin, ymin], [xmax, ymax], nx, ny).map_err(err)?;
-    let cfg = SgsConfig {
-        n_realizations,
-        seed,
-        max_neighbors: max_neighbors.max(1),
-        search_radius: None,
-        ..Default::default()
-    };
+    // `SgsConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields rather than a struct expression (not allowed for
+    // non_exhaustive structs from another crate, even with `..base`).
+    let mut cfg = SgsConfig::default();
+    cfg.n_realizations = n_realizations;
+    cfg.seed = seed;
+    cfg.max_neighbors = max_neighbors.max(1);
+    cfg.search_radius = None;
     let res = sequential_gaussian_simulation(&data, &model, &grid, &cfg).map_err(err)?;
     Ok(res.realizations.into_iter().flatten().collect())
 }

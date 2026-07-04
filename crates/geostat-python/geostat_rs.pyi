@@ -13,6 +13,8 @@ import numpy.typing as npt
 
 FloatArray = npt.NDArray[np.float64]
 
+__version__: str
+
 class VariogramModel:
     """A fitted variogram model (JSON-compatible with the geostat CLI)."""
 
@@ -55,11 +57,12 @@ def variogram_map(
     y: Sequence[float],
     values: Sequence[float],
     n_lags: int = 15,
-    lag_width: float = 1.0,
+    lag_width: Optional[float] = None,
 ) -> dict[str, Any]:
     """2-D variogram map (lag-space semivariance surface). Returns a dict
     with ``size``, ``lag_width``, and flat row-major lists ``hx``, ``hy``,
-    ``gamma``, ``n_pairs``."""
+    ``gamma``, ``n_pairs``. ``lag_width`` defaults to a fifteenth of the
+    data's bounding-box half-diagonal when omitted."""
 
 def fit_variogram(
     x: Sequence[float],
@@ -218,7 +221,8 @@ def loo_cv(
 ) -> dict[str, Any]:
     """Cross-validation (leave-one-out by default; ``folds``/``blocks`` for
     k-fold or spatial block CV). Returns a dict with ``me``, ``mae``,
-    ``rmse``, ``msdr``, ``vecv``, ``e1``, ``predicted`` and ``variance``."""
+    ``rmse``, ``msdr``, ``vecv``, ``e1``, ``observed``, ``predicted`` and
+    ``variance``."""
 
 def accuracy_plot(
     actual: Sequence[float],
@@ -362,8 +366,8 @@ def sgs(
     seed: int = 42,
     max_neighbors: int = 16,
     radius: Optional[float] = None,
-    lower_tail: str = "none",
-    upper_tail: str = "none",
+    ltail: str = "none",
+    utail: str = "none",
     zmin: Optional[float] = None,
     zmax: Optional[float] = None,
     decluster_cell: Optional[float] = None,
@@ -387,6 +391,7 @@ def sis(
     radius: Optional[float] = None,
     n_lags: int = 15,
     max_dist: Optional[float] = None,
+    fit: str = "spherical,exponential",
     ltail: str = "linear",
     utail: str = "linear",
     tail_min: Optional[float] = None,
@@ -395,7 +400,9 @@ def sis(
     ordinary: bool = False,
 ) -> FloatArray:
     """Conditional sequential indicator simulation. Returns an
-    ``n_realizations x n_cells`` array, one row per realization."""
+    ``n_realizations x n_cells`` array, one row per realization. ``fit`` is
+    a comma-separated list of candidate variogram families for the
+    per-cutoff auto-fit (e.g. "spherical,exponential,matern:1.5")."""
 
 def experimental_variogram_3d(
     x: Sequence[float],
@@ -451,6 +458,7 @@ def indicator_kriging(
     radius: Optional[float] = None,
     n_lags: int = 15,
     max_dist: Optional[float] = None,
+    fit: str = "spherical,exponential",
     ltail: str = "linear",
     utail: str = "linear",
     tail_min: Optional[float] = None,
@@ -460,4 +468,5 @@ def indicator_kriging(
 ) -> dict[str, Any]:
     """Indicator kriging at arbitrary target locations. Returns a dict with
     ``ccdf`` (``n_targets x n_cutoffs`` array), ``e_type`` and
-    ``cond_var``."""
+    ``cond_var``. ``fit`` is a comma-separated list of candidate variogram
+    families for the per-cutoff auto-fit."""

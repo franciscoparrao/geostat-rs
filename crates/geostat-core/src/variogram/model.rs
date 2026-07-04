@@ -27,7 +27,7 @@ pub const MATERN_NU_MAX: f64 = 50.0;
 /// evaluation (cheaper, no quadrature); [`ModelKind::Matern`] covers any
 /// other real `ν > 0` via the general correlation `(2^{1-ν}/Γ(ν)) (√(2ν) d)^ν
 /// K_ν(√(2ν) d)` (`K_ν` the modified Bessel function of the second kind, see
-/// [`super::bessel`]) and agrees with the closed forms at ν = 1.5/2.5 to
+/// the `bessel` module) and agrees with the closed forms at ν = 1.5/2.5 to
 /// within quadrature error (~1e-9, see
 /// `tests::matern_matches_closed_form_special_cases`).
 ///
@@ -140,8 +140,9 @@ impl ModelKind {
                     0.0
                 } else {
                     let s = (2.0 * nu).sqrt() * d;
-                    let corr =
-                        2f64.powf(1.0 - nu) / bessel::gamma(nu) * s.powf(nu) * bessel::bessel_k(nu, s);
+                    let corr = 2f64.powf(1.0 - nu) / bessel::gamma(nu)
+                        * s.powf(nu)
+                        * bessel::bessel_k(nu, s);
                     1.0 - corr
                 }
             }
@@ -509,32 +510,35 @@ impl VariogramModel {
                 )));
             }
             if let ModelKind::Matern(nu) = s.kind
-                && (!(nu > 0.0) || nu > MATERN_NU_MAX) {
-                    // AUDIT-2026-07-v2.md §1.8: beyond ~171.6, `Gamma(nu)`
-                    // overflows to `inf` (bessel::gamma's Lanczos
-                    // approximation has no overflow guard) and
-                    // `2^(1-nu)` underflows to `0`, so the correlation
-                    // silently evaluates to NaN for a model this
-                    // constructor accepted as valid. MATERN_NU_MAX keeps a
-                    // wide margin below that (and below Matern-family
-                    // practical identifiability: nu this large is already
-                    // indistinguishable from Gaussian in f64).
-                    return Err(GeostatError::InvalidParameter(format!(
-                        "Matern nu must be finite, > 0 and <= {MATERN_NU_MAX}, got {nu}"
-                    )));
-                }
+                && (!(nu > 0.0) || nu > MATERN_NU_MAX)
+            {
+                // AUDIT-2026-07-v2.md §1.8: beyond ~171.6, `Gamma(nu)`
+                // overflows to `inf` (bessel::gamma's Lanczos
+                // approximation has no overflow guard) and
+                // `2^(1-nu)` underflows to `0`, so the correlation
+                // silently evaluates to NaN for a model this
+                // constructor accepted as valid. MATERN_NU_MAX keeps a
+                // wide margin below that (and below Matern-family
+                // practical identifiability: nu this large is already
+                // indistinguishable from Gaussian in f64).
+                return Err(GeostatError::InvalidParameter(format!(
+                    "Matern nu must be finite, > 0 and <= {MATERN_NU_MAX}, got {nu}"
+                )));
+            }
             if let ModelKind::Stable(alpha) = s.kind
-                && (!(alpha > 0.0) || alpha > 2.0) {
-                    return Err(GeostatError::InvalidParameter(format!(
-                        "Stable alpha must be in (0, 2], got {alpha}"
-                    )));
-                }
+                && (!(alpha > 0.0) || alpha > 2.0)
+            {
+                return Err(GeostatError::InvalidParameter(format!(
+                    "Stable alpha must be in (0, 2], got {alpha}"
+                )));
+            }
             if let ModelKind::Power(theta) = s.kind
-                && (!(theta > 0.0) || theta >= 2.0) {
-                    return Err(GeostatError::InvalidParameter(format!(
-                        "Power theta must be in (0, 2), got {theta}"
-                    )));
-                }
+                && (!(theta > 0.0) || theta >= 2.0)
+            {
+                return Err(GeostatError::InvalidParameter(format!(
+                    "Power theta must be in (0, 2), got {theta}"
+                )));
+            }
             if let Some(a) = s.anis {
                 // ratio > 1 is valid (zonal anisotropy: the orthogonal axis
                 // is longer than the labeled one; see `Anisotropy` docs) --
@@ -729,13 +733,20 @@ mod tests {
         assert!(
             VariogramModel::new(
                 0.0,
-                vec![Structure::new(ModelKind::Matern(MATERN_NU_MAX + 1.0), 1.0, 10.0)]
+                vec![Structure::new(
+                    ModelKind::Matern(MATERN_NU_MAX + 1.0),
+                    1.0,
+                    10.0
+                )]
             )
             .is_err()
         );
         assert!(
-            VariogramModel::new(0.0, vec![Structure::new(ModelKind::Matern(200.0), 1.0, 10.0)])
-                .is_err()
+            VariogramModel::new(
+                0.0,
+                vec![Structure::new(ModelKind::Matern(200.0), 1.0, 10.0)]
+            )
+            .is_err()
         );
         assert!(
             VariogramModel::new(
@@ -836,7 +847,13 @@ mod tests {
             )],
         )
         .unwrap();
-        for &(x, y) in &[(0.0, 50.0), (100.0, 0.0), (30.0, 0.0), (0.0, 30.0), (17.0, -42.0)] {
+        for &(x, y) in &[
+            (0.0, 50.0),
+            (100.0, 0.0),
+            (30.0, 0.0),
+            (0.0, 30.0),
+            (17.0, -42.0),
+        ] {
             assert!(
                 (m.gamma_dh([x, y]) - mirrored.gamma_dh([x, y])).abs() < 1e-12,
                 "({x},{y}): {} vs {}",
@@ -1020,7 +1037,9 @@ mod tests {
         // pure relative-error check is dominated by the quadrature's
         // absolute error floor; accept either a tight relative match or a
         // tiny absolute one.
-        let close_enough = |a: f64, b: f64| -> bool { (a - b).abs() < 1e-9 || (a - b).abs() / b.max(1e-12) < 1e-6 };
+        let close_enough = |a: f64, b: f64| -> bool {
+            (a - b).abs() < 1e-9 || (a - b).abs() / b.max(1e-12) < 1e-6
+        };
         let d_values = [0.001, 0.01, 0.1, 0.3, 0.5, 1.0, 2.0, 5.0];
         for &d in &d_values {
             let general15 = ModelKind::Matern(1.5).g(d, 1.0);
@@ -1049,8 +1068,9 @@ mod tests {
     #[test]
     fn matern_continuous_nu_bounded_and_monotone() {
         for &nu in &[0.15, 0.3, 0.75, 1.0, 1.8, 3.0, 4.5] {
-            let m = VariogramModel::new(0.0, vec![Structure::new(ModelKind::Matern(nu), 2.0, 50.0)])
-                .unwrap();
+            let m =
+                VariogramModel::new(0.0, vec![Structure::new(ModelKind::Matern(nu), 2.0, 50.0)])
+                    .unwrap();
             let mut prev = 0.0;
             for i in 1..=100 {
                 let g = m.gamma(i as f64 * 5.0);
@@ -1070,14 +1090,19 @@ mod tests {
     /// Matérn/Ste).
     #[test]
     fn new_families_match_gstat_reference_values() {
-        let hs = [1.0, 10.0, 30.0, 50.0, 80.0, 100.0, 150.0, 200.0, 300.0, 500.0];
+        let hs = [
+            1.0, 10.0, 30.0, 50.0, 80.0, 100.0, 150.0, 200.0, 300.0, 500.0,
+        ];
 
         let cir_gstat = [
             0.01273218, 0.12711143, 0.37616234, 0.60899778, 0.89591196, 1.0, 1.0, 1.0, 1.0, 1.0,
         ];
         for (&h, &expected) in hs.iter().zip(&cir_gstat) {
             let got = ModelKind::Circular.g(h, 100.0);
-            assert!((got - expected).abs() < 1e-7, "Cir h={h}: {got} vs {expected}");
+            assert!(
+                (got - expected).abs() < 1e-7,
+                "Cir h={h}: {got} vs {expected}"
+            );
         }
 
         let hol_gstat = [
@@ -1094,7 +1119,10 @@ mod tests {
         ];
         for (&h, &expected) in hs.iter().zip(&hol_gstat) {
             let got = ModelKind::Hole.g(h, 100.0);
-            assert!((got - expected).abs() < 1e-6, "Hol h={h}: {got} vs {expected}");
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "Hol h={h}: {got} vs {expected}"
+            );
         }
 
         let wav_gstat = [
@@ -1111,7 +1139,10 @@ mod tests {
         ];
         for (&h, &expected) in hs.iter().zip(&wav_gstat) {
             let got = ModelKind::Wave.g(h, 100.0);
-            assert!((got - expected).abs() < 1e-6, "Wav h={h}: {got} vs {expected}");
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "Wav h={h}: {got} vs {expected}"
+            );
         }
 
         let exc15_gstat = [
@@ -1128,7 +1159,10 @@ mod tests {
         ];
         for (&h, &expected) in hs.iter().zip(&exc15_gstat) {
             let got = ModelKind::Stable(1.5).g(h, 100.0);
-            assert!((got - expected).abs() < 1e-7, "Exc(1.5) h={h}: {got} vs {expected}");
+            assert!(
+                (got - expected).abs() < 1e-7,
+                "Exc(1.5) h={h}: {got} vs {expected}"
+            );
         }
     }
 
@@ -1157,14 +1191,18 @@ mod tests {
         // Both are valid (positive-definite) covariance models but are NOT
         // monotone: they overshoot the sill (negative covariance) once past
         // their first zero-crossing.
-        let hol = VariogramModel::new(0.0, vec![Structure::new(ModelKind::Hole, 1.0, 100.0)])
-            .unwrap();
-        let wav = VariogramModel::new(0.0, vec![Structure::new(ModelKind::Wave, 1.0, 100.0)])
-            .unwrap();
+        let hol =
+            VariogramModel::new(0.0, vec![Structure::new(ModelKind::Hole, 1.0, 100.0)]).unwrap();
+        let wav =
+            VariogramModel::new(0.0, vec![Structure::new(ModelKind::Wave, 1.0, 100.0)]).unwrap();
         assert_eq!(hol.gamma(0.0), 0.0);
         assert_eq!(wav.gamma(0.0), 0.0);
         // Wave's covariance is exactly zero at h = range by construction.
-        assert!(wav.covariance(100.0).abs() < 1e-9, "{}", wav.covariance(100.0));
+        assert!(
+            wav.covariance(100.0).abs() < 1e-9,
+            "{}",
+            wav.covariance(100.0)
+        );
         // Hole overshoots the sill (negative covariance) well past its range.
         assert!(hol.gamma(500.0) > 1.0, "Hol should overshoot by h=500");
         assert!(hol.covariance(500.0) < 0.0);

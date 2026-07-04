@@ -991,7 +991,13 @@ mod tests {
         //                   z=c(1.0,2.0,1.5,2.5,1.8))
         //   krige(z~1, d, target, model=vgm(2.0,"Pow",1.2))
         let data = PointSet::new(
-            vec![[0.0, 0.0], [10.0, 0.0], [0.0, 10.0], [10.0, 10.0], [5.0, 5.0]],
+            vec![
+                [0.0, 0.0],
+                [10.0, 0.0],
+                [0.0, 10.0],
+                [10.0, 10.0],
+                [5.0, 5.0],
+            ],
             vec![1.0, 2.0, 1.5, 2.5, 1.8],
         )
         .unwrap();
@@ -1093,7 +1099,10 @@ mod tests {
             [2.0, 8.0],
             [8.0, 3.0],
         ];
-        let values: Vec<f64> = coords.iter().map(|p| 2.0 + 0.3 * p[0] - 0.1 * p[1]).collect();
+        let values: Vec<f64> = coords
+            .iter()
+            .map(|p| 2.0 + 0.3 * p[0] - 0.1 * p[1])
+            .collect();
         let data = PointSet::new(coords, values).unwrap();
         let m = VariogramModel::new(0.01, vec![Structure::new(ModelKind::Power(1.0), 0.5, 1.0)])
             .unwrap();

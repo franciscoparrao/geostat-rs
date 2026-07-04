@@ -10,7 +10,9 @@ use std::time::Instant;
 use geostat_core::PointSet;
 use geostat_core::rng::Rng;
 use geostat_core::variogram::{ModelKind, Structure, VariogramModel};
-use geostat_core::vecchia::{vecchia_loglik, vecchia_loglik_grouped, vecchia_mle, vecchia_mle_grouped};
+use geostat_core::vecchia::{
+    vecchia_loglik, vecchia_loglik_grouped, vecchia_mle, vecchia_mle_grouped,
+};
 
 fn field(n: usize) -> PointSet {
     let mut rng = Rng::new(42);
@@ -92,7 +94,10 @@ fn main() {
     let t = Instant::now();
     let fit = vecchia_mle(&data_mle, ModelKind::Exponential, m_mle, None).unwrap();
     let base_ms = t.elapsed().as_secs_f64() * 1e3;
-    println!("group_size=1 (ungrouped): {base_ms:>8.0} ms  (loglik {:.1})", fit.loglik);
+    println!(
+        "group_size=1 (ungrouped): {base_ms:>8.0} ms  (loglik {:.1})",
+        fit.loglik
+    );
 
     for &g in &[2usize, 4] {
         let t = Instant::now();

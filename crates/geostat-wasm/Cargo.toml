@@ -7,11 +7,16 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+keywords = ["geostatistics", "kriging", "variogram", "wasm"]
+categories = ["science", "wasm"]
+# A minimal wasm-bindgen demo surface (see examples/wasm-demo/), not a
+# general-purpose library crate; flip this if that changes.
+publish = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-geostat-core = { path = "../geostat-core", default-features = false }
+geostat-core = { path = "../geostat-core", version = "0.7.0", default-features = false }
 wasm-bindgen = "0.2"
 serde_json = { workspace = true }

@@ -193,7 +193,11 @@ impl Lmc {
 }
 
 /// Co-kriging search configuration (applied per variable).
+///
+/// `#[non_exhaustive]`: construct via `CoKrigingConfig { ridge, ..
+/// Default::default() }` (AUDIT-2026-07-v2.md §6 Fase 5).
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct CoKrigingConfig {
     /// Maximum nearest neighbors per variable (all points when unset).
     pub max_neighbors: Option<usize>,

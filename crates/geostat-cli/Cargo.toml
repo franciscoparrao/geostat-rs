@@ -7,13 +7,20 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+keywords = ["geostatistics", "kriging", "variogram", "simulation", "cli"]
+categories = ["science", "mathematics", "command-line-utilities"]
+readme = "../../README.md"
+
+[lib]
+name = "geostat_cli"
+path = "src/lib.rs"
 
 [[bin]]
 name = "geostat"
 path = "src/main.rs"
 
 [dependencies]
-geostat-core = { path = "../geostat-core" }
+geostat-core = { path = "../geostat-core", version = "0.7.0" }
 anyhow = { workspace = true }
 clap = { workspace = true }
 csv = { workspace = true }

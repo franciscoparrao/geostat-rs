@@ -58,13 +58,13 @@ fn bench_sgs(c: &mut Criterion) {
     let data = synthetic(300, 3);
     let m = model();
     let grid = Grid2D::from_bbox([0.0, 0.0], [1000.0, 1000.0], 50, 50).unwrap();
-    let cfg = SgsConfig {
-        n_realizations: 1,
-        seed: 42,
-        max_neighbors: 16,
-        search_radius: None,
-        ..Default::default()
-    };
+    // `SgsConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields.
+    let mut cfg = SgsConfig::default();
+    cfg.n_realizations = 1;
+    cfg.seed = 42;
+    cfg.max_neighbors = 16;
+    cfg.search_radius = None;
     let mut group = c.benchmark_group("sgs");
     group.sample_size(10);
     group.bench_function("sgs_2500_cells_1_realization_k16", |b| {

@@ -207,19 +207,22 @@ fn experimental_variogram(
 /// 2-D variogram map (lag-space semivariance surface) for spotting anisotropy.
 /// Returns a dict with `size` (grid side = 2*n_lags+1), `lag_width`, and flat
 /// row-major (`iy*size+ix`) lists `hx`, `hy`, `gamma` (NaN where empty) and
-/// `n_pairs`.
+/// `n_pairs`. `lag_width` defaults to a fifteenth of the data's
+/// bounding-box half-diagonal when omitted (same convention as the CLI's
+/// `vmap --lag-width`), rather than an arbitrary fixed distance unit.
 #[pyfunction]
-#[pyo3(signature = (x, y, values, n_lags = 15, lag_width = 1.0))]
+#[pyo3(signature = (x, y, values, n_lags = 15, lag_width = None))]
 fn variogram_map(
     py: Python<'_>,
     x: Vec<f64>,
     y: Vec<f64>,
     values: Vec<f64>,
     n_lags: usize,
-    lag_width: f64,
+    lag_width: Option<f64>,
 ) -> PyResult<Py<PyDict>> {
     let data = point_set(x, y, values)?;
     let (m, hx, hy) = py.allow_threads(|| {
+        let lag_width = lag_width.unwrap_or_else(|| core::default_lag_width(&data, n_lags));
         let m = core::variogram_map(&data, n_lags, lag_width).map_err(err)?;
         let (mut hx, mut hy) = (Vec::new(), Vec::new());
         for iy in 0..m.size {
@@ -241,11 +244,13 @@ fn variogram_map(
     Ok(out.into())
 }
 
-/// Fits a variogram model to the data by weighted least squares.
-/// `kinds` is "best" or a comma-separated list (spherical, exponential,
-/// gaussian, matern15, matern25). `detrend`/`detrend_drift` fit the model on
-/// OLS trend residuals (see `experimental_variogram`) — use them when the
-/// model feeds universal or external-drift kriging.
+/// Fits a variogram model to the data by weighted least squares. `kinds` is
+/// "best" (tries the 6 bounded families: spherical, exponential, gaussian,
+/// matern15, matern25, circular) or an explicit comma-separated list, which
+/// may also include hole, wave, matern:<nu>, stable:<alpha> and
+/// power:<theta>. `detrend`/`detrend_drift` fit the model on OLS trend
+/// residuals (see `experimental_variogram`) — use them when the model feeds
+/// universal or external-drift kriging.
 #[pyfunction]
 #[pyo3(signature = (x, y, values, n_lags = 15, max_dist = None, kinds = "best",
     detrend = None, detrend_drift = None))]
@@ -300,8 +305,10 @@ fn fit_anisotropic(
 /// Fits a single-structure model by Vecchia maximum likelihood: maximizes the
 /// Vecchia-approximated Gaussian log-likelihood (conditioning size `m`) instead
 /// of variogram weighted least squares. Scales as O(n m^3), so it fits the
-/// covariance to the data likelihood on large `n`. `kind` is one family
-/// (spherical, exponential, gaussian, matern15, matern25).
+/// covariance to the data likelihood on large `n`. `kind` is one family:
+/// spherical, exponential, gaussian, matern15, matern25, circular, hole,
+/// wave, matern:<nu> or stable:<alpha> (Power has no covariance function,
+/// so it is not supported here — use `fit_variogram` + `krige` instead).
 #[pyfunction]
 #[pyo3(signature = (x, y, values, kind = "exponential", m = 20))]
 fn vecchia_mle(
@@ -365,8 +372,8 @@ fn vecchia_reml_drift(
     let k = *parse_kinds(kind)?
         .first()
         .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("no model kind given"))?;
-    let fit = py
-        .allow_threads(|| core::vecchia_reml_drift(&data, k, m, &covariates, None).map_err(err))?;
+    let fit =
+        py.allow_threads(|| core::vecchia_reml_drift(&data, k, m, &covariates, None).map_err(err))?;
     Ok(VariogramModel { inner: fit.model })
 }
 
@@ -385,7 +392,8 @@ fn vecchia_param_se(
     m: usize,
 ) -> PyResult<(f64, f64, f64)> {
     let data = point_set(x, y, values)?;
-    let se = py.allow_threads(|| core::vecchia_param_se(&data, &model.inner, m, None).map_err(err))?;
+    let se =
+        py.allow_threads(|| core::vecchia_param_se(&data, &model.inner, m, None).map_err(err))?;
     Ok((se[0], se[1], se[2]))
 }
 
@@ -554,11 +562,7 @@ fn lognormal_kriging(
     let (values, variances) = py.allow_threads(|| {
         let ests =
             core::lognormal_kriging(&data, &targets, &log_model.inner, &config).map_err(err)?;
-        Ok::<_, PyErr>(
-            ests.into_iter()
-                .map(|e| (e.value, e.log_variance))
-                .unzip(),
-        )
+        Ok::<_, PyErr>(ests.into_iter().map(|e| (e.value, e.log_variance)).unzip())
     })?;
     Ok((arr1(py, values), arr1(py, variances)))
 }
@@ -616,7 +620,7 @@ fn krige_grid(
 /// holds out whole blocks at a time — a more honest error estimate than
 /// random k-fold/LOO under spatial autocorrelation; `blocks` and `folds` are
 /// mutually exclusive). Returns a dict with `me`, `mae`, `rmse`, `msdr`,
-/// `vecv`, `e1`, `predicted` and `variance`.
+/// `vecv`, `e1`, `observed`, `predicted` and `variance`.
 #[pyfunction]
 #[pyo3(signature = (x, y, values, model, method = "ordinary", mean = None,
     degree = 1, max_neighbors = None, radius = None, folds = None, seed = 0,
@@ -648,7 +652,9 @@ fn loo_cv(
         max_per_octant: octant,
     };
     if blocks.is_some() && folds.is_some() {
-        return Err(PyValueError::new_err("blocks and folds are mutually exclusive"));
+        return Err(PyValueError::new_err(
+            "blocks and folds are mutually exclusive",
+        ));
     }
     let cv = py.allow_threads(|| match (blocks, folds) {
         (Some((nx, ny)), _) => core::block_cv(&data, &model.inner, &config, [nx, ny]).map_err(err),
@@ -666,6 +672,7 @@ fn loo_cv(
     out.set_item("rrmse", cv.rrmse())?;
     out.set_item("vecv", cv.vecv())?;
     out.set_item("e1", cv.e1())?;
+    out.set_item("observed", arr1(py, cv.observed))?;
     out.set_item("predicted", arr1(py, cv.predicted))?;
     out.set_item("variance", arr1(py, cv.variance))?;
     Ok(out.into())
@@ -837,11 +844,12 @@ fn co_kriging(
         let cfg = vario_config(&primary, n_lags, max_dist, None, 0.0, 22.5);
         let lmc = core::fit_lmc_collocated(&primary, &secondary, &cfg, &core::ModelKind::ALL)
             .map_err(err)?;
-        let config = core::CoKrigingConfig {
-            max_neighbors,
-            search_radius: radius,
-            ridge,
-        };
+        // `CoKrigingConfig` is `#[non_exhaustive]`: build from
+        // `Default::default()` and assign fields.
+        let mut config = core::CoKrigingConfig::default();
+        config.max_neighbors = max_neighbors;
+        config.search_radius = radius;
+        config.ridge = ridge;
         let ck = core::CoKriging::new(vec![&primary, &secondary], &lmc, config).map_err(err)?;
         let ests = ck.predict_many(&targets);
         Ok::<_, PyErr>(ests.into_iter().map(|e| (e.value, e.variance)).unzip())
@@ -997,9 +1005,9 @@ fn tune_idw_power(
     radius: Option<f64>,
 ) -> PyResult<Py<PyDict>> {
     let data = point_set(x, y, values)?;
-    let res =
-        py.allow_threads(|| core::tune_idw_power(&data, &powers, max_neighbors, radius))
-            .map_err(err)?;
+    let res = py
+        .allow_threads(|| core::tune_idw_power(&data, &powers, max_neighbors, radius))
+        .map_err(err)?;
     let out = PyDict::new(py);
     out.set_item("best", res.best)?;
     out.set_item("best_vecv", res.best_vecv)?;
@@ -1020,7 +1028,9 @@ fn tune_knn_k(
     radius: Option<f64>,
 ) -> PyResult<Py<PyDict>> {
     let data = point_set(x, y, values)?;
-    let res = py.allow_threads(|| core::tune_knn_k(&data, &ks, radius)).map_err(err)?;
+    let res = py
+        .allow_threads(|| core::tune_knn_k(&data, &ks, radius))
+        .map_err(err)?;
     let out = PyDict::new(py);
     out.set_item("best", res.best)?;
     out.set_item("best_vecv", res.best_vecv)?;
@@ -1169,15 +1179,15 @@ fn decluster_weights(
 /// or let the CLI auto-fit). Returns one list per realization, in grid
 /// storage order.
 ///
-/// By default realizations are clamped to the data range; `lower_tail` /
-/// `upper_tail` ("linear", "power:<w>", "hyper:<w>", GSLIB ltail/utail)
-/// with `zmin`/`zmax` extrapolate the back-transform beyond the data
-/// extremes — without them the simulated variance and extreme quantiles
-/// are systematically truncated.
+/// By default realizations are clamped to the data range; `ltail`/`utail`
+/// ("linear", "power:<w>", "hyper:<w>", GSLIB ltail/utail — same names as
+/// `sis`/`indicator_kriging`) with `zmin`/`zmax` extrapolate the
+/// back-transform beyond the data extremes — without them the simulated
+/// variance and extreme quantiles are systematically truncated.
 #[pyfunction]
 #[pyo3(signature = (x, y, values, model_ns, bbox, nx, ny, n_realizations = 10,
     seed = 42, max_neighbors = 16, radius = None,
-    lower_tail = "none", upper_tail = "none", zmin = None, zmax = None,
+    ltail = "none", utail = "none", zmin = None, zmax = None,
     decluster_cell = None, max_node_neighbors = None, multigrid = 0))]
 #[allow(clippy::too_many_arguments)]
 fn sgs(
@@ -1193,8 +1203,8 @@ fn sgs(
     seed: u64,
     max_neighbors: usize,
     radius: Option<f64>,
-    lower_tail: &str,
-    upper_tail: &str,
+    ltail: &str,
+    utail: &str,
     zmin: Option<f64>,
     zmax: Option<f64>,
     decluster_cell: Option<f64>,
@@ -1208,21 +1218,22 @@ fn sgs(
         None => None,
     };
     let tails = core::Tails {
-        lower: parse_tail(lower_tail)?,
-        upper: parse_tail(upper_tail)?,
+        lower: parse_tail(ltail)?,
+        upper: parse_tail(utail)?,
         lower_bound: zmin,
         upper_bound: zmax,
     };
-    let cfg = SgsConfig {
-        n_realizations,
-        seed,
-        max_neighbors,
-        search_radius: radius,
-        tails,
-        decluster_weights,
-        max_node_neighbors,
-        multigrid,
-    };
+    // `SgsConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields.
+    let mut cfg = SgsConfig::default();
+    cfg.n_realizations = n_realizations;
+    cfg.seed = seed;
+    cfg.max_neighbors = max_neighbors;
+    cfg.search_radius = radius;
+    cfg.tails = tails;
+    cfg.decluster_weights = decluster_weights;
+    cfg.max_node_neighbors = max_node_neighbors;
+    cfg.multigrid = multigrid;
     let realizations = py.allow_threads(|| {
         core::sequential_gaussian_simulation(&data, &model_ns.inner, &grid, &cfg)
             .map_err(err)
@@ -1232,9 +1243,13 @@ fn sgs(
 }
 
 /// Conditional sequential indicator simulation. Indicator variogram models
-/// are fitted automatically at each cutoff (spherical/exponential), or a
-/// single shared model at the median cutoff when `mik=True` (GSLIB `mik=1`
-/// median IK — amortizes one factorization across every cutoff).
+/// are fitted automatically at each cutoff, or a single shared model at the
+/// median cutoff when `mik=True` (GSLIB `mik=1` median IK — amortizes one
+/// factorization across every cutoff). `fit` is a comma-separated list of
+/// candidate families for that auto-fit (same spec as the CLI's `--fit`:
+/// "spherical", "exponential", "gaussian", "matern15", "matern25",
+/// "circular", "hole", "wave", "matern:<nu>", "stable:<alpha>",
+/// "power:<theta>" — the best-fitting one is picked per cutoff).
 /// `ltail`/`utail` ("linear", "power:<w>", "hyper:<w>") set the GSLIB tail
 /// interpolation between `tail_min`/`tail_max` (default: data extremes) and
 /// the extreme cutoffs; hyperbolic upper tails are capped at `tail_max`.
@@ -1242,8 +1257,8 @@ fn sgs(
 #[pyfunction]
 #[pyo3(signature = (x, y, values, cutoffs, bbox, nx, ny, n_realizations = 10,
     seed = 42, max_neighbors = 16, radius = None, n_lags = 15, max_dist = None,
-    ltail = "linear", utail = "linear", tail_min = None, tail_max = None,
-    mik = false, ordinary = false))]
+    fit = "spherical,exponential", ltail = "linear", utail = "linear",
+    tail_min = None, tail_max = None, mik = false, ordinary = false))]
 #[allow(clippy::too_many_arguments)]
 fn sis(
     py: Python<'_>,
@@ -1260,6 +1275,7 @@ fn sis(
     radius: Option<f64>,
     n_lags: usize,
     max_dist: Option<f64>,
+    fit: &str,
     ltail: &str,
     utail: &str,
     tail_min: Option<f64>,
@@ -1270,7 +1286,7 @@ fn sis(
     let data = point_set(x, y, values)?;
     let grid = Grid2D::from_bbox([bbox.0, bbox.1], [bbox.2, bbox.3], nx, ny).map_err(err)?;
     let cfg_v = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
-    let kinds = [core::ModelKind::Spherical, core::ModelKind::Exponential];
+    let kinds = core::ModelKind::parse_list(fit).map_err(err)?;
     let models = if mik {
         core::fit_median_indicator_model(&data, &cutoffs, &kinds, &cfg_v).map_err(err)?
     } else {
@@ -1278,19 +1294,20 @@ fn sis(
     };
     let lower_tail = parse_tail(ltail)?;
     let upper_tail = parse_tail(utail)?;
-    let cfg = SisConfig {
-        cutoffs,
-        models,
-        ordinary,
-        n_realizations,
-        seed,
-        max_neighbors,
-        search_radius: radius,
-        tail_min,
-        tail_max,
-        lower_tail,
-        upper_tail,
-    };
+    // `SisConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields.
+    let mut cfg = SisConfig::default();
+    cfg.cutoffs = cutoffs;
+    cfg.models = models;
+    cfg.ordinary = ordinary;
+    cfg.n_realizations = n_realizations;
+    cfg.seed = seed;
+    cfg.max_neighbors = max_neighbors;
+    cfg.search_radius = radius;
+    cfg.tail_min = tail_min;
+    cfg.tail_max = tail_max;
+    cfg.lower_tail = lower_tail;
+    cfg.upper_tail = upper_tail;
     let realizations = py.allow_threads(|| {
         core::sequential_indicator_simulation(&data, &grid, &cfg)
             .map_err(err)
@@ -1424,14 +1441,18 @@ fn krige_3d(
 /// `ccdf` (list of per-target ccdf lists), `e_type` and `cond_var`.
 /// Indicator variogram models are fitted automatically per cutoff, or a
 /// single shared model at the median cutoff when `mik=True` (GSLIB `mik=1`
-/// median IK). `ltail`/`utail` ("linear", "power:<w>", "hyper:<w>") set the
-/// GSLIB tail interpolation used for the E-type and conditional-variance
-/// integrals. `ordinary=True` uses ordinary (Σw=1) instead of simple IK.
+/// median IK). `fit` is a comma-separated list of candidate families for
+/// that auto-fit (same spec as the CLI's `--fit`: "spherical", "exponential",
+/// "gaussian", "matern15", "matern25", "circular", "hole", "wave",
+/// "matern:<nu>", "stable:<alpha>", "power:<theta>"). `ltail`/`utail`
+/// ("linear", "power:<w>", "hyper:<w>") set the GSLIB tail interpolation
+/// used for the E-type and conditional-variance integrals. `ordinary=True`
+/// uses ordinary (Σw=1) instead of simple IK.
 #[pyfunction]
 #[pyo3(signature = (x, y, values, cutoffs, target_x, target_y,
     max_neighbors = None, radius = None, n_lags = 15, max_dist = None,
-    ltail = "linear", utail = "linear", tail_min = None, tail_max = None,
-    mik = false, ordinary = false))]
+    fit = "spherical,exponential", ltail = "linear", utail = "linear",
+    tail_min = None, tail_max = None, mik = false, ordinary = false))]
 #[allow(clippy::too_many_arguments)]
 fn indicator_kriging(
     py: Python<'_>,
@@ -1445,6 +1466,7 @@ fn indicator_kriging(
     radius: Option<f64>,
     n_lags: usize,
     max_dist: Option<f64>,
+    fit: &str,
     ltail: &str,
     utail: &str,
     tail_min: Option<f64>,
@@ -1467,23 +1489,24 @@ fn indicator_kriging(
         .collect();
     let (ccdf, e_type, cond_var) = py.allow_threads(|| {
         let cfg_v = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
-        let kinds = [core::ModelKind::Spherical, core::ModelKind::Exponential];
+        let kinds = core::ModelKind::parse_list(fit).map_err(err)?;
         let models = if mik {
             core::fit_median_indicator_model(&data, &cutoffs, &kinds, &cfg_v).map_err(err)?
         } else {
             core::fit_indicator_models(&data, &cutoffs, &kinds, &cfg_v).map_err(err)?
         };
-        let cfg = core::IkConfig {
-            cutoffs,
-            models,
-            ordinary,
-            max_neighbors,
-            search_radius: radius,
-            tail_min,
-            tail_max,
-            lower_tail,
-            upper_tail,
-        };
+        // `IkConfig` is `#[non_exhaustive]`: build from `Default::default()`
+        // and assign fields.
+        let mut cfg = core::IkConfig::default();
+        cfg.cutoffs = cutoffs;
+        cfg.models = models;
+        cfg.ordinary = ordinary;
+        cfg.max_neighbors = max_neighbors;
+        cfg.search_radius = radius;
+        cfg.tail_min = tail_min;
+        cfg.tail_max = tail_max;
+        cfg.lower_tail = lower_tail;
+        cfg.upper_tail = upper_tail;
         let ests = core::indicator_kriging(&data, &targets, &cfg).map_err(err)?;
         let ccdf: Vec<Vec<f64>> = ests.iter().map(|e| e.ccdf.clone()).collect();
         let e_type: Vec<f64> = ests.iter().map(|e| e.e_type).collect();

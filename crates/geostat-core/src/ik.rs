@@ -14,7 +14,12 @@ use crate::tails::TailModel;
 use crate::variogram::VariogramModel;
 
 /// Configuration for indicator kriging.
+///
+/// `#[non_exhaustive]`: construct via `IkConfig { cutoffs, models, ..
+/// Default::default() }` so new fields can be added without breaking
+/// callers (AUDIT-2026-07-v2.md §6 Fase 5).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct IkConfig {
     /// Indicator cutoffs, strictly ascending, inside the data value range.
     pub cutoffs: Vec<f64>,
@@ -40,6 +45,22 @@ pub struct IkConfig {
     /// Upper-tail interpolation between the last cutoff and `tail_max`
     /// (GSLIB `utail`; hyperbolic tails are capped at `tail_max`).
     pub upper_tail: TailModel,
+}
+
+impl Default for IkConfig {
+    fn default() -> Self {
+        Self {
+            cutoffs: Vec::new(),
+            models: Vec::new(),
+            ordinary: false,
+            max_neighbors: None,
+            search_radius: None,
+            tail_min: None,
+            tail_max: None,
+            lower_tail: TailModel::Linear,
+            upper_tail: TailModel::Linear,
+        }
+    }
 }
 
 /// Local ccdf estimate at one target.
@@ -672,15 +693,11 @@ mod tests {
             .collect();
 
         cfg.ordinary = true;
-        assert!(
-            indicator_kriging_soft(&data, &targets, &good_soft, &good_calib, &cfg).is_err()
-        );
+        assert!(indicator_kriging_soft(&data, &targets, &good_soft, &good_calib, &cfg).is_err());
         cfg.ordinary = false;
 
         let bad_soft = vec![vec![0.5; nc - 1]]; // wrong cutoff count
-        assert!(
-            indicator_kriging_soft(&data, &targets, &bad_soft, &good_calib, &cfg).is_err()
-        );
+        assert!(indicator_kriging_soft(&data, &targets, &bad_soft, &good_calib, &cfg).is_err());
 
         let bad_calib = vec![crate::sis::MarkovBayesCalibration {
             rho: 1.5, // out of [-1,1]
@@ -690,9 +707,7 @@ mod tests {
         .into_iter()
         .chain(good_calib.iter().skip(1).copied())
         .collect::<Vec<_>>();
-        assert!(
-            indicator_kriging_soft(&data, &targets, &good_soft, &bad_calib, &cfg).is_err()
-        );
+        assert!(indicator_kriging_soft(&data, &targets, &good_soft, &bad_calib, &cfg).is_err());
     }
 
     #[test]

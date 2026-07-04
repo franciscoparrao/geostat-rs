@@ -1,0 +1,30 @@
+[package]
+name = "geostat-cli-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.geostat-cli]
+path = ".."
+
+[[bin]]
+name = "gpkg_decode_point"
+path = "fuzz_targets/gpkg_decode_point.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gpkg_decode_png"
+path = "fuzz_targets/gpkg_decode_png.rs"
+test = false
+doc = false
+bench = false

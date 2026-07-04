@@ -1,7 +1,6 @@
 //! `geostat` — CLI for the geostat-rs geostatistics engine.
 
-mod gpkg;
-mod io_utils;
+use geostat_cli::{gpkg, io_utils};
 
 use std::path::PathBuf;
 
@@ -10,12 +9,11 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use geostat_core::{
     CoKriging, CoKrigingConfig, DirectionConfig, Grid2D, IkConfig, Kriging, KrigingConfig,
     KrigingMethod, ModelKind, PointSet, SgsConfig, SisConfig, Tails, VariogramConfig,
-    VariogramModel, cell_declustering_weights, decluster_scan, detrend_external,
-    detrend_polynomial, experimental_variogram, fit_anisotropic, fit_best, fit_indicator_models,
-    block_cv, fit_lmc_collocated, fit_median_indicator_model, indicator_kriging, k_fold,
-    leave_one_out, leave_one_out_with_drift,
-    sequential_gaussian_simulation, sequential_indicator_simulation, variogram_map, vecchia_mle,
-    vecchia_predict, vecchia_reml,
+    VariogramModel, block_cv, cell_declustering_weights, decluster_scan, default_lag_width,
+    detrend_external, detrend_polynomial, experimental_variogram, fit_anisotropic, fit_best,
+    fit_indicator_models, fit_lmc_collocated, fit_median_indicator_model, indicator_kriging,
+    k_fold, leave_one_out, leave_one_out_with_drift, sequential_gaussian_simulation,
+    sequential_indicator_simulation, variogram_map, vecchia_mle, vecchia_predict, vecchia_reml,
 };
 
 #[derive(Parser)]
@@ -260,8 +258,9 @@ struct VariogramCmd {
     input: InputOpts,
     #[command(flatten)]
     vario: VariogramOpts,
-    /// Fit model(s): "best", or comma-separated kinds
-    /// (spherical, exponential, gaussian, matern15, matern25)
+    /// Fit model(s): "best" (the 6 bounded families), or a comma-separated
+    /// list: spherical, exponential, gaussian, matern15, matern25, circular,
+    /// hole, wave, `matern:<nu>`, `stable:<alpha>`, `power:<theta>`
     #[arg(long)]
     fit: Option<String>,
     /// Fit a geometrically anisotropic model: estimate the major-axis azimuth
@@ -464,10 +463,10 @@ struct SgsCmd {
     #[arg(long)]
     radius: Option<f64>,
     /// Lower-tail extrapolation of the back-transform: none, linear or
-    /// power:<w> (GSLIB ltail; requires --zmin)
+    /// `power:<w>` (GSLIB ltail; requires --zmin)
     #[arg(long, default_value = "none")]
     ltail: String,
-    /// Upper-tail extrapolation: none, linear, power:<w> or hyper:<w>
+    /// Upper-tail extrapolation: none, linear, `power:<w>` or `hyper:<w>`
     /// (GSLIB utail; requires --zmax)
     #[arg(long, default_value = "none")]
     utail: String,
@@ -539,7 +538,9 @@ struct SisCmd {
     /// Explicit indicator cutoffs (overrides --quantiles)
     #[arg(long)]
     cutoffs: Option<String>,
-    /// Model kinds to try when fitting indicator variograms
+    /// Model kinds to try when fitting indicator variograms: comma-separated
+    /// from spherical, exponential, gaussian, matern15, matern25, circular,
+    /// hole, wave, `matern:<nu>`, `stable:<alpha>`, `power:<theta>`
     #[arg(long, default_value = "spherical,exponential")]
     fit: String,
     /// Number of realizations
@@ -560,10 +561,10 @@ struct SisCmd {
     /// Upper tail bound (default: data maximum)
     #[arg(long)]
     tail_max: Option<f64>,
-    /// Lower-tail interpolation: linear or power:<w> (GSLIB ltail)
+    /// Lower-tail interpolation: linear or `power:<w>` (GSLIB ltail)
     #[arg(long, default_value = "linear")]
     ltail: String,
-    /// Upper-tail interpolation: linear, power:<w> or hyper:<w> (GSLIB
+    /// Upper-tail interpolation: linear, `power:<w>` or `hyper:<w>` (GSLIB
     /// utail; hyperbolic is capped at --tail-max)
     #[arg(long, default_value = "linear")]
     utail: String,
@@ -599,7 +600,9 @@ struct IkCmd {
     /// (default: auto-fit per cutoff)
     #[arg(long)]
     models: Option<String>,
-    /// Model kinds to try when auto-fitting indicator variograms
+    /// Model kinds to try when auto-fitting indicator variograms: comma-separated
+    /// from spherical, exponential, gaussian, matern15, matern25, circular,
+    /// hole, wave, `matern:<nu>`, `stable:<alpha>`, `power:<theta>`
     #[arg(long, default_value = "spherical,exponential")]
     fit: String,
     #[command(flatten)]
@@ -610,10 +613,10 @@ struct IkCmd {
     /// Upper tail bound (default: data maximum)
     #[arg(long)]
     tail_max: Option<f64>,
-    /// Lower-tail interpolation: linear or power:<w> (GSLIB ltail)
+    /// Lower-tail interpolation: linear or `power:<w>` (GSLIB ltail)
     #[arg(long, default_value = "linear")]
     ltail: String,
-    /// Upper-tail interpolation: linear, power:<w> or hyper:<w> (GSLIB
+    /// Upper-tail interpolation: linear, `power:<w>` or `hyper:<w>` (GSLIB
     /// utail; hyperbolic is capped at --tail-max)
     #[arg(long, default_value = "linear")]
     utail: String,
@@ -738,7 +741,7 @@ struct GpkgSampleCmd {
     /// Y coordinate column in the points CSV
     #[arg(long, default_value = "y")]
     y_col: String,
-    /// Output CSV (x,y,<value>); points outside the extent or on no-data are
+    /// Output CSV (x,y,`<value>`); points outside the extent or on no-data are
     /// written with an empty value
     #[arg(short, long)]
     output: PathBuf,
@@ -1095,20 +1098,9 @@ fn run_vmap(cmd: VmapCmd) -> Result<()> {
         data.len(),
         cmd.input.input.display()
     );
-    let lag_width = match cmd.lag_width {
-        Some(w) => w,
-        None => {
-            let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
-            for c in data.coords() {
-                for d in 0..2 {
-                    lo[d] = lo[d].min(c[d]);
-                    hi[d] = hi[d].max(c[d]);
-                }
-            }
-            let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2)).sqrt();
-            diag / 2.0 / cmd.n_lags as f64
-        }
-    };
+    let lag_width = cmd
+        .lag_width
+        .unwrap_or_else(|| default_lag_width(&data, cmd.n_lags));
     let m = variogram_map(&data, cmd.n_lags, lag_width)?;
     println!(
         "Variogram map {0}x{0}, lag width {1:.4}",
@@ -1552,11 +1544,12 @@ fn run_cokrige(cmd: CokrigeCmd) -> Result<()> {
     }
 
     let grid = cmd.grid.build(&primary)?;
-    let config = CoKrigingConfig {
-        max_neighbors: cmd.neighbors.max_neighbors,
-        search_radius: cmd.neighbors.radius,
-        ridge: cmd.ridge,
-    };
+    // `CoKrigingConfig` is `#[non_exhaustive]`: build from
+    // `Default::default()` and assign fields.
+    let mut config = CoKrigingConfig::default();
+    config.max_neighbors = cmd.neighbors.max_neighbors;
+    config.search_radius = cmd.neighbors.radius;
+    config.ridge = cmd.ridge;
     let ck = CoKriging::new(vec![&primary, &secondary], &lmc, config)?;
     let (values, variances) = match &cmd.block {
         Some(spec) => {
@@ -1593,8 +1586,8 @@ fn run_cokrige(cmd: CokrigeCmd) -> Result<()> {
 /// Prints the leave-one-out cross-validation report: error measures plus the
 /// scale-free relative measures and the predictive-accuracy measures VEcv and
 /// E₁ (Li 2016, 2017).
-fn print_cv_report(cv: &geostat_core::CvResult, n: usize) {
-    println!("\nLeave-one-out cross-validation ({n} points):");
+fn print_cv_report(cv: &geostat_core::CvResult, n: usize, method: &str) {
+    println!("\n{method} ({n} points):");
     println!("  Mean error (bias): {:>12.6}", cv.mean_error());
     println!("  MAE:               {:>12.6}", cv.mae());
     println!("  RMSE:              {:>12.6}", cv.rmse());
@@ -1666,11 +1659,17 @@ fn run_cv(cmd: CvCmd) -> Result<()> {
             min_neighbors: cmd.neighbors.min_neighbors,
             max_per_octant: cmd.neighbors.octant,
         };
-        let cv = match cmd.folds {
-            Some(k) => k_fold(&data, &model, &config, k, cmd.seed)?,
-            None => leave_one_out(&data, &model, &config)?,
+        let (cv, method_label) = match cmd.folds {
+            Some(k) => (
+                k_fold(&data, &model, &config, k, cmd.seed)?,
+                "K-fold cross-validation",
+            ),
+            None => (
+                leave_one_out(&data, &model, &config)?,
+                "Leave-one-out cross-validation",
+            ),
         };
-        print_cv_report(&cv, data.len());
+        print_cv_report(&cv, data.len(), method_label);
         if cmd.accuracy {
             print_accuracy_plot(&cv)?;
         }
@@ -1680,7 +1679,7 @@ fn run_cv(cmd: CvCmd) -> Result<()> {
         return Ok(());
     }
 
-    let (data, cv) = if let Some(drift_spec) = &cmd.drift_cols {
+    let (data, cv, method_label) = if let Some(drift_spec) = &cmd.drift_cols {
         if cmd.folds.is_some() {
             bail!("--folds (k-fold) is not yet supported with --drift-cols");
         }
@@ -1707,7 +1706,7 @@ fn run_cv(cmd: CvCmd) -> Result<()> {
             max_per_octant: cmd.neighbors.octant,
         };
         let cv = leave_one_out_with_drift(&data, &drift_data, &model, &config)?;
-        (data, cv)
+        (data, cv, "Leave-one-out cross-validation (external drift)")
     } else {
         let data = cmd.input.read()?;
         println!("Loaded {} points; model: {model}", data.len());
@@ -1718,15 +1717,24 @@ fn run_cv(cmd: CvCmd) -> Result<()> {
             min_neighbors: cmd.neighbors.min_neighbors,
             max_per_octant: cmd.neighbors.octant,
         };
-        let cv = match (&cmd.blocks, cmd.folds) {
-            (Some(spec), _) => block_cv(&data, &model, &config, parse_blocks_2d(spec)?)?,
-            (None, Some(k)) => k_fold(&data, &model, &config, k, cmd.seed)?,
-            (None, None) => leave_one_out(&data, &model, &config)?,
+        let (cv, method_label) = match (&cmd.blocks, cmd.folds) {
+            (Some(spec), _) => (
+                block_cv(&data, &model, &config, parse_blocks_2d(spec)?)?,
+                "Spatial block cross-validation",
+            ),
+            (None, Some(k)) => (
+                k_fold(&data, &model, &config, k, cmd.seed)?,
+                "K-fold cross-validation",
+            ),
+            (None, None) => (
+                leave_one_out(&data, &model, &config)?,
+                "Leave-one-out cross-validation",
+            ),
         };
-        (data, cv)
+        (data, cv, method_label)
     };
 
-    print_cv_report(&cv, data.len());
+    print_cv_report(&cv, data.len(), method_label);
     if cmd.accuracy {
         print_accuracy_plot(&cv)?;
     }
@@ -1783,21 +1791,22 @@ fn run_sgs(cmd: SgsCmd) -> Result<()> {
         None => None,
     };
     let grid = cmd.grid.build(&data)?;
-    let cfg = SgsConfig {
-        n_realizations: cmd.realizations,
-        seed: cmd.seed,
-        max_neighbors: cmd.max_neighbors,
-        search_radius: cmd.radius,
-        tails: Tails {
-            lower: cmd.ltail.parse()?,
-            upper: cmd.utail.parse()?,
-            lower_bound: cmd.zmin,
-            upper_bound: cmd.zmax,
-        },
-        decluster_weights,
-        max_node_neighbors: cmd.nodmax,
-        multigrid: cmd.multigrid,
+    // `SgsConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields.
+    let mut cfg = SgsConfig::default();
+    cfg.n_realizations = cmd.realizations;
+    cfg.seed = cmd.seed;
+    cfg.max_neighbors = cmd.max_neighbors;
+    cfg.search_radius = cmd.radius;
+    cfg.tails = Tails {
+        lower: cmd.ltail.parse()?,
+        upper: cmd.utail.parse()?,
+        lower_bound: cmd.zmin,
+        upper_bound: cmd.zmax,
     };
+    cfg.decluster_weights = decluster_weights;
+    cfg.max_node_neighbors = cmd.nodmax;
+    cfg.multigrid = cmd.multigrid;
     let res = sequential_gaussian_simulation(&data, &model_ns, &grid, &cfg)?;
 
     println!(
@@ -1908,19 +1917,20 @@ fn run_sis(cmd: SisCmd) -> Result<()> {
     }
 
     let grid = cmd.grid.build(&data)?;
-    let cfg = SisConfig {
-        cutoffs,
-        models,
-        ordinary: cmd.ordinary,
-        n_realizations: cmd.realizations,
-        seed: cmd.seed,
-        max_neighbors: cmd.max_neighbors,
-        search_radius: cmd.radius,
-        tail_min: cmd.tail_min,
-        tail_max: cmd.tail_max,
-        lower_tail: cmd.ltail.parse()?,
-        upper_tail: cmd.utail.parse()?,
-    };
+    // `SisConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields.
+    let mut cfg = SisConfig::default();
+    cfg.cutoffs = cutoffs;
+    cfg.models = models;
+    cfg.ordinary = cmd.ordinary;
+    cfg.n_realizations = cmd.realizations;
+    cfg.seed = cmd.seed;
+    cfg.max_neighbors = cmd.max_neighbors;
+    cfg.search_radius = cmd.radius;
+    cfg.tail_min = cmd.tail_min;
+    cfg.tail_max = cmd.tail_max;
+    cfg.lower_tail = cmd.ltail.parse()?;
+    cfg.upper_tail = cmd.utail.parse()?;
     let res = sequential_indicator_simulation(&data, &grid, &cfg)?;
 
     println!(
@@ -2003,17 +2013,18 @@ fn run_ik(cmd: IkCmd) -> Result<()> {
 
     let grid = cmd.grid.build(&data)?;
     let n_cutoffs = cutoffs.len();
-    let cfg = IkConfig {
-        cutoffs,
-        models,
-        ordinary: cmd.ordinary,
-        max_neighbors: cmd.neighbors.max_neighbors,
-        search_radius: cmd.neighbors.radius,
-        tail_min: cmd.tail_min,
-        tail_max: cmd.tail_max,
-        lower_tail: cmd.ltail.parse()?,
-        upper_tail: cmd.utail.parse()?,
-    };
+    // `IkConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields.
+    let mut cfg = IkConfig::default();
+    cfg.cutoffs = cutoffs;
+    cfg.models = models;
+    cfg.ordinary = cmd.ordinary;
+    cfg.max_neighbors = cmd.neighbors.max_neighbors;
+    cfg.search_radius = cmd.neighbors.radius;
+    cfg.tail_min = cmd.tail_min;
+    cfg.tail_max = cmd.tail_max;
+    cfg.lower_tail = cmd.ltail.parse()?;
+    cfg.upper_tail = cmd.utail.parse()?;
     let centers = grid.centers();
     let ests = indicator_kriging(&data, &centers, &cfg)?;
     println!(

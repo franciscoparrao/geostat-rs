@@ -158,7 +158,10 @@ mod tests {
         for (nu, x, expected) in cases {
             let got = bessel_k(nu, x);
             let rel = ((got - expected) / expected).abs();
-            assert!(rel < 1e-8, "K_{nu}({x}) = {got}, expected {expected} (rel {rel})");
+            assert!(
+                rel < 1e-8,
+                "K_{nu}({x}) = {got}, expected {expected} (rel {rel})"
+            );
         }
     }
 }

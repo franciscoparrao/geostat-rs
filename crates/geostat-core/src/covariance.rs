@@ -160,7 +160,12 @@ mod tests {
         for t in targets {
             let a = via_trait.predict(t).unwrap();
             let b = via_concrete.predict(t).unwrap();
-            assert!((a.value - b.value).abs() < 1e-12, "{} vs {}", a.value, b.value);
+            assert!(
+                (a.value - b.value).abs() < 1e-12,
+                "{} vs {}",
+                a.value,
+                b.value
+            );
             assert!(
                 (a.variance - b.variance).abs() < 1e-12,
                 "{} vs {}",

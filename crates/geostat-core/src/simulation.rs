@@ -22,7 +22,11 @@ use crate::transform::{NormalScore, Tails};
 use crate::variogram::VariogramModel;
 
 /// Configuration for sequential Gaussian simulation.
+///
+/// `#[non_exhaustive]`: construct via `SgsConfig { n_realizations, seed, ..
+/// Default::default() }` (AUDIT-2026-07-v2.md §6 Fase 5).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SgsConfig {
     /// Number of realizations to generate.
     pub n_realizations: usize,
@@ -153,8 +157,7 @@ fn sgs_at_with_levels<const D: usize>(
 ) -> Result<Vec<Vec<f64>>> {
     if model_ns.has_power() {
         return Err(GeostatError::InvalidParameter(
-            "SGS needs a valid covariance function and cannot use the unbounded Power model"
-                .into(),
+            "SGS needs a valid covariance function and cannot use the unbounded Power model".into(),
         ));
     }
     if cfg.n_realizations == 0 {

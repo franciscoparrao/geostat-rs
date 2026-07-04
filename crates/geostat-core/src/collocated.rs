@@ -51,7 +51,11 @@ pub enum MarkovModel {
 /// Search-neighbourhood configuration for [`CollocatedCokriging`] (primary
 /// data only; the secondary is always exactly the one value collocated with
 /// the target).
+///
+/// `#[non_exhaustive]`: construct via `CollocatedConfig { ridge, ..
+/// Default::default() }` (AUDIT-2026-07-v2.md §6 Fase 5).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[non_exhaustive]
 pub struct CollocatedConfig {
     /// Maximum number of nearest primary conditioning points (`None` = all).
     pub max_neighbors: Option<usize>,
@@ -111,10 +115,14 @@ impl<'a, const D: usize> CollocatedCokriging<'a, D> {
                     .into(),
             ));
         }
-        let dim_offender = model1.invalid_structure_for_dim(D).or_else(|| match &markov {
-            MarkovModel::Mm2 { secondary_model } => secondary_model.invalid_structure_for_dim(D),
-            MarkovModel::Mm1 => None,
-        });
+        let dim_offender = model1
+            .invalid_structure_for_dim(D)
+            .or_else(|| match &markov {
+                MarkovModel::Mm2 { secondary_model } => {
+                    secondary_model.invalid_structure_for_dim(D)
+                }
+                MarkovModel::Mm1 => None,
+            });
         if let Some(kind) = dim_offender {
             return Err(GeostatError::InvalidParameter(format!(
                 "{kind:?} is not a valid covariance in {D} dimensions; use Spherical instead for \
@@ -303,7 +311,13 @@ mod tests {
 
     fn primary() -> PointSet {
         PointSet::new(
-            vec![[0.0, 0.0], [10.0, 0.0], [0.0, 10.0], [10.0, 10.0], [5.0, 5.0]],
+            vec![
+                [0.0, 0.0],
+                [10.0, 0.0],
+                [0.0, 10.0],
+                [10.0, 10.0],
+                [5.0, 5.0],
+            ],
             vec![1.0, 2.0, 1.5, 2.5, 1.8],
         )
         .unwrap()
@@ -487,8 +501,8 @@ mod tests {
         let data = primary();
         let m1 = model1();
         let k = 4.0; // sigma2 = 2 * sigma1
-        let m2 = VariogramModel::new(0.0, vec![Structure::new(ModelKind::Spherical, k, 20.0)])
-            .unwrap();
+        let m2 =
+            VariogramModel::new(0.0, vec![Structure::new(ModelKind::Spherical, k, 20.0)]).unwrap();
         let sigma1 = 1.0;
         let sigma2 = (k * sigma1 * sigma1).sqrt();
         let rho12 = 0.7;

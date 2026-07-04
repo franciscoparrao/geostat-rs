@@ -347,7 +347,10 @@ fn guinness_blocks(plan: &VecchiaPlan, group_size: usize) -> Vec<(usize, usize)>
             let nb = &plan.neighbours[k1];
             let m = nb.len().max(1);
             let in_block = |j: &usize| plan.order[k0..k1].contains(j);
-            let new_count = nb.iter().filter(|j| !v_ids.contains(j) && !in_block(j)).count();
+            let new_count = nb
+                .iter()
+                .filter(|j| !v_ids.contains(j) && !in_block(j))
+                .count();
             if new_count as f64 > GUINNESS_MERGE_NEW_FRAC * m as f64 {
                 break;
             }
@@ -633,7 +636,7 @@ pub fn vecchia_loglik<const D: usize>(
 
 /// Like [`vecchia_loglik`], but amortizes Cholesky factorizations across
 /// blocks of `group_size` consecutive points in the ordering (Guinness 2018
-/// grouping; see [`loglik_with_plan_grouped`]). `group_size <= 1` reproduces
+/// grouping; see `loglik_with_plan_grouped`). `group_size <= 1` reproduces
 /// `vecchia_loglik` exactly; larger values trade a richer (never worse)
 /// per-point conditioning set for fewer, larger factorizations.
 pub fn vecchia_loglik_grouped<const D: usize>(
@@ -678,7 +681,7 @@ pub fn vecchia_mle<const D: usize>(
 }
 
 /// Like [`vecchia_mle`], but every likelihood evaluation in the optimizer's
-/// hot loop uses [`loglik_with_plan_grouped`] with the given `group_size`
+/// hot loop uses `loglik_with_plan_grouped` with the given `group_size`
 /// (Guinness 2018 grouping). This is where grouping earns its keep: the
 /// optimizer calls the likelihood thousands of times, so amortizing
 /// factorizations across blocks compounds directly into faster fits.
@@ -767,7 +770,10 @@ fn mle_fit_with_plan<const D: usize>(
         .map(|f| vec![(0.1 * var0).sqrt(), (0.9 * var0).ln(), ln_range0 + f.ln()])
         .collect();
     let (xb, neg_ll) = nelder_mead_multistart(objective, &starts, 0.3, 2000);
-    let model = VariogramModel::new(xb[0] * xb[0], vec![Structure::new(kind, xb[1].exp(), xb[2].exp())])?;
+    let model = VariogramModel::new(
+        xb[0] * xb[0],
+        vec![Structure::new(kind, xb[1].exp(), xb[2].exp())],
+    )?;
     Ok(VecchiaFit {
         model,
         loglik: -neg_ll,
@@ -955,7 +961,11 @@ fn standardized_drift_basis(drift: &[Vec<f64>]) -> Vec<Vec<f64>> {
         .map(|row| {
             let mut b = Vec::with_capacity(ncov + 1);
             b.push(1.0);
-            b.extend(row.iter().enumerate().map(|(k, &v)| (v - mean[k]) / scale[k]));
+            b.extend(
+                row.iter()
+                    .enumerate()
+                    .map(|(k, &v)| (v - mean[k]) / scale[k]),
+            );
             b
         })
         .collect()
@@ -1162,7 +1172,7 @@ pub fn vecchia_reml<const D: usize>(
 
 /// Like [`vecchia_reml`], grouping the REML likelihood's Cholesky
 /// factorizations by `group_size` (Guinness 2018; see
-/// [`reml_loglik_with_blocks`]). `group_size <= 1` reproduces
+/// `reml_loglik_with_blocks`). `group_size <= 1` reproduces
 /// `vecchia_reml` exactly.
 pub fn vecchia_reml_grouped<const D: usize>(
     data: &PointSet<D>,
@@ -1218,7 +1228,7 @@ pub fn vecchia_reml_drift<const D: usize>(
 }
 
 /// Grouped counterpart of [`vecchia_reml_drift`] (see
-/// [`reml_loglik_with_blocks`]). `group_size <= 1` reproduces
+/// `reml_loglik_with_blocks`). `group_size <= 1` reproduces
 /// `vecchia_reml_drift` exactly.
 #[allow(clippy::too_many_arguments)]
 pub fn vecchia_reml_drift_grouped<const D: usize>(
@@ -1328,7 +1338,10 @@ fn reml_fit_with_basis<const D: usize>(
         .map(|f| vec![(0.1 * var0).sqrt(), (0.9 * var0).ln(), ln_range0 + f.ln()])
         .collect();
     let (xb, neg_ll) = nelder_mead_multistart(objective, &starts, 0.3, 2000);
-    let model = VariogramModel::new(xb[0] * xb[0], vec![Structure::new(kind, xb[1].exp(), xb[2].exp())])?;
+    let model = VariogramModel::new(
+        xb[0] * xb[0],
+        vec![Structure::new(kind, xb[1].exp(), xb[2].exp())],
+    )?;
     Ok(VecchiaFit {
         model,
         loglik: -neg_ll,
@@ -1533,7 +1546,10 @@ mod tests {
             let mut covered = 0;
             for &(k0, k1) in &blocks {
                 assert_eq!(k0, covered, "blocks must tile 0..n with no gaps/overlap");
-                assert!(k1 > k0 && k1 - k0 <= g, "block ({k0},{k1}) exceeds group_size {g}");
+                assert!(
+                    k1 > k0 && k1 - k0 <= g,
+                    "block ({k0},{k1}) exceeds group_size {g}"
+                );
                 covered = k1;
             }
             assert_eq!(covered, plan.order.len());
@@ -1569,8 +1585,8 @@ mod tests {
         // exactly {0,...,k-1} regardless of group_size (see the doc comment
         // on `loglik_with_plan_grouped`).
         for group_size in [2, 3, 5, 8] {
-            let v = vecchia_loglik_grouped(&data, &model, data.len() - 1, None, group_size)
-                .unwrap();
+            let v =
+                vecchia_loglik_grouped(&data, &model, data.len() - 1, None, group_size).unwrap();
             assert!(
                 (v - exact).abs() < 1e-8,
                 "group_size {group_size}: vecchia {v} vs exact {exact}"
@@ -1613,7 +1629,9 @@ mod tests {
             grouped.loglik
         );
         assert!((ungrouped.model.nugget - grouped.model.nugget).abs() < 1e-4);
-        assert!((ungrouped.model.structures[0].sill - grouped.model.structures[0].sill).abs() < 1e-3);
+        assert!(
+            (ungrouped.model.structures[0].sill - grouped.model.structures[0].sill).abs() < 1e-3
+        );
         assert!(
             (ungrouped.model.structures[0].range - grouped.model.structures[0].range).abs() < 1e-2
         );

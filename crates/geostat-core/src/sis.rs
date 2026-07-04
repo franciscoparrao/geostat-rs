@@ -20,7 +20,11 @@ use crate::tails::{self, TailModel};
 use crate::variogram::VariogramModel;
 
 /// Configuration for sequential indicator simulation.
+///
+/// `#[non_exhaustive]`: construct via `SisConfig { cutoffs, models, ..
+/// Default::default() }` (AUDIT-2026-07-v2.md §6 Fase 5).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SisConfig {
     /// Indicator cutoffs, strictly ascending, inside the data value range.
     pub cutoffs: Vec<f64>,
@@ -29,7 +33,7 @@ pub struct SisConfig {
     /// the same spatial structure fit to the median cutoff's indicator and
     /// reused everywhere, which amortizes one factorization across every
     /// cutoff at each node instead of paying for `nc` (an ~nc× saving in
-    /// the hot loop; see [`indicator_ccdf`]). Sill ≈ p(1-p) either way.
+    /// the hot loop; see `indicator_ccdf`). Sill ≈ p(1-p) either way.
     pub models: Vec<VariogramModel>,
     /// Ordinary indicator kriging (`Σw=1`, no assumed known mean) instead of
     /// the default simple IK (global proportion as the known mean).
@@ -426,7 +430,8 @@ pub fn calibrate_markov_bayes(
         .map(|k| {
             let h: Vec<f64> = hard.iter().map(|r| r[k]).collect();
             let s: Vec<f64> = soft.iter().map(|r| r[k]).collect();
-            let (rho, _sigma_hard, sigma_soft) = crate::collocated::estimate_collocated_stats(&h, &s)?;
+            let (rho, _sigma_hard, sigma_soft) =
+                crate::collocated::estimate_collocated_stats(&h, &s)?;
             let mean_soft = s.iter().sum::<f64>() / s.len() as f64;
             Ok(MarkovBayesCalibration {
                 rho,
@@ -528,7 +533,11 @@ pub(crate) fn indicator_ccdf_soft<const D: usize>(
     ccdf: &mut [f64],
 ) -> Result<()> {
     for k in 0..cutoffs.len() {
-        let model = if models.len() == 1 { &models[0] } else { &models[k] };
+        let model = if models.len() == 1 {
+            &models[0]
+        } else {
+            &models[k]
+        };
         let w = indicator_weights_soft(coords, nb, model, target, calib[k])?;
         ccdf[k] = indicator_estimate_soft(
             &w,
@@ -798,12 +807,11 @@ mod tests {
         let mean_soft = 0.9;
         let soft_val = mean_soft;
         let est = indicator_estimate_soft(&w, &nb, &vals, cutoff, p, soft_val, mean_soft);
-        let hard_only: f64 = p
-            + w[..2]
-                .iter()
-                .zip(&nb)
-                .map(|(&wi, &i)| wi * (if vals[i] <= cutoff { 1.0 } else { 0.0 } - p))
-                .sum::<f64>();
+        let hard_only: f64 = p + w[..2]
+            .iter()
+            .zip(&nb)
+            .map(|(&wi, &i)| wi * (if vals[i] <= cutoff { 1.0 } else { 0.0 } - p))
+            .sum::<f64>();
         assert!(
             (est - hard_only).abs() < 1e-12,
             "soft term should vanish when soft_val == mean_soft: {est} vs {hard_only}"

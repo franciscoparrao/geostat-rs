@@ -712,7 +712,9 @@ pub fn read_raster(path: &Path, layer: Option<&str>) -> Result<RasterGrid> {
 }
 
 /// Decodes a 16-bit grayscale PNG tile into a `tw*th` row-major `u16` buffer.
-fn decode_png_u16(blob: &[u8], tw: usize, th: usize) -> Result<Vec<u16>> {
+/// `pub` so `fuzz/fuzz_targets/gpkg_decode_png.rs` can drive it directly on
+/// arbitrary bytes without a real GeoPackage.
+pub fn decode_png_u16(blob: &[u8], tw: usize, th: usize) -> Result<Vec<u16>> {
     let dec = png::Decoder::new(std::io::Cursor::new(blob));
     let mut reader = dec
         .read_info()
@@ -762,7 +764,9 @@ fn rd_f64(b: &[u8], le: bool) -> f64 {
 
 /// Decodes the (x, y) of a point from a GeoPackageBinary blob: a `GP` header
 /// (magic, version, flags, srs_id, optional envelope) followed by standard WKB.
-fn decode_point(blob: &[u8]) -> Result<(f64, f64)> {
+/// `pub` so `fuzz/fuzz_targets/gpkg_decode_point.rs` can drive it directly on
+/// arbitrary bytes without a real GeoPackage.
+pub fn decode_point(blob: &[u8]) -> Result<(f64, f64)> {
     if blob.len() < 8 || &blob[0..2] != b"GP" {
         bail!("not a GeoPackage geometry blob");
     }

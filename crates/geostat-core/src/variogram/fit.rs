@@ -124,7 +124,10 @@ pub fn fit_model_weighted(
         .collect();
     let (xb, wsse) = nelder_mead_multistart(objective, &starts, 0.25, 1000);
 
-    let model = VariogramModel::new(xb[0] * xb[0], vec![Structure::new(kind, xb[1].exp(), xb[2].exp())])?;
+    let model = VariogramModel::new(
+        xb[0] * xb[0],
+        vec![Structure::new(kind, xb[1].exp(), xb[2].exp())],
+    )?;
     Ok(FitResult { model, wsse })
 }
 
@@ -262,7 +265,11 @@ pub fn fit_stable(exp_v: &ExperimentalVariogram) -> Result<FitResult> {
     let alpha = 1.0 + xb[3].tanh();
     let model = VariogramModel::new(
         xb[0] * xb[0],
-        vec![Structure::new(ModelKind::Stable(alpha), xb[1].exp(), xb[2].exp())],
+        vec![Structure::new(
+            ModelKind::Stable(alpha),
+            xb[1].exp(),
+            xb[2].exp(),
+        )],
     )?;
     Ok(FitResult { model, wsse })
 }
@@ -665,9 +672,8 @@ mod tests {
         // needed. theta is fixed (part of the requested ModelKind, like
         // Matern's nu), only nugget/slope are fit; range is ignored (see
         // ModelKind::Power docs) so any positive placeholder recovers.
-        let truth =
-            VariogramModel::new(0.2, vec![Structure::new(ModelKind::Power(1.2), 1.5, 1.0)])
-                .unwrap();
+        let truth = VariogramModel::new(0.2, vec![Structure::new(ModelKind::Power(1.2), 1.5, 1.0)])
+            .unwrap();
         let ev = synthetic_bins(&truth, 20.0, 15);
         let fit = fit_model(&ev, ModelKind::Power(1.2)).unwrap();
         assert!(
@@ -696,14 +702,18 @@ mod tests {
         ] {
             let fit = fit_model_weighted(&ev, ModelKind::Spherical, w).unwrap();
             let s = fit.model.structures[0];
-            assert!((fit.model.nugget - 0.1).abs() < 0.05, "{w:?}: nugget {}", fit.model.nugget);
+            assert!(
+                (fit.model.nugget - 0.1).abs() < 0.05,
+                "{w:?}: nugget {}",
+                fit.model.nugget
+            );
             assert!((s.sill - 0.9).abs() < 0.1, "{w:?}: sill {}", s.sill);
             assert!((s.range - 300.0).abs() < 30.0, "{w:?}: range {}", s.range);
         }
         // `fit_model` is exactly the NOverHSquared scheme.
         let default_fit = fit_model(&ev, ModelKind::Spherical).unwrap();
-        let weighted_fit = fit_model_weighted(&ev, ModelKind::Spherical, FitWeights::NOverHSquared)
-            .unwrap();
+        let weighted_fit =
+            fit_model_weighted(&ev, ModelKind::Spherical, FitWeights::NOverHSquared).unwrap();
         assert_eq!(default_fit.model, weighted_fit.model);
     }
 
@@ -727,7 +737,11 @@ mod tests {
                 "true_nu={true_nu}: nugget {}",
                 fit.model.nugget
             );
-            assert!((s.sill - 0.92).abs() < 0.05, "true_nu={true_nu}: sill {}", s.sill);
+            assert!(
+                (s.sill - 0.92).abs() < 0.05,
+                "true_nu={true_nu}: sill {}",
+                s.sill
+            );
             assert!(
                 (s.range - 250.0).abs() < 25.0,
                 "true_nu={true_nu}: range {}",
@@ -754,13 +768,21 @@ mod tests {
             let ModelKind::Stable(alpha) = s.kind else {
                 panic!("expected Stable, got {:?}", s.kind)
             };
-            assert!(fit.wsse < 1e-6, "true_alpha={true_alpha}: wsse {}", fit.wsse);
+            assert!(
+                fit.wsse < 1e-6,
+                "true_alpha={true_alpha}: wsse {}",
+                fit.wsse
+            );
             assert!(
                 (fit.model.nugget - 0.05).abs() < 0.02,
                 "true_alpha={true_alpha}: nugget {}",
                 fit.model.nugget
             );
-            assert!((s.sill - 0.95).abs() < 0.05, "true_alpha={true_alpha}: sill {}", s.sill);
+            assert!(
+                (s.sill - 0.95).abs() < 0.05,
+                "true_alpha={true_alpha}: sill {}",
+                s.sill
+            );
             assert!(
                 (s.range - 200.0).abs() < 20.0,
                 "true_alpha={true_alpha}: range {}",

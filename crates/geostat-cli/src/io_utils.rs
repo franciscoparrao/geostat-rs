@@ -310,3 +310,152 @@ fn writer(path: &Path) -> Result<BufWriter<File>> {
         format!("cannot create output file {}", path.display())
     })?))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // No `tempfile` dependency in this workspace: build unique paths under
+    // the OS temp dir instead (pid + a per-process counter, so parallel
+    // `#[test]` threads in this binary never collide).
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "geostat-io-utils-test-{}-{n}-{name}",
+            std::process::id()
+        ))
+    }
+
+    fn write_csv(path: &Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn read_points_happy_path() {
+        let path = temp_path("points.csv");
+        write_csv(&path, "x,y,z\n0,0,1.0\n1,0,2.0\n0,1,1.5\n");
+        let data = read_points(&path, "x", "y", "z").unwrap();
+        assert_eq!(data.len(), 3);
+        assert_eq!(data.coord(1), [1.0, 0.0]);
+        assert_eq!(data.value(1), 2.0);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_points_reports_missing_column_and_lists_available() {
+        let path = temp_path("points_bad_col.csv");
+        write_csv(&path, "east,north,val\n0,0,1.0\n");
+        let err = read_points(&path, "x", "y", "val").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("column 'x' not found"), "{msg}");
+        assert!(msg.contains("east"), "should list available columns: {msg}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_points_skips_missing_or_non_numeric_rows() {
+        let path = temp_path("points_missing.csv");
+        write_csv(
+            &path,
+            "x,y,z\n0,0,1.0\n1,0,\n2,0,NaN\n3,0,na\n4,0,not_a_number\n5,0,2.0\n",
+        );
+        // 4 of 6 rows are unparseable/missing; only the two clean rows survive.
+        let data = read_points(&path, "x", "y", "z").unwrap();
+        assert_eq!(data.len(), 2);
+        assert_eq!(data.value(0), 1.0);
+        assert_eq!(data.value(1), 2.0);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_points_errors_when_every_row_is_skipped() {
+        let path = temp_path("points_all_missing.csv");
+        write_csv(&path, "x,y,z\n0,0,\n1,0,na\n");
+        let err = read_points(&path, "x", "y", "z").unwrap_err();
+        assert!(format!("{err}").contains("no valid data rows"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_points_with_extras_reads_drift_columns() {
+        let path = temp_path("points_extras.csv");
+        write_csv(&path, "x,y,z,sdist\n0,0,1.0,0.1\n1,0,2.0,0.2\n");
+        let (data, extras) =
+            read_points_with_extras(&path, "x", "y", "z", &["sdist".to_string()]).unwrap();
+        assert_eq!(data.len(), 2);
+        assert_eq!(extras, vec![vec![0.1], vec![0.2]]);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_points3_assembles_xyz_and_value_correctly() {
+        let path = temp_path("points3.csv");
+        write_csv(&path, "x,y,z,grade\n0,0,5,1.0\n1,2,3,2.5\n");
+        let data = read_points3(&path, "x", "y", "z", "grade").unwrap();
+        assert_eq!(data.len(), 2);
+        assert_eq!(data.coord(0), [0.0, 0.0, 5.0]);
+        assert_eq!(data.value(0), 1.0);
+        assert_eq!(data.coord(1), [1.0, 2.0, 3.0]);
+        assert_eq!(data.value(1), 2.5);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_targets_and_targets3_round_trip_coordinates_and_extras() {
+        let path = temp_path("targets.csv");
+        write_csv(&path, "x,y,sdist\n0,0,0.1\n1,1,0.2\n");
+        let (coords, extras) = read_targets(&path, "x", "y", &["sdist".to_string()]).unwrap();
+        assert_eq!(coords, vec![[0.0, 0.0], [1.0, 1.0]]);
+        assert_eq!(extras, vec![vec![0.1], vec![0.2]]);
+        std::fs::remove_file(&path).ok();
+
+        let path3 = temp_path("targets3.csv");
+        write_csv(&path3, "x,y,z\n0,0,5\n1,2,3\n");
+        let targets3 = read_targets3(&path3, "x", "y", "z").unwrap();
+        assert_eq!(targets3, vec![[0.0, 0.0, 5.0], [1.0, 2.0, 3.0]]);
+        std::fs::remove_file(&path3).ok();
+    }
+
+    #[test]
+    fn model_json_round_trips_through_read_and_write() {
+        let path = temp_path("model.json");
+        let model = VariogramModel::new(
+            0.1,
+            vec![geostat_core::Structure::new(
+                geostat_core::ModelKind::Spherical,
+                0.9,
+                10.0,
+            )],
+        )
+        .unwrap();
+        write_model(&path, &model).unwrap();
+        let back = read_model(&path).unwrap();
+        assert_eq!(back.nugget, model.nugget);
+        assert_eq!(back.structures.len(), 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_model_reports_a_clear_error_for_a_missing_file() {
+        let path = temp_path("does-not-exist.json");
+        let err = read_model(&path).unwrap_err();
+        assert!(format!("{err}").contains("cannot open model file"));
+    }
+
+    #[test]
+    fn write_grid_csv_matches_grid_cell_count_and_order() {
+        let path = temp_path("grid.csv");
+        let grid = Grid2D::from_bbox([0.0, 0.0], [1.0, 1.0], 2, 2).unwrap();
+        let values = vec![1.0, 2.0, 3.0, 4.0];
+        let variances = vec![0.1, 0.2, 0.3, 0.4];
+        write_grid_csv(&path, &grid, &values, &variances).unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines[0], "x,y,prediction,variance");
+        assert_eq!(lines.len(), 1 + grid.n_cells());
+        std::fs::remove_file(&path).ok();
+    }
+}

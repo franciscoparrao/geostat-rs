@@ -15,5 +15,5 @@ pub use fit::{
     FitResult, FitWeights, fit_anisotropic, fit_best, fit_indicator_models, fit_matern,
     fit_median_indicator_model, fit_model, fit_model_weighted, fit_nested, fit_stable,
 };
-pub use map::{VariogramMap, variogram_map};
+pub use map::{VariogramMap, default_lag_width, variogram_map};
 pub use model::{Anisotropy, MATERN_NU_MAX, ModelKind, Structure, VariogramModel};

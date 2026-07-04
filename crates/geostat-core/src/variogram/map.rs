@@ -69,6 +69,21 @@ impl Acc {
     }
 }
 
+/// Data-driven default cell size for [`variogram_map`]: a fraction (a
+/// fifteenth by default in the CLI/Python front-ends) of the data's
+/// bounding-box half-diagonal, so the map covers the data's spatial extent
+/// without every front-end reimplementing this bbox/diagonal computation
+/// (AUDIT-2026-07-v2.md §6 Fase 5: `lag_width = 1.0` was hardcoded in the
+/// Python binding — an arbitrary, often-degenerate default in UTM-scale
+/// coordinates). `n_lags` must be at least 1 (matches [`variogram_map`]'s
+/// own validation, which the caller should still rely on for the actual
+/// error).
+pub fn default_lag_width(data: &PointSet<2>, n_lags: usize) -> f64 {
+    let (min, max) = data.bbox();
+    let diag = ((max[0] - min[0]).powi(2) + (max[1] - min[1]).powi(2)).sqrt();
+    diag / 2.0 / n_lags.max(1) as f64
+}
+
 /// Computes a 2-D variogram map with `n_lags` cells on each side of the origin
 /// and a cell size of `lag_width` distance units. Each unordered pair is binned
 /// at both `(h_x, h_y)` and `(-h_x, -h_y)`, so the surface is symmetric.

@@ -2,10 +2,10 @@
 //! `PointSet<3>` — same code paths as 2-D via const generics.
 
 use geostat_core::{
-    CollocatedConfig, CollocatedCokriging, Grid3D, IkConfig, Kriging, KrigingConfig,
-    KrigingMethod, MarkovModel, ModelKind, PointSet, Rng, SgsConfig, SisConfig, Structure,
-    TailModel, VariogramConfig, VariogramModel, experimental_variogram, fit_best,
-    indicator_kriging, leave_one_out, sgs_at, sis_at, vecchia_loglik, vecchia_predict,
+    CollocatedCokriging, CollocatedConfig, Grid3D, IkConfig, Kriging, KrigingConfig, KrigingMethod,
+    MarkovModel, ModelKind, PointSet, Rng, SgsConfig, SisConfig, Structure, VariogramConfig,
+    VariogramModel, experimental_variogram, fit_best, indicator_kriging, leave_one_out, sgs_at,
+    sis_at, vecchia_loglik, vecchia_predict,
 };
 
 fn synthetic_3d(n: usize, seed: u64) -> PointSet<3> {
@@ -148,13 +148,13 @@ fn sgs_3d_reproducible_and_bounded() {
     )
     .unwrap();
     let grid = Grid3D::from_bbox([0.0, 0.0, 0.0], [100.0, 100.0, 40.0], 8, 8, 4).unwrap();
-    let cfg = SgsConfig {
-        n_realizations: 2,
-        seed: 31,
-        max_neighbors: 12,
-        search_radius: None,
-        ..Default::default()
-    };
+    // `SgsConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields.
+    let mut cfg = SgsConfig::default();
+    cfg.n_realizations = 2;
+    cfg.seed = 31;
+    cfg.max_neighbors = 12;
+    cfg.search_radius = None;
     let a = sgs_at(&data, &model, &grid.centers(), &cfg).unwrap();
     let b = sgs_at(&data, &model, &grid.centers(), &cfg).unwrap();
     assert_eq!(a, b);
@@ -274,29 +274,23 @@ fn vecchia_3d_rejects_circular_model() {
 #[test]
 fn sis_3d_rejects_circular_model() {
     let data = synthetic_3d(30, 3);
-    let cfg = SisConfig {
-        cutoffs: vec![0.0],
-        models: vec![circular_model_3d()],
-        n_realizations: 1,
-        ..SisConfig::default()
-    };
+    // `SisConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields.
+    let mut cfg = SisConfig::default();
+    cfg.cutoffs = vec![0.0];
+    cfg.models = vec![circular_model_3d()];
+    cfg.n_realizations = 1;
     assert!(sis_at(&data, &[[1.0, 1.0, 1.0]], &cfg).is_err());
 }
 
 #[test]
 fn ik_3d_rejects_circular_model() {
     let data = synthetic_3d(30, 3);
-    let cfg = IkConfig {
-        cutoffs: vec![0.0],
-        models: vec![circular_model_3d()],
-        ordinary: false,
-        max_neighbors: None,
-        search_radius: None,
-        tail_min: None,
-        tail_max: None,
-        lower_tail: TailModel::Linear,
-        upper_tail: TailModel::Linear,
-    };
+    // `IkConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields.
+    let mut cfg = IkConfig::default();
+    cfg.cutoffs = vec![0.0];
+    cfg.models = vec![circular_model_3d()];
     assert!(indicator_kriging(&data, &[[1.0, 1.0, 1.0]], &cfg).is_err());
 }
 
@@ -319,8 +313,8 @@ fn collocated_3d_rejects_circular_model() {
         .is_err()
     );
     // Circular as MM2's secondary-only model, with a valid primary.
-    let primary = VariogramModel::new(0.01, vec![Structure::new(ModelKind::Spherical, 1.0, 30.0)])
-        .unwrap();
+    let primary =
+        VariogramModel::new(0.01, vec![Structure::new(ModelKind::Spherical, 1.0, 30.0)]).unwrap();
     assert!(
         CollocatedCokriging::<3>::new(
             &data,

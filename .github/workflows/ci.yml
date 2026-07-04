@@ -60,3 +60,81 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Check with minimum supported Rust
         run: cargo check --workspace
+
+  docs:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Scoped to geostat-core + geostat-cli (the crates meant for docs.rs):
+      # geostat-python/geostat-wasm are `publish = false` bindings whose
+      # `///` comments double as PyO3/wasm-bindgen docstrings, and
+      # documenting geostat-python currently trips an upstream rustdoc ICE
+      # when resolving intra-doc links inside the `numpy` crate's own
+      # source (unrelated to this crate's code).
+      - name: Build docs (deny warnings, matches docs.rs)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p geostat-core -p geostat-cli --no-deps
+
+  python:
+    name: maturin build + import smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install maturin
+        run: pip install maturin
+      - name: Build and install the wheel into a venv
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install numpy
+          maturin develop --release --manifest-path crates/geostat-python/Cargo.toml
+      - name: Import smoke test
+        run: |
+          source .venv/bin/activate
+          python -c "
+          import geostat_rs as g
+          import numpy as np
+          assert g.__version__, 'missing __version__'
+          x = [0.0, 1.0, 0.0, 1.0, 0.4]
+          y = [0.0, 0.0, 1.0, 1.0, 0.6]
+          z = [1.0, 2.0, 1.5, 2.5, 1.7]
+          model = g.fit_variogram(x, y, z, n_lags=3, max_dist=1.5)
+          pred, var = g.krige_grid(x, y, z, model, bbox=(0, 0, 1, 1), nx=5, ny=5)
+          assert isinstance(pred, np.ndarray) and pred.shape == (25,)
+          print('geostat_rs', g.__version__, 'import + krige_grid smoke test OK')
+          "
+
+  fuzz-smoke:
+    name: fuzz smoke (short run, catches immediate crashes/regressions)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            crates/geostat-core/fuzz -> target
+            crates/geostat-cli/fuzz -> target
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz model_kind_parse (short run)
+        run: cargo +nightly fuzz run model_kind_parse -- -max_total_time=30
+        working-directory: crates/geostat-core/fuzz
+      - name: Fuzz variogram_model_json (short run)
+        run: cargo +nightly fuzz run variogram_model_json -- -max_total_time=30
+        working-directory: crates/geostat-core/fuzz
+      - name: Fuzz gpkg_decode_point (short run)
+        run: cargo +nightly fuzz run gpkg_decode_point -- -max_total_time=30
+        working-directory: crates/geostat-cli/fuzz
+      - name: Fuzz gpkg_decode_png (short run)
+        run: cargo +nightly fuzz run gpkg_decode_png -- -max_total_time=30
+        working-directory: crates/geostat-cli/fuzz

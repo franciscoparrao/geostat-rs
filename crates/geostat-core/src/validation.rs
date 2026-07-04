@@ -404,7 +404,9 @@ impl AccuracyPlot {
     /// requested probability (Deutsch's "accurate" criterion — the model is
     /// never overconfident, though it may be imprecise).
     pub fn is_accurate(&self) -> bool {
-        self.points.iter().all(|pt| pt.observed >= pt.nominal - 1e-9)
+        self.points
+            .iter()
+            .all(|pt| pt.observed >= pt.nominal - 1e-9)
     }
 }
 
@@ -427,7 +429,12 @@ impl AccuracyPlot {
 /// uncertainty is the worse failure mode). `G = 1` exactly when
 /// `p̄_k = p_k` for every `k` (perfect calibration); `G < 1` for any
 /// miscalibration in either direction.
-pub fn accuracy_plot(actual: &[f64], mean: &[f64], std: &[f64], probs: &[f64]) -> Result<AccuracyPlot> {
+pub fn accuracy_plot(
+    actual: &[f64],
+    mean: &[f64],
+    std: &[f64],
+    probs: &[f64],
+) -> Result<AccuracyPlot> {
     if actual.len() != mean.len() || actual.len() != std.len() {
         return Err(GeostatError::DimensionMismatch(format!(
             "{} actual, {} mean, {} std",
@@ -733,14 +740,16 @@ mod tests {
 
     #[test]
     fn accuracy_plot_goodness_is_one_when_observed_matches_nominal_exactly() {
-        let points = [AccuracyPoint {
+        let points = [
+            AccuracyPoint {
                 nominal: 0.3,
                 observed: 0.3,
             },
             AccuracyPoint {
                 nominal: 0.7,
                 observed: 0.7,
-            }];
+            },
+        ];
         let goodness = 1.0
             - points
                 .iter()

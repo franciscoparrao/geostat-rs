@@ -209,9 +209,7 @@ mod tests {
             method: KrigingMethod::Simple { mean: 0.0 },
             ..Default::default()
         };
-        assert!(
-            lognormal_kriging(&data, &[[10.0, 10.0]], &power_model, &simple_cfg).is_err()
-        );
+        assert!(lognormal_kriging(&data, &[[10.0, 10.0]], &power_model, &simple_cfg).is_err());
     }
 
     #[test]

@@ -1,9 +1,15 @@
 # geostat-rs
 
+[![CI](https://github.com/franciscoparrao/geostat-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/franciscoparrao/geostat-rs/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 Geostatistics engine in pure Rust: variography, kriging and sequential
-Gaussian simulation. A modern, single-binary take on the GSLIB / gstat
+Gaussian/indicator simulation, plus a scalable Vecchia approximation for
+large point sets. A modern, single-binary take on the GSLIB / gstat
 feature set, with deterministic stochastic simulation and parallel
-prediction out of the box.
+prediction out of the box, validated against gstat at machine precision.
+
+Not yet published to crates.io/PyPI — build from source (see below).
 
 ## Crates
 
@@ -14,28 +20,51 @@ prediction out of the box.
 | `geostat-python` | Python module `geostat_rs` (PyO3, abi3 ≥ 3.9). Build with maturin. |
 | `geostat-wasm` | WebAssembly bindings (wasm-bindgen); demo in `examples/wasm-demo/`. |
 
-## Features (v0.6)
+## Features (v0.7)
 
 - **2-D and 3-D** — the engine is generic over dimension (`PointSet<2>` /
   `PointSet<3>`); variography, kriging, CV and SGS all run in 3-D through
   the same validated code paths.
 - **Experimental variograms** — omnidirectional, directional (azimuth +
   dip cone in 3-D, gstat/GSLIB convention) and cross-variograms.
-- **Theoretical models** — spherical, exponential, Gaussian, Matérn
-  (ν = 3/2, 5/2), nested structures plus nugget, with geometric
-  anisotropy per structure (azimuth + horizontal ratio + vertical ratio).
-- **Model fitting** — weighted least squares (`N_j / h_j²` weights,
-  gstat's default) via Nelder–Mead; automatic best-family selection;
-  2-variable LMC fitting with PSD projection.
+- **Theoretical models** — spherical, exponential, Gaussian, Matérn with
+  **continuous ν** (Bessel-quadrature evaluation; ν = 3/2, 5/2 also have
+  closed forms), circular, stable (power-exponential), hole-effect and
+  wave (cardinal-sine), and **Power** (IRF-0, unbounded, kriged directly in
+  semivariogram form). Nested multi-structure models plus nugget, with
+  geometric anisotropy per structure — full 3-D rotation
+  (azimuth/dip/rake, GSLIB `setrot`) and zonal anisotropy.
+- **Model fitting** — weighted least squares via Nelder–Mead
+  (log-parametrized, multi-start), with selectable weight schemes
+  (`N_j/h_j²` gstat default, `N_j`, Cressie `N_j/γ(h_j)²`, OLS); automatic
+  best-family selection; multi-structure nesting; joint `ν`/`α` fitting for
+  Matérn/stable; geometric-anisotropy auto-fit; N-variable-capable LMC
+  prediction (2-variable iterated Goulard–Voltz fit) with PSD projection.
 - **Kriging** — simple, ordinary, universal (polynomial drift) and
   **external drift** (KED); **ordinary co-kriging** (collocated or
-  **heterotopic**) under a linear model of coregionalization; **block
+  **heterotopic**) and **collocated cokriging** (MM1/MM2, Journel 1999,
+  core-only for now) under a linear model of coregionalization; **block
   kriging** and **block co-kriging** with explicit discretization;
-  **lognormal kriging** (unbiased back-transform); standalone **indicator
-  kriging** (local ccdf, E-type estimate, conditional variance);
+  **lognormal kriging** (unbiased back-transform); **median/ordinary
+  indicator kriging** (local ccdf, E-type estimate, conditional variance),
+  with **Markov-Bayes** calibration of soft secondary data (core-only);
   **regression kriging** (a trend fitted separately — built-in OLS or any
-  external/ML model — plus kriging of its residuals); kd-tree moving
-  neighborhoods; parallel over targets; variance maps.
+  external/ML model — plus kriging of its residuals); per-datum
+  **measurement error** (gstat `Err`); octant search (GSLIB `noct`) and
+  `min_neighbors` (`ndmin`); kd-tree moving neighborhoods; parallel over
+  targets; variance maps.
+- **Vecchia approximation** — for point sets too large for exact kriging:
+  O(n log n) maxmin ordering, likelihood-based maximum-likelihood/REML
+  fitting (including external-drift REML and joint Matérn-`ν` MLE),
+  Guinness (2018) likelihood grouping, and joint prediction (Katzfuss &
+  Guinness 2021) that stays consistent across targets as `m` grows.
+- **Simulation** — conditional sequential **Gaussian** simulation
+  (normal-score transform, GSLIB-style tail extrapolation, cell
+  declustering + weighted normal scores, multiple-grid path, separate
+  data/simulated-node neighbor quotas) and sequential **indicator**
+  simulation (ccdf with order-relation corrections), both with a
+  deterministic, platform-independent RNG (xoshiro256++) and incremental
+  bucket-grid neighbor search: same seed, same realizations, anywhere.
 - **Mathematical interpolators** — inverse-distance weighting and
   k-nearest-neighbor averaging (k = 1 is nearest-neighbor / Voronoi), as
   assumption-light baselines for fair method comparison.
@@ -56,20 +85,18 @@ prediction out of the box.
   writes a point layer (prediction + variance) — or, with `--raster`, a
   single-band **2D-gridded-coverage** raster (16-bit PNG tile, values
   preserved via scale/offset) — with a recorded CRS, readable by QGIS/GDAL.
-- **Validation** — leave-one-out cross-validation with error measures
-  (ME, MAE, MSE, RMSE, MSDR), scale-free relative measures (RME, RMAE,
-  RRMSE) and predictive-accuracy measures **VEcv** (variance explained by
-  cross-validation, Li 2016) and **E₁** (Legates–McCabe), with or without
-  external drift.
-- **Simulation** — conditional sequential **Gaussian** simulation
-  (normal-score transform) and sequential **indicator** simulation
-  (GSLIB-style ccdf with order-relation corrections), both with a
-  deterministic, platform-independent RNG (xoshiro256++) and incremental
-  bucket-grid neighbor search: same seed, same realizations, anywhere.
-- **Benchmarks** — criterion suite (`cargo bench -p geostat-core`).
+- **Validation** — leave-one-out, k-fold and **spatial block**
+  cross-validation, with error measures (ME, MAE, MSE, RMSE, MSDR),
+  scale-free relative measures (RME, RMAE, RRMSE), predictive-accuracy
+  measures **VEcv** (Li 2016) and **E₁** (Legates–McCabe), and
+  **Deutsch (1997) accuracy plots** for checking whether kriging variances
+  are well calibrated, with or without external drift.
+- **Benchmarks** — criterion suite (`cargo bench -p geostat-core`);
+  proptest property tests and `cargo-fuzz` targets for parser robustness.
 - **Bindings** — Python (`import geostat_rs`: variography, kriging, CV,
-  SGS, SIS, IK, all with 3-D variants) and WebAssembly (browser demo in
-  `examples/wasm-demo/`).
+  SGS, SIS, IK, all with 3-D variants; zero-copy numpy outputs, GIL
+  released during computation, `.pyi` type stubs) and WebAssembly (browser
+  demo in `examples/wasm-demo/`).
 
 ## Build
 
@@ -141,6 +168,16 @@ geostat krige -i meuse.gpkg --value-col lzinc -m model.json \
     --nx 100 --ny 100 --srs 28992 -o kriged.gpkg           # write a .gpkg point layer
 geostat krige -i meuse.gpkg --value-col lzinc -m model.json \
     --nx 200 --ny 200 --srs 28992 --raster -o kriged.gpkg  # write a single-band raster
+
+# 15. Vecchia: scalable ML covariance fitting + prediction for large n
+#     (O(n log n) plan; --trend for REML under a spatial trend)
+geostat variogram -i drillholes.csv --value-col grade \
+    --mle --cond 20 --model-out model_ml.json
+geostat krige -i drillholes.csv --value-col grade -m model_ml.json \
+    --vecchia 20 --nx 200 --ny 200 -o kriged_vecchia.csv
+
+# 16. Spatial block CV + Deutsch accuracy plot (honest error under autocorrelation)
+geostat cv -i meuse.csv --value-col zinc -m model.json --blocks 4,4 --accuracy
 ```
 
 Other useful flags: `--azimuth/--dip/--tolerance` (directional variograms,
@@ -211,15 +248,26 @@ are comparable across families.
   with Li's spm::pred.acc); ✅ regression kriging (separate trend + residual
   kriging), the bridge to an ML trend engine; ✅ IDW/k-NN/NN baselines + a
   VEcv method-comparison harness; ✅ hyperparameter tuning by predictive
-  accuracy (IDW power, k-NN k, kriging neighborhood).
+  accuracy (IDW power, k-NN k, kriging neighborhood); ✅ GeoPackage I/O
+  (point reading + point-layer writing + single-band raster /
+  2D-gridded-coverage output).
+- v0.7: ✅ Vecchia approximation (O(n log n) plan, MLE/REML, Guinness
+  grouping, joint prediction) for large point sets; ✅ Matérn with
+  continuous ν, plus circular/stable/hole/wave/Power families, full 3-D
+  rotation and zonal anisotropy; ✅ cell declustering + weighted normal
+  scores; ✅ GSLIB tail extrapolation for SGS/SIS/IK back-transforms;
+  ✅ median/ordinary indicator kriging, collocated cokriging (MM1/MM2) and
+  Markov-Bayes soft-data calibration; ✅ per-datum measurement error,
+  octant search; ✅ spatial block CV and Deutsch accuracy plots;
+  ✅ public `Covariance` trait, zero-copy numpy bindings, proptest/fuzz
+  coverage. See `docs/AUDIT-2026-07.md` and `docs/AUDIT-2026-07-v2.md` for
+  the full audit trail behind this release.
 - ML+geostatistics hybrids: regression kriging accepts an external trend, so
   an ML model supplies the mean and geostat-rs kriges the residuals. See
   `examples/hybrid_smelt_rk.py` for an RFOK-style hybrid built entirely from
   the author's Rust engines — a Smelt random-forest trend + residual kriging
   here — scored by VEcv.
-- Next: paper draft (Computers & Geosciences); GeoPackage I/O for SurtGIS
-  integration (✅ point reading + point-layer writing + single-band raster /
-  2D-gridded-coverage output).
+- Next: paper draft (Mathematical Geosciences); publish to crates.io/PyPI.
 
 ## Python quickstart
 
@@ -267,4 +315,5 @@ gs.tune_knn_k(x, y, vals); gs.tune_kriging_neighbors(x, y, vals)
 
 ## License
 
-MIT OR Apache-2.0
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at
+your option.

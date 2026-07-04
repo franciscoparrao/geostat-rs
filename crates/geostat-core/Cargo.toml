@@ -16,6 +16,9 @@ default = ["parallel"]
 # Parallel execution via rayon. Disable for single-threaded targets (wasm32).
 parallel = ["dep:rayon"]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [dependencies]
 ndarray = { workspace = true }
 rayon = { workspace = true, optional = true }

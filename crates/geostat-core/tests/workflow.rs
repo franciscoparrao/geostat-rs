@@ -73,13 +73,13 @@ fn full_workflow_on_synthetic_field() {
 
     // 5. SGS conditioned on the data: reproducible, in data range, and with
     //    realistic spread across realizations.
-    let sgs_cfg = SgsConfig {
-        n_realizations: 5,
-        seed: 99,
-        max_neighbors: 16,
-        search_radius: None,
-        ..Default::default()
-    };
+    // `SgsConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields.
+    let mut sgs_cfg = SgsConfig::default();
+    sgs_cfg.n_realizations = 5;
+    sgs_cfg.seed = 99;
+    sgs_cfg.max_neighbors = 16;
+    sgs_cfg.search_radius = None;
     let sim = sequential_gaussian_simulation(&data, model, &grid, &sgs_cfg).unwrap();
     assert_eq!(sim.realizations.len(), 5);
     let (dmin, dmax) = data
