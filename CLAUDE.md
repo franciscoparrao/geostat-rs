@@ -358,8 +358,52 @@ Computers & Geosciences.
     desde una curva sintética. **Con esto el ítem #16 queda 100%
     completo.** 189 tests, clippy limpio, paridad gstat re-confirmada.
 
-    Quedan los ítems #18 (block CV espacial, accuracy plots de Deutsch),
-    #19 (trait de covarianza, rust-numpy, proptest, publicación
-    crates.io/PyPI), y exponer collocated cokriging/Markov-Bayes/block IRF-0
-    en CLI/Python (todo deliberadamente diferido, alcance de esta sesión: el
-    núcleo del motor).
+12. **Ítem #18 (2026-07-03): block CV espacial + accuracy plots de Deutsch**
+    hecho. `validation.rs::block_cv` reusa el mismo núcleo per-fold que
+    `k_fold` (refactorizado a `cv_with_folds`, compartido por ambos) pero
+    con una asignación de folds **geométrica** (`spatial_block_assignment`:
+    grilla regular `blocks_per_dim` sobre el bounding box) en vez del
+    shuffle aleatorio de `k_fold` — agrupa puntos espacialmente contiguos
+    en el mismo fold, el remedio estándar al sesgo optimista de LOO/k-fold
+    aleatorio bajo autocorrelación espacial (dejar fuera un punto a la vez,
+    o puntos dispersos aleatoriamente entre folds, deja a cada punto
+    retirado rodeado de vecinos casi-duplicados en el entrenamiento).
+    Validado por: cobertura completa de puntos + señal predictiva bajo el
+    esquema más duro; y un test que **prueba el punto central de la
+    feature** — sobre un campo muy suave (rango largo vs. dominio), block
+    CV da RMSE ≥ k-fold aleatorio (bloques fuerzan distancias de
+    predicción genuinamente más largas). Folds vacíos (posibles con una
+    nube de puntos irregular) se saltan sin error.
+
+    **Accuracy plots de Deutsch (1997)**: `AccuracyPoint`/`AccuracyPlot` +
+    `accuracy_plot(actual, mean, std, probs)` — para cada probabilidad
+    nominal p (ej. 0.1..0.9), construye el intervalo simétrico
+    `[mean+std·z((1-p)/2), mean+std·z((1+p)/2)]` (asumiendo distribución
+    condicional local Gaussiana, la convención estándar de kriging;
+    `z`=`transform::inv_norm_cdf`, ya validado contra R, reusado sin
+    cambios) y mide la fracción observada de valores reales dentro. El
+    estadístico de "goodness" de Deutsch pondera 2× la desviación cuando
+    la cobertura observada es MENOR que la nominal (sobreconfianza,
+    subestimar incertidumbre) vs 1× cuando es MAYOR (imprecisión,
+    conservador pero no incorrecto). **Sin paridad gstat posible** (gstat
+    no implementa accuracy plots de Deutsch) — validado por
+    autoconsistencia fuerte: con valores reales generados EXACTAMENTE
+    desde `Normal(mean,std)` sintético (n=20000), la cobertura observada
+    converge a la nominal y goodness→1. **Bug real atrapado por este mismo
+    test**: la primera implementación de la fórmula de goodness tenía un
+    error de signo (aplicaba el peso 2× a la desviación CON signo en vez
+    de al valor absoluto), lo que hacía que subdispersión (el caso
+    "inexacto") diera goodness>1 (¡mejor que perfecto!) en vez de <1 —
+    atrapado por el test `accuracy_plot_penalizes_underdispersion...`
+    antes de cualquier commit, otro caso de la regla de la sesión de
+    verificar numéricamente en vez de confiar en la fórmula de memoria.
+    Expuesto en CLI (`geostat cv --blocks nx,ny --accuracy`) y Python
+    (`loo_cv(blocks=(nx,ny))`, `accuracy_plot(...)`), probado end-to-end
+    con Meuse (block CV da RMSE más alto que LOO/k-fold en datos reales
+    también, consistente con la teoría). 196 tests, clippy limpio, paridad
+    gstat general re-confirmada sin regresiones.
+
+    Quedan el ítem #19 (trait de covarianza, rust-numpy, proptest,
+    publicación crates.io/PyPI), y exponer collocated cokriging/
+    Markov-Bayes/block IRF-0 en CLI/Python (deliberadamente diferido,
+    alcance de esas sesiones: el núcleo del motor).

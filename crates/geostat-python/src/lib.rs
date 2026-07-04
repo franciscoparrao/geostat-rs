@@ -539,12 +539,16 @@ fn krige_grid(
 }
 
 /// Cross-validation. Leave-one-out by default; pass `folds=k` for `k`-fold
-/// (faster on large datasets, reproducible via `seed`). Returns a dict with
-/// `me`, `mae`, `rmse`, `msdr`, `vecv`, `e1`, `predicted` and `variance`.
+/// (faster on large datasets, reproducible via `seed`), or `blocks=(nx,ny)`
+/// for spatial block CV (partitions the domain into an `nx`-by-`ny` grid and
+/// holds out whole blocks at a time — a more honest error estimate than
+/// random k-fold/LOO under spatial autocorrelation; `blocks` and `folds` are
+/// mutually exclusive). Returns a dict with `me`, `mae`, `rmse`, `msdr`,
+/// `vecv`, `e1`, `predicted` and `variance`.
 #[pyfunction]
 #[pyo3(signature = (x, y, values, model, method = "ordinary", mean = None,
     degree = 1, max_neighbors = None, radius = None, folds = None, seed = 0,
-    min_neighbors = None, octant = None))]
+    min_neighbors = None, octant = None, blocks = None))]
 #[allow(clippy::too_many_arguments)]
 fn loo_cv(
     py: Python<'_>,
@@ -561,6 +565,7 @@ fn loo_cv(
     seed: u64,
     min_neighbors: Option<usize>,
     octant: Option<usize>,
+    blocks: Option<(usize, usize)>,
 ) -> PyResult<Py<PyDict>> {
     let data = point_set(x, y, values)?;
     let config = KrigingConfig {
@@ -570,9 +575,13 @@ fn loo_cv(
         min_neighbors,
         max_per_octant: octant,
     };
-    let cv = match folds {
-        Some(k) => core::k_fold(&data, &model.inner, &config, k, seed).map_err(err)?,
-        None => core::leave_one_out(&data, &model.inner, &config).map_err(err)?,
+    if blocks.is_some() && folds.is_some() {
+        return Err(PyValueError::new_err("blocks and folds are mutually exclusive"));
+    }
+    let cv = match (blocks, folds) {
+        (Some((nx, ny)), _) => core::block_cv(&data, &model.inner, &config, [nx, ny]).map_err(err)?,
+        (None, Some(k)) => core::k_fold(&data, &model.inner, &config, k, seed).map_err(err)?,
+        (None, None) => core::leave_one_out(&data, &model.inner, &config).map_err(err)?,
     };
     let out = PyDict::new(py);
     out.set_item("me", cv.mean_error())?;
@@ -587,6 +596,37 @@ fn loo_cv(
     out.set_item("e1", cv.e1())?;
     out.set_item("predicted", &cv.predicted)?;
     out.set_item("variance", &cv.variance)?;
+    Ok(out.into())
+}
+
+/// Deutsch (1997) accuracy plot: checks whether a model's *uncertainty* (not
+/// just its central prediction) is well calibrated. `actual`/`mean`/`std`
+/// are typically a cross-validation's `observed`/`predicted`/
+/// `sqrt(variance)` (see `loo_cv`); `probs` are the nominal probabilities to
+/// check (default: 0.1..0.9 step 0.1). Returns a dict with `nominal`,
+/// `observed` (lists, one entry per probability) and `goodness` (the
+/// calibration statistic, 1.0 = perfect).
+#[pyfunction]
+#[pyo3(signature = (actual, mean, std, probs = None))]
+fn accuracy_plot(
+    py: Python<'_>,
+    actual: Vec<f64>,
+    mean: Vec<f64>,
+    std: Vec<f64>,
+    probs: Option<Vec<f64>>,
+) -> PyResult<Py<PyDict>> {
+    let probs = probs.unwrap_or_else(|| (1..=9).map(|i| i as f64 * 0.1).collect());
+    let plot = core::accuracy_plot(&actual, &mean, &std, &probs).map_err(err)?;
+    let out = PyDict::new(py);
+    out.set_item(
+        "nominal",
+        plot.points.iter().map(|p| p.nominal).collect::<Vec<_>>(),
+    )?;
+    out.set_item(
+        "observed",
+        plot.points.iter().map(|p| p.observed).collect::<Vec<_>>(),
+    )?;
+    out.set_item("goodness", plot.goodness)?;
     Ok(out.into())
 }
 
@@ -1308,6 +1348,7 @@ fn geostat_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(krige, m)?)?;
     m.add_function(wrap_pyfunction!(krige_grid, m)?)?;
     m.add_function(wrap_pyfunction!(loo_cv, m)?)?;
+    m.add_function(wrap_pyfunction!(accuracy_plot, m)?)?;
     m.add_function(wrap_pyfunction!(regression_kriging, m)?)?;
     m.add_function(wrap_pyfunction!(idw, m)?)?;
     m.add_function(wrap_pyfunction!(knn, m)?)?;

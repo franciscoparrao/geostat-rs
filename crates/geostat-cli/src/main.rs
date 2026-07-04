@@ -12,8 +12,8 @@ use geostat_core::{
     KrigingMethod, ModelKind, PointSet, SgsConfig, SisConfig, Tails, VariogramConfig,
     VariogramModel, cell_declustering_weights, decluster_scan, detrend_external,
     detrend_polynomial, experimental_variogram, fit_anisotropic, fit_best, fit_indicator_models,
-    fit_lmc_collocated, fit_median_indicator_model, indicator_kriging, k_fold, leave_one_out,
-    leave_one_out_with_drift,
+    block_cv, fit_lmc_collocated, fit_median_indicator_model, indicator_kriging, k_fold,
+    leave_one_out, leave_one_out_with_drift,
     sequential_gaussian_simulation, sequential_indicator_simulation, variogram_map, vecchia_mle,
     vecchia_predict, vecchia_reml,
 };
@@ -393,9 +393,21 @@ struct CvCmd {
     /// supported together with --drift-cols.
     #[arg(long, value_name = "K")]
     folds: Option<usize>,
+    /// Use spatial block cross-validation instead of leave-one-out/k-fold:
+    /// comma-separated block counts per dimension (2-D: "nx,ny"). Groups
+    /// spatially contiguous points into the same held-out fold, giving a
+    /// more honest error estimate than random k-fold/LOO under spatial
+    /// autocorrelation. Not yet supported together with --drift-cols or 3-D.
+    #[arg(long, value_name = "NX,NY", conflicts_with = "folds")]
+    blocks: Option<String>,
     /// RNG seed for the k-fold split
     #[arg(long, default_value_t = 0)]
     seed: u64,
+    /// Print a Deutsch (1997) accuracy plot (nominal vs. observed coverage
+    /// at 10%..90% probability intervals, assuming a local Gaussian
+    /// conditional distribution) plus the goodness statistic
+    #[arg(long)]
+    accuracy: bool,
     /// Write per-point residuals to a CSV file
     #[arg(short, long)]
     output: Option<PathBuf>,
@@ -1571,12 +1583,56 @@ fn print_cv_report(cv: &geostat_core::CvResult, n: usize) {
     println!("  E1   (%, ideal 100): {:>10.4}", cv.e1());
 }
 
+/// Parses "nx,ny" into a `[usize; 2]` block count.
+fn parse_blocks_2d(spec: &str) -> Result<[usize; 2]> {
+    let parts: Vec<usize> = spec
+        .split(',')
+        .map(|p| {
+            p.trim()
+                .parse::<usize>()
+                .with_context(|| format!("invalid block count '{}'", p.trim()))
+        })
+        .collect::<Result<_>>()?;
+    if parts.len() != 2 {
+        bail!("--blocks expects \"nx,ny\", got '{spec}'");
+    }
+    Ok([parts[0], parts[1]])
+}
+
+/// Prints a Deutsch (1997) accuracy plot: nominal vs. observed coverage at
+/// 10%..90% probability intervals (assuming a local Gaussian conditional
+/// distribution, i.e. `Normal(prediction, kriging variance)`), plus the
+/// goodness statistic.
+fn print_accuracy_plot(cv: &geostat_core::CvResult) -> Result<()> {
+    let std: Vec<f64> = cv.variance.iter().map(|v| v.max(0.0).sqrt()).collect();
+    let probs: Vec<f64> = (1..=9).map(|i| i as f64 * 0.1).collect();
+    let plot = geostat_core::accuracy_plot(&cv.observed, &cv.predicted, &std, &probs)?;
+    println!("\nAccuracy plot (Deutsch 1997):");
+    println!("  nominal   observed");
+    for pt in &plot.points {
+        println!("  {:>7.2}   {:>8.4}", pt.nominal, pt.observed);
+    }
+    println!(
+        "  goodness: {:.4} ({})",
+        plot.goodness,
+        if plot.is_accurate() {
+            "accurate"
+        } else {
+            "overconfident at some level"
+        }
+    );
+    Ok(())
+}
+
 fn run_cv(cmd: CvCmd) -> Result<()> {
     let model = io_utils::read_model(&cmd.model)?;
 
     if cmd.input.z_col.is_some() {
         if cmd.drift_cols.is_some() {
             bail!("3-D cross-validation does not support --drift-cols");
+        }
+        if cmd.blocks.is_some() {
+            bail!("--blocks (block CV) is not yet supported in 3-D mode");
         }
         let data = cmd.input.read3()?;
         println!("Loaded {} 3-D points; model: {model}", data.len());
@@ -1592,6 +1648,9 @@ fn run_cv(cmd: CvCmd) -> Result<()> {
             None => leave_one_out(&data, &model, &config)?,
         };
         print_cv_report(&cv, data.len());
+        if cmd.accuracy {
+            print_accuracy_plot(&cv)?;
+        }
         if cmd.output.is_some() {
             bail!("--output is not supported in 3-D mode yet");
         }
@@ -1601,6 +1660,9 @@ fn run_cv(cmd: CvCmd) -> Result<()> {
     let (data, cv) = if let Some(drift_spec) = &cmd.drift_cols {
         if cmd.folds.is_some() {
             bail!("--folds (k-fold) is not yet supported with --drift-cols");
+        }
+        if cmd.blocks.is_some() {
+            bail!("--blocks (block CV) is not yet supported with --drift-cols");
         }
         let drift_cols: Vec<String> = drift_spec
             .split(',')
@@ -1633,14 +1695,18 @@ fn run_cv(cmd: CvCmd) -> Result<()> {
             min_neighbors: cmd.neighbors.min_neighbors,
             max_per_octant: cmd.neighbors.octant,
         };
-        let cv = match cmd.folds {
-            Some(k) => k_fold(&data, &model, &config, k, cmd.seed)?,
-            None => leave_one_out(&data, &model, &config)?,
+        let cv = match (&cmd.blocks, cmd.folds) {
+            (Some(spec), _) => block_cv(&data, &model, &config, parse_blocks_2d(spec)?)?,
+            (None, Some(k)) => k_fold(&data, &model, &config, k, cmd.seed)?,
+            (None, None) => leave_one_out(&data, &model, &config)?,
         };
         (data, cv)
     };
 
     print_cv_report(&cv, data.len());
+    if cmd.accuracy {
+        print_accuracy_plot(&cv)?;
+    }
 
     if let Some(path) = &cmd.output {
         io_utils::write_cv_csv(path, &data, &cv)?;
