@@ -7,6 +7,15 @@ use serde::{Deserialize, Serialize};
 use super::bessel;
 use crate::error::{GeostatError, Result};
 
+/// Upper bound accepted for [`ModelKind::Matern`]'s `nu` (see
+/// [`VariogramModel::new`]'s validation and AUDIT-2026-07-v2.md §1.8):
+/// `bessel::gamma` overflows to `inf` around `nu ~ 171.6`, past which the
+/// correlation silently evaluates to NaN. This cap keeps a wide safety
+/// margin below that, comfortably inside the quadrature's well-validated
+/// range and well past the point where Matern becomes indistinguishable
+/// from Gaussian in f64.
+pub const MATERN_NU_MAX: f64 = 50.0;
+
 /// Supported variogram model families.
 ///
 /// The Matérn variants use the Rasmussen & Williams parameterization
@@ -93,6 +102,17 @@ impl ModelKind {
         ModelKind::Matern25,
         ModelKind::Circular,
     ];
+
+    /// `true` if this kind is a valid (positive-definite) covariance in
+    /// `dim` spatial dimensions. [`ModelKind::Circular`] is the disk
+    /// covariance and is positive-definite only for `dim <= 2` — its
+    /// analogue in 3-D is [`ModelKind::Spherical`]. Every other kind here is
+    /// valid in any dimension (AUDIT-2026-07-v2.md §1.5: nothing previously
+    /// stopped `fit_best`/`ModelKind::ALL` from picking `Circular` for 3-D
+    /// data, silently risking a non-PD covariance matrix).
+    pub fn valid_in_dim(self, dim: usize) -> bool {
+        !matches!(self, ModelKind::Circular) || dim <= 2
+    }
 
     /// Normalized variogram (unit sill) at lag `h` for range parameter `a`.
     pub(crate) fn g(self, h: f64, a: f64) -> f64 {
@@ -315,7 +335,7 @@ impl Anisotropy {
     /// the isotropic-equivalent effective distance (before dividing by the
     /// structure's `range`). Only meaningful in 3-D; see the struct docs
     /// for the gstat cross-check.
-    fn rotation_matrix_3d(&self) -> [[f64; 3]; 3] {
+    pub(crate) fn rotation_matrix_3d(&self) -> [[f64; 3]; 3] {
         let alpha = if (0.0..270.0).contains(&self.azimuth_deg) {
             (90.0 - self.azimuth_deg).to_radians()
         } else {
@@ -489,9 +509,18 @@ impl VariogramModel {
                 )));
             }
             if let ModelKind::Matern(nu) = s.kind
-                && (!(nu > 0.0) || !nu.is_finite()) {
+                && (!(nu > 0.0) || nu > MATERN_NU_MAX) {
+                    // AUDIT-2026-07-v2.md §1.8: beyond ~171.6, `Gamma(nu)`
+                    // overflows to `inf` (bessel::gamma's Lanczos
+                    // approximation has no overflow guard) and
+                    // `2^(1-nu)` underflows to `0`, so the correlation
+                    // silently evaluates to NaN for a model this
+                    // constructor accepted as valid. MATERN_NU_MAX keeps a
+                    // wide margin below that (and below Matern-family
+                    // practical identifiability: nu this large is already
+                    // indistinguishable from Gaussian in f64).
                     return Err(GeostatError::InvalidParameter(format!(
-                        "Matern nu must be finite and > 0, got {nu}"
+                        "Matern nu must be finite, > 0 and <= {MATERN_NU_MAX}, got {nu}"
                     )));
                 }
             if let ModelKind::Stable(alpha) = s.kind
@@ -594,6 +623,18 @@ impl VariogramModel {
             .any(|s| matches!(s.kind, ModelKind::Power(_)))
     }
 
+    /// Returns the first structure whose [`ModelKind`] is not a valid
+    /// covariance in `dim` dimensions, if any (see
+    /// [`ModelKind::valid_in_dim`]) — e.g. [`ModelKind::Circular`] (the disk
+    /// covariance) is only positive-definite for `dim <= 2`. `None` means
+    /// every structure is dimensionally valid.
+    pub fn invalid_structure_for_dim(&self, dim: usize) -> Option<ModelKind> {
+        self.structures
+            .iter()
+            .map(|s| s.kind)
+            .find(|k| !k.valid_in_dim(dim))
+    }
+
     /// Covariance at scalar lag `h` under second-order stationarity:
     /// `C(h) = total_sill - gamma(h)`, with `C(0) = total_sill`. See the
     /// [`VariogramModel::has_power`] caveat.
@@ -670,6 +711,46 @@ mod tests {
         );
         // Pure nugget is valid.
         assert!(VariogramModel::new(1.0, vec![]).is_ok());
+    }
+
+    /// AUDIT-2026-07-v2.md §1.8: past `MATERN_NU_MAX`, `bessel::gamma`
+    /// overflows to `inf` and the correlation silently evaluates to NaN.
+    /// The constructor must reject such models instead of accepting them.
+    #[test]
+    fn matern_nu_is_capped() {
+        assert!(
+            VariogramModel::new(
+                0.0,
+                vec![Structure::new(ModelKind::Matern(MATERN_NU_MAX), 1.0, 10.0)]
+            )
+            .is_ok(),
+            "the cap itself must still be accepted"
+        );
+        assert!(
+            VariogramModel::new(
+                0.0,
+                vec![Structure::new(ModelKind::Matern(MATERN_NU_MAX + 1.0), 1.0, 10.0)]
+            )
+            .is_err()
+        );
+        assert!(
+            VariogramModel::new(0.0, vec![Structure::new(ModelKind::Matern(200.0), 1.0, 10.0)])
+                .is_err()
+        );
+        assert!(
+            VariogramModel::new(
+                0.0,
+                vec![Structure::new(ModelKind::Matern(f64::INFINITY), 1.0, 10.0)]
+            )
+            .is_err()
+        );
+        assert!(
+            VariogramModel::new(
+                0.0,
+                vec![Structure::new(ModelKind::Matern(f64::NAN), 1.0, 10.0)]
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -810,6 +891,42 @@ mod tests {
                 (got - expected).abs() < 1e-9,
                 "dir={dir:?}: {got} vs {expected}"
             );
+        }
+    }
+
+    /// Cross-check between [`super::experimental::direction_unit_vector`]
+    /// (used to filter pairs into a directional experimental variogram) and
+    /// `rotation_matrix_3d`'s major-axis row (used to fit/evaluate the
+    /// model): for the *same* `azimuth_deg`/`dip_deg`, both must point along
+    /// the same 3-D line (up to the documented sign-agnosticity of
+    /// direction). Before this test existed the two used opposite dip sign
+    /// conventions (AUDIT-2026-07-v2.md §1.1) -- an experimental variogram
+    /// computed with `DirectionConfig { dip_deg: 30.0, .. }` and a model
+    /// fitted/evaluated with `Anisotropy { dip_deg: 30.0, .. }` were
+    /// silently describing mirror-image 3-D directions.
+    #[test]
+    fn direction_matches_model_major_axis() {
+        use super::super::experimental::direction_unit_vector;
+        for &azimuth_deg in &[0.0, 30.0, 90.0, 150.0, 200.0, 300.0] {
+            for &dip_deg in &[-60.0, -20.0, 0.0, 20.0, 60.0] {
+                let u_exp: [f64; 3] = direction_unit_vector(azimuth_deg, dip_deg);
+                let anis = Anisotropy {
+                    azimuth_deg,
+                    ratio: 0.3,
+                    ratio_z: 1.0,
+                    dip_deg,
+                    rake_deg: 0.0,
+                };
+                let u_model = anis.rotation_matrix_3d()[0];
+                // Sign-agnostic: direction filtering accepts +-u, so the
+                // major axis must be parallel (dot = +-1), not necessarily
+                // equal.
+                let dot: f64 = (0..3).map(|k| u_exp[k] * u_model[k]).sum();
+                assert!(
+                    (dot.abs() - 1.0).abs() < 1e-12,
+                    "azimuth={azimuth_deg} dip={dip_deg}: u_exp={u_exp:?} u_model={u_model:?} dot={dot}"
+                );
+            }
         }
     }
 

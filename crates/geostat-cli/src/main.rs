@@ -87,6 +87,18 @@ struct InputOpts {
 
 impl InputOpts {
     fn read3(&self) -> Result<PointSet<3>> {
+        if is_gpkg(&self.input) {
+            // AUDIT-2026-07-v2.md §1.9: only `read()` (below) routes .gpkg
+            // through the GeoPackage reader; without this check the file
+            // falls through to the CSV parser, which fails with a
+            // misleading "column not found" error over binary garbage
+            // instead of saying what's actually wrong.
+            bail!(
+                "{}: 3-D mode (--z-col) does not support GeoPackage input yet; \
+                 use a CSV with x/y/z/value columns instead",
+                self.input.display()
+            );
+        }
         let z_col = self.z_col.as_ref().expect("z_col checked by caller");
         io_utils::read_points3(
             &self.input,
@@ -105,6 +117,16 @@ impl InputOpts {
     }
 
     fn read_with_extras(&self, extras: &[String]) -> Result<(PointSet, Vec<Vec<f64>>)> {
+        if is_gpkg(&self.input) {
+            // AUDIT-2026-07-v2.md §1.9: drift/error/detrend covariate
+            // columns aren't wired to the GeoPackage attribute reader yet;
+            // fail clearly instead of falling through to the CSV parser.
+            bail!(
+                "{}: GeoPackage input does not support extra covariate columns \
+                 (drift/error/detrend) yet; use a CSV instead",
+                self.input.display()
+            );
+        }
         io_utils::read_points_with_extras(
             &self.input,
             &self.x_col,
@@ -129,7 +151,8 @@ struct VariogramOpts {
     /// Angular tolerance in degrees for the directional variogram
     #[arg(long, default_value_t = 22.5)]
     tolerance: f64,
-    /// Dip in degrees (positive downward) for 3-D directional variograms
+    /// Dip in degrees for 3-D directional variograms (same sign convention
+    /// as the fitted model's rotation: GSLIB ang2 / gstat)
     #[arg(long, default_value_t = 0.0)]
     dip: f64,
 }
@@ -2025,4 +2048,67 @@ fn parse_bbox(s: &str) -> Result<([f64; 2], [f64; 2])> {
         bail!("bbox must be \"xmin,ymin,xmax,ymax\", got '{s}'");
     }
     Ok(([parts[0], parts[1]], [parts[2], parts[3]]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gpkg_opts() -> InputOpts {
+        // The path need not exist: AUDIT-2026-07-v2.md §1.9's guard is a
+        // pure extension check that must fire *before* any file I/O, so a
+        // nonexistent path still proves the guard runs first (a CSV-parser
+        // error, by contrast, could only happen after opening the file).
+        InputOpts {
+            input: PathBuf::from("does-not-exist.gpkg"),
+            x_col: "x".into(),
+            y_col: "y".into(),
+            z_col: Some("z".into()),
+            value_col: "value".into(),
+            layer: None,
+        }
+    }
+
+    #[test]
+    fn read3_rejects_gpkg_with_a_clear_error_not_a_csv_parse_failure() {
+        let err = gpkg_opts().read3().unwrap_err().to_string();
+        assert!(
+            err.contains("GeoPackage") || err.contains(".gpkg") || err.contains("3-D"),
+            "expected a clear GeoPackage/3-D error, got: {err}"
+        );
+        assert!(
+            !err.contains("not found; available columns"),
+            "must not fall through to the CSV parser's column-not-found error: {err}"
+        );
+    }
+
+    #[test]
+    fn read_with_extras_rejects_gpkg_with_a_clear_error_not_a_csv_parse_failure() {
+        let err = gpkg_opts()
+            .read_with_extras(&["covariate".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("GeoPackage") || err.contains(".gpkg"),
+            "expected a clear GeoPackage error, got: {err}"
+        );
+        assert!(
+            !err.contains("not found; available columns"),
+            "must not fall through to the CSV parser's column-not-found error: {err}"
+        );
+    }
+
+    #[test]
+    fn read_still_accepts_gpkg_for_the_plain_xyz_case() {
+        // Regression guard: the two new guards above must not over-reject
+        // the path that already worked (plain x/y/value from a .gpkg).
+        // `read()` still fails here (the file doesn't exist), but it must
+        // fail as a GeoPackage-open error, not the 3-D/extras guard's
+        // message -- proving `read()` itself was left untouched.
+        let err = gpkg_opts().read().unwrap_err().to_string();
+        assert!(
+            !err.contains("does not support"),
+            "read() must not be gated by the new 3-D/extras guards: {err}"
+        );
+    }
 }

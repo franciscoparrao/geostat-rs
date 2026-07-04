@@ -47,6 +47,22 @@ fn reject_power_model(model: &VariogramModel) -> Result<()> {
     Ok(())
 }
 
+/// Rejects models containing a structure that is not a valid covariance in
+/// `D` dimensions (e.g. [`ModelKind::Circular`], only positive-definite for
+/// `dim <= 2` -- see [`VariogramModel::invalid_structure_for_dim`] and
+/// AUDIT-2026-07-v2.md §1.5). Vecchia Cholesky-factors real conditioning
+/// covariance matrices, so an invalid-in-D structure can silently produce a
+/// non-PD system instead of a clear error.
+fn reject_invalid_dim_model<const D: usize>(model: &VariogramModel) -> Result<()> {
+    if let Some(kind) = model.invalid_structure_for_dim(D) {
+        return Err(GeostatError::InvalidParameter(format!(
+            "{kind:?} is not a valid covariance in {D} dimensions; use Spherical instead for a \
+             3-D-safe bounded structure"
+        )));
+    }
+    Ok(())
+}
+
 fn reject_power_kind(kind: ModelKind) -> Result<()> {
     if matches!(kind, ModelKind::Power(_)) {
         return Err(GeostatError::InvalidParameter(POWER_UNSUPPORTED.into()));
@@ -484,6 +500,7 @@ pub fn vecchia_predict<const D: usize>(
     m: usize,
 ) -> Result<Vec<VecchiaEstimate>> {
     reject_power_model(model)?;
+    reject_invalid_dim_model::<D>(model)?;
     if m == 0 {
         return Err(GeostatError::InvalidParameter(
             "conditioning size m must be at least 1".into(),
@@ -533,7 +550,12 @@ pub fn vecchia_predict<const D: usize>(
     let mut kss: Vec<f64> = Vec::new();
     let mut ki: Vec<f64> = Vec::new();
     let mut w: Vec<f64> = Vec::new();
-    let mut acc: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
+    // BTreeMap, not HashMap: `row` below is built by iterating this map, and
+    // the variance is a floating-point sum over `row` -- HashMap's per-process
+    // random seed would make that summation order (and so the last-bit value
+    // of `var`) vary run-to-run, breaking the bit-for-bit reproducibility
+    // this module otherwise guarantees (AUDIT-2026-07-v2.md §1.4).
+    let mut acc: std::collections::BTreeMap<u32, f64> = std::collections::BTreeMap::new();
     let coef_tol = 1e-8 * c0.sqrt();
 
     for &t in &order {
@@ -604,6 +626,7 @@ pub fn vecchia_loglik<const D: usize>(
     order: Option<&[usize]>,
 ) -> Result<f64> {
     reject_power_model(model)?;
+    reject_invalid_dim_model::<D>(model)?;
     let plan = vecchia_plan(data.coords(), m, order)?;
     loglik_with_plan(data, model, &plan)
 }
@@ -621,6 +644,7 @@ pub fn vecchia_loglik_grouped<const D: usize>(
     group_size: usize,
 ) -> Result<f64> {
     reject_power_model(model)?;
+    reject_invalid_dim_model::<D>(model)?;
     let plan = vecchia_plan(data.coords(), m, order)?;
     loglik_with_plan_grouped(data, model, &plan, group_size)
 }
@@ -789,7 +813,11 @@ pub fn vecchia_mle_matern<const D: usize>(
         let nugget = x[0] * x[0];
         let psill = x[1].exp();
         let range = x[2].exp();
-        let nu = x[3].exp();
+        // Clamp, don't let the search wander past MATERN_NU_MAX: beyond it
+        // the correlation silently evaluates to NaN (AUDIT-2026-07-v2.md
+        // §1.8), and nu that large is indistinguishable from Gaussian
+        // anyway, so clamping costs no real fitting power.
+        let nu = x[3].exp().min(crate::variogram::MATERN_NU_MAX);
         let range_max = 10.0 * extent;
         let reg = if range > range_max {
             ((range - range_max) / range_max).powi(2)
@@ -827,7 +855,11 @@ pub fn vecchia_mle_matern<const D: usize>(
     let (xb, neg_ll) = nelder_mead_multistart(objective, &starts, 0.3, 1200);
     let model = VariogramModel::new(
         xb[0] * xb[0],
-        vec![Structure::new(ModelKind::Matern(xb[3].exp()), xb[1].exp(), xb[2].exp())],
+        vec![Structure::new(
+            ModelKind::Matern(xb[3].exp().min(crate::variogram::MATERN_NU_MAX)),
+            xb[1].exp(),
+            xb[2].exp(),
+        )],
     )?;
     Ok(VecchiaFit {
         model,
@@ -887,6 +919,44 @@ fn poly_basis<const D: usize>(coords: &[[f64; D]], degree: u8) -> Vec<Vec<f64>> 
                     v
                 })
                 .collect()
+        })
+        .collect()
+}
+
+/// Intercept + per-column-standardized covariates: column `k` of `basis` is
+/// `(drift[.][k] - mean_k) / sd_k`. Mirrors [`poly_basis`]'s centering/scaling
+/// (mean 0, unit variance, `sd` floored at `1e-12`) so the GLS normal equations
+/// (`F^T Sigma^-1 F`) in [`reml_loglik_with_plan`]/[`reml_loglik_with_blocks`]
+/// stay well-conditioned regardless of the covariates' native units --
+/// raw UTM-scale covariates (~1e6) previously left this basis unnormalized
+/// while [`poly_basis`] (the plain polynomial-trend path) already
+/// normalized (AUDIT-2026-07-v2.md §2.5).
+///
+/// This changes only the GLS solve's conditioning, not its result: the
+/// fitted trend coefficients never leave this module, so the public
+/// contract of `vecchia_reml_drift`/`vecchia_reml_drift_grouped` (which
+/// only report the covariance parameters) is unaffected.
+fn standardized_drift_basis(drift: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    let n = drift.len();
+    let ncov = drift[0].len();
+    let mut mean = vec![0.0; ncov];
+    for row in drift {
+        for (k, &v) in row.iter().enumerate() {
+            mean[k] += v / n as f64;
+        }
+    }
+    let mut scale = vec![1.0; ncov];
+    for k in 0..ncov {
+        let var = drift.iter().map(|r| (r[k] - mean[k]).powi(2)).sum::<f64>() / n as f64;
+        scale[k] = var.sqrt().max(1e-12);
+    }
+    drift
+        .iter()
+        .map(|row| {
+            let mut b = Vec::with_capacity(ncov + 1);
+            b.push(1.0);
+            b.extend(row.iter().enumerate().map(|(k, &v)| (v - mean[k]) / scale[k]));
+            b
         })
         .collect()
 }
@@ -1141,16 +1211,8 @@ pub fn vecchia_reml_drift<const D: usize>(
             "all drift rows must have the same number of covariates".into(),
         ));
     }
-    // Basis = intercept + covariate columns.
-    let basis: Vec<Vec<f64>> = drift
-        .iter()
-        .map(|row| {
-            let mut b = Vec::with_capacity(ncov + 1);
-            b.push(1.0);
-            b.extend_from_slice(row);
-            b
-        })
-        .collect();
+    // Basis = intercept + standardized covariate columns.
+    let basis = standardized_drift_basis(drift);
     let plan = vecchia_plan(data.coords(), m, order)?;
     reml_fit_with_basis(data, kind, &plan, &basis, 1)
 }
@@ -1186,15 +1248,7 @@ pub fn vecchia_reml_drift_grouped<const D: usize>(
             "all drift rows must have the same number of covariates".into(),
         ));
     }
-    let basis: Vec<Vec<f64>> = drift
-        .iter()
-        .map(|row| {
-            let mut b = Vec::with_capacity(ncov + 1);
-            b.push(1.0);
-            b.extend_from_slice(row);
-            b
-        })
-        .collect();
+    let basis = standardized_drift_basis(drift);
     let plan = vecchia_plan(data.coords(), m, order)?;
     reml_fit_with_basis(data, kind, &plan, &basis, group_size)
 }
@@ -1298,6 +1352,7 @@ pub fn vecchia_param_se<const D: usize>(
     order: Option<&[usize]>,
 ) -> Result<[f64; 3]> {
     reject_power_model(model)?;
+    reject_invalid_dim_model::<D>(model)?;
     if model.structures.len() != 1 {
         return Err(GeostatError::InvalidParameter(
             "standard errors are defined for a single-structure model".into(),
@@ -1637,6 +1692,36 @@ mod tests {
     }
 
     #[test]
+    fn predict_is_bit_for_bit_deterministic_across_calls() {
+        // AUDIT-2026-07-v2.md §1.4: the innovation-coefficient accumulator
+        // used to use a `HashMap`, whose per-construction random hasher
+        // state could reorder the floating-point sum that produces `var`
+        // differently between otherwise-identical calls -- silently
+        // breaking the bit-for-bit reproducibility this crate promises.
+        // With m small (much less than n + targets) and many targets, later
+        // targets chain through several prior targets' innovation rows, so
+        // any accumulation-order sensitivity would show up as differing
+        // bits between repeated calls with the exact same inputs.
+        let data = field(150, 11);
+        let model = VariogramModel::new(
+            0.05,
+            vec![Structure::new(ModelKind::Exponential, 0.95, 25.0)],
+        )
+        .unwrap();
+        let targets: Vec<[f64; 2]> = (0..60)
+            .map(|i| [1.7 * i as f64 + 3.0, 96.0 - 1.6 * i as f64])
+            .collect();
+        let first = vecchia_predict(&data, &model, &targets, 8).unwrap();
+        for _ in 0..5 {
+            let again = vecchia_predict(&data, &model, &targets, 8).unwrap();
+            for (a, b) in first.iter().zip(&again) {
+                assert_eq!(a.value.to_bits(), b.value.to_bits());
+                assert_eq!(a.variance.to_bits(), b.variance.to_bits());
+            }
+        }
+    }
+
+    #[test]
     fn maxmin_order_is_a_permutation() {
         let data = field(50, 7);
         let ord = maxmin_order(data.coords());
@@ -1964,6 +2049,57 @@ mod tests {
         assert!(
             r < 40.0,
             "covariate-REML range {r} should be near the truth (10)"
+        );
+    }
+
+    #[test]
+    fn reml_drift_recovers_range_with_a_utm_scale_covariate() {
+        // AUDIT-2026-07-v2.md §2.5: the drift basis previously used the raw
+        // covariate scale, unlike `poly_basis`'s centered/scaled columns --
+        // with UTM-style covariates (~1e6) the GLS normal equations
+        // (F^T Sigma^-1 F) became needlessly ill-conditioned. Same model as
+        // `reml_drift_recovers_range_with_a_covariate`, but the covariate is
+        // shifted and scaled to UTM easting magnitude (~6e5, range ~1e4)
+        // instead of [0, 1] -- the standardized-basis fit must still recover
+        // the true range, proving the normalization didn't change the
+        // estimator's answer, just its conditioning.
+        let mut rng = Rng::new(21);
+        let n = 90;
+        let coords: Vec<[f64; 2]> = (0..n)
+            .map(|_| [rng.uniform() * 60.0, rng.uniform() * 60.0])
+            .collect();
+        let cov_raw: Vec<f64> = coords
+            .iter()
+            .map(|p| (-((p[0] - 30.0).powi(2) + (p[1] - 30.0).powi(2)) / 200.0).exp())
+            .collect();
+        // Same *shape* as the covariate above, but UTM-scale units: a
+        // monotone affine map (600_000 + 1e4 * cov_raw) so the underlying
+        // relationship to the mean is identical, only the units differ.
+        let cov_utm: Vec<f64> = cov_raw.iter().map(|&c| 600_000.0 + 1e4 * c).collect();
+        let truth = VariogramModel::new(
+            0.05,
+            vec![Structure::new(ModelKind::Exponential, 1.0, 10.0)],
+        )
+        .unwrap();
+        let mut sig = vec![0.0; n * n];
+        for a in 0..n {
+            for b in 0..n {
+                sig[a * n + b] = truth.covariance_dh(sep(&coords[a], &coords[b]));
+            }
+        }
+        let l = cholesky(n, &sig);
+        let eps: Vec<f64> = (0..n).map(|_| rng.normal()).collect();
+        let values: Vec<f64> = (0..n)
+            .map(|i| 8.0 * cov_raw[i] + (0..=i).map(|k| l[i * n + k] * eps[k]).sum::<f64>())
+            .collect();
+        let data = PointSet::new(coords, values).unwrap();
+
+        let drift: Vec<Vec<f64>> = cov_utm.iter().map(|&c| vec![c]).collect();
+        let fit = vecchia_reml_drift(&data, ModelKind::Exponential, 8, &drift, None).unwrap();
+        let r = fit.model.structures[0].range;
+        assert!(
+            r < 40.0,
+            "UTM-scale-covariate REML range {r} should be near the truth (10)"
         );
     }
 

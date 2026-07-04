@@ -49,7 +49,9 @@ prediction out of the box.
   i.e. by predictive accuracy rather than by a model fit.
 - **GeoPackage I/O** — read point feature layers straight from an OGC
   `.gpkg` and write kriging results back to one (pure Rust via bundled
-  SQLite — no GDAL): any CLI subcommand accepts a `.gpkg` input,
+  SQLite — no GDAL): any CLI subcommand that only needs x/y/value accepts a
+  `.gpkg` input (drift/error/detrend covariate columns and 3-D mode still
+  require a CSV — they fail with a clear error on `.gpkg` for now),
   `geostat gpkg-info` lists its layers, and `geostat krige -o out.gpkg`
   writes a point layer (prediction + variance) — or, with `--raster`, a
   single-band **2D-gridded-coverage** raster (16-bit PNG tile, values

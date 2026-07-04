@@ -182,7 +182,11 @@ pub fn fit_matern(exp_v: &ExperimentalVariogram) -> Result<FitResult> {
         let nugget = x[0] * x[0];
         let psill = x[1].exp();
         let range = x[2].exp();
-        let nu = x[3].exp();
+        // Clamp, don't let the search wander past MATERN_NU_MAX: beyond it
+        // the correlation silently evaluates to NaN (AUDIT-2026-07-v2.md
+        // §1.8), and nu that large is indistinguishable from Gaussian
+        // anyway, so clamping costs no real fitting power.
+        let nu = x[3].exp().min(super::MATERN_NU_MAX);
         let model = VariogramModel {
             nugget,
             structures: vec![Structure::new(ModelKind::Matern(nu), psill, range)],
@@ -209,7 +213,11 @@ pub fn fit_matern(exp_v: &ExperimentalVariogram) -> Result<FitResult> {
 
     let model = VariogramModel::new(
         xb[0] * xb[0],
-        vec![Structure::new(ModelKind::Matern(xb[3].exp()), xb[1].exp(), xb[2].exp())],
+        vec![Structure::new(
+            ModelKind::Matern(xb[3].exp().min(super::MATERN_NU_MAX)),
+            xb[1].exp(),
+            xb[2].exp(),
+        )],
     )?;
     Ok(FitResult { model, wsse })
 }

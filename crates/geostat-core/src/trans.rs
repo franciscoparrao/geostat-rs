@@ -58,6 +58,19 @@ pub fn lognormal_kriging<const D: usize>(
             "lognormal kriging requires strictly positive data values".into(),
         ));
     }
+    if log_model.has_power() {
+        // The ordinary-kriging back-transform above uses `mu` as the
+        // Lagrange multiplier *in covariance form* (see the module docs).
+        // Power (IRF-0) models are solved in semivariogram form, where the
+        // multiplier has the opposite sign (`mu_gamma = -mu_C`); using it
+        // unmodified here would silently invert the bias correction. Power
+        // is also a poor fit for the lognormal correction regardless (J&H
+        // assumes a finite log-space variance/sill), so reject rather than
+        // derive the sign flip.
+        return Err(GeostatError::InvalidParameter(
+            "lognormal kriging does not support Power (IRF-0) models".into(),
+        ));
+    }
 
     // For simple kriging the mean must be given in log units; if the user
     // passed the original-scale mean, that is their responsibility. We krige
@@ -171,6 +184,34 @@ mod tests {
         let est = lognormal_kriging(&data, &[[500.0, 500.0]], &model, &cfg).unwrap();
         assert!(est[0].value.is_nan(), "expected NaN, got {}", est[0].value);
         assert!(!est[0].value.is_infinite());
+    }
+
+    #[test]
+    fn rejects_power_model() {
+        // AUDIT-2026-07-v2.md §1.3: the Lagrange multiplier from a Power
+        // (semivariogram-form) system has the opposite sign of the
+        // covariance-form multiplier this module's back-transform expects;
+        // must be rejected rather than silently applying the wrong sign.
+        let data = lognormal_field(20, 5);
+        let power_model =
+            VariogramModel::new(0.0, vec![Structure::new(ModelKind::Power(1.0), 1.0, 1.0)])
+                .unwrap();
+        assert!(
+            lognormal_kriging(
+                &data,
+                &[[10.0, 10.0]],
+                &power_model,
+                &KrigingConfig::default()
+            )
+            .is_err()
+        );
+        let simple_cfg = KrigingConfig {
+            method: KrigingMethod::Simple { mean: 0.0 },
+            ..Default::default()
+        };
+        assert!(
+            lognormal_kriging(&data, &[[10.0, 10.0]], &power_model, &simple_cfg).is_err()
+        );
     }
 
     #[test]

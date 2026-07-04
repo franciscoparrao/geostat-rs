@@ -84,6 +84,16 @@ pub fn indicator_kriging<const D: usize>(
                 .into(),
         ));
     }
+    if let Some(kind) = cfg
+        .models
+        .iter()
+        .find_map(|m| m.invalid_structure_for_dim(D))
+    {
+        return Err(GeostatError::InvalidParameter(format!(
+            "{kind:?} is not a valid covariance in {D} dimensions; use Spherical instead for a \
+             3-D-safe bounded structure"
+        )));
+    }
     if cfg.max_neighbors == Some(0) {
         return Err(GeostatError::InvalidParameter(
             "max_neighbors must be at least 1".into(),
@@ -222,6 +232,16 @@ pub fn indicator_kriging_soft<const D: usize>(
              unbounded Power model"
                 .into(),
         ));
+    }
+    if let Some(kind) = cfg
+        .models
+        .iter()
+        .find_map(|m| m.invalid_structure_for_dim(D))
+    {
+        return Err(GeostatError::InvalidParameter(format!(
+            "{kind:?} is not a valid covariance in {D} dimensions; use Spherical instead for a \
+             3-D-safe bounded structure"
+        )));
     }
     if soft.len() != targets.len() {
         return Err(GeostatError::DimensionMismatch(format!(
@@ -569,6 +589,7 @@ mod tests {
             .map(|_| crate::sis::MarkovBayesCalibration {
                 rho: 0.0,
                 sigma_soft: 0.25,
+                mean_soft: 0.7,
             })
             .collect();
         let with_soft = indicator_kriging_soft(&data, &targets, &soft, &calib, &cfg).unwrap();
@@ -620,6 +641,7 @@ mod tests {
             .map(|_| crate::sis::MarkovBayesCalibration {
                 rho: 0.75,
                 sigma_soft: 0.3,
+                mean_soft: 0.5, // midpoint of the soft channel's {0.15, 0.85} values
             })
             .collect();
         let with_soft = indicator_kriging_soft(&data, &targets, &soft, &calib, &cfg).unwrap();
@@ -645,6 +667,7 @@ mod tests {
             .map(|_| crate::sis::MarkovBayesCalibration {
                 rho: 0.3,
                 sigma_soft: 0.2,
+                mean_soft: 0.5,
             })
             .collect();
 
@@ -662,6 +685,7 @@ mod tests {
         let bad_calib = vec![crate::sis::MarkovBayesCalibration {
             rho: 1.5, // out of [-1,1]
             sigma_soft: 0.2,
+            mean_soft: 0.5,
         }]
         .into_iter()
         .chain(good_calib.iter().skip(1).copied())

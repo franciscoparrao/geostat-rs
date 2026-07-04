@@ -7,15 +7,22 @@ use crate::parallel::{n_chunks, par_map};
 /// Directional tolerance for anisotropic variograms.
 ///
 /// Azimuth follows the gstat/GSLIB convention: degrees clockwise from north
-/// (0 = N, 90 = E). In 3-D, `dip_deg` tilts the direction vector (positive
-/// downward); pairs are accepted within a cone of half-aperture
-/// `tolerance_deg` around the (sign-agnostic) direction. A tolerance of 90°
-/// is equivalent to an omnidirectional variogram.
+/// (0 = N, 90 = E). In 3-D, `dip_deg` tilts the direction vector using the
+/// same sign convention as [`super::Anisotropy::dip_deg`] (GSLIB `ang2` /
+/// gstat, verified against `rotation_matrix_3d` in
+/// `direction_matches_model_major_axis` below — a positive `dip_deg` here
+/// picks out the same 3-D direction as a fitted model with the same
+/// `azimuth_deg`/`dip_deg`, so a variogram computed along `DirectionConfig`
+/// and fit to a model built from the same angles are mutually consistent).
+/// Pairs are accepted within a cone of half-aperture `tolerance_deg` around
+/// the (sign-agnostic) direction. A tolerance of 90° is equivalent to an
+/// omnidirectional variogram.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DirectionConfig {
     /// Azimuth in degrees clockwise from north.
     pub azimuth_deg: f64,
-    /// Dip in degrees, positive downward (3-D only; 0 in 2-D).
+    /// Dip in degrees (3-D only; 0 in 2-D). Same sign convention as
+    /// [`super::Anisotropy::dip_deg`] — see the struct docs.
     pub dip_deg: f64,
     /// Half-aperture tolerance in degrees.
     pub tolerance_deg: f64,
@@ -30,6 +37,21 @@ impl DirectionConfig {
             tolerance_deg,
         }
     }
+}
+
+/// Unit direction vector for an azimuth/dip pair, in the same sign
+/// convention as [`super::Anisotropy::rotation_matrix_3d`]'s major-axis row
+/// (see `direction_matches_model_major_axis`). `D = 2` ignores `dip_deg`.
+pub(crate) fn direction_unit_vector<const D: usize>(azimuth_deg: f64, dip_deg: f64) -> [f64; D] {
+    let az = azimuth_deg.to_radians();
+    let dip = dip_deg.to_radians();
+    let mut u = [0.0; D];
+    u[0] = dip.cos() * az.sin();
+    u[1] = dip.cos() * az.cos();
+    if D == 3 {
+        u[2] = dip.sin();
+    }
+    u
 }
 
 /// Configuration for the experimental variogram.
@@ -161,14 +183,7 @@ pub(crate) fn pair_bins<const D: usize>(
     let width = cfg.max_dist / n_lags as f64;
     // Sign-agnostic cone test: |dot(pair, u)| >= |pair| * cos(tol).
     let dir = cfg.direction.as_ref().map(|d| {
-        let az = d.azimuth_deg.to_radians();
-        let dip = d.dip_deg.to_radians();
-        let mut u = [0.0; D];
-        u[0] = dip.cos() * az.sin();
-        u[1] = dip.cos() * az.cos();
-        if D == 3 {
-            u[2] = -dip.sin(); // dip positive downward
-        }
+        let u: [f64; D] = direction_unit_vector(d.azimuth_deg, d.dip_deg);
         (u, d.tolerance_deg.to_radians().cos())
     });
 

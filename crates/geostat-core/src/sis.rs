@@ -115,6 +115,16 @@ pub fn sis_at<const D: usize>(
                 .into(),
         ));
     }
+    if let Some(kind) = cfg
+        .models
+        .iter()
+        .find_map(|m| m.invalid_structure_for_dim(D))
+    {
+        return Err(GeostatError::InvalidParameter(format!(
+            "{kind:?} is not a valid covariance in {D} dimensions; use Spherical instead for a \
+             3-D-safe bounded structure"
+        )));
+    }
     if cfg.n_realizations == 0 || cfg.max_neighbors == 0 {
         return Err(GeostatError::InvalidParameter(
             "n_realizations and max_neighbors must be at least 1".into(),
@@ -375,6 +385,14 @@ pub struct MarkovBayesCalibration {
     pub rho: f64,
     /// Marginal standard deviation of the soft datum.
     pub sigma_soft: f64,
+    /// Marginal mean of the soft datum at the calibration pairs (`E[Y]`).
+    /// In the simple-kriging system each datum enters as a deviation from
+    /// *its own* mean; the soft channel's mean is generally **not** the
+    /// hard indicator's global proportion `p` unless the soft probabilities
+    /// happen to be perfectly calibrated on average (AUDIT-2026-07-v2.md
+    /// §1.7 — using `p` here silently imported the soft channel's
+    /// calibration bias, if any, into every prediction with weight `w[n]`).
+    pub mean_soft: f64,
 }
 
 /// Estimates one [`MarkovBayesCalibration`] per cutoff from collocated
@@ -409,7 +427,12 @@ pub fn calibrate_markov_bayes(
             let h: Vec<f64> = hard.iter().map(|r| r[k]).collect();
             let s: Vec<f64> = soft.iter().map(|r| r[k]).collect();
             let (rho, _sigma_hard, sigma_soft) = crate::collocated::estimate_collocated_stats(&h, &s)?;
-            Ok(MarkovBayesCalibration { rho, sigma_soft })
+            let mean_soft = s.iter().sum::<f64>() / s.len() as f64;
+            Ok(MarkovBayesCalibration {
+                rho,
+                sigma_soft,
+                mean_soft,
+            })
         })
         .collect()
 }
@@ -469,6 +492,7 @@ fn indicator_estimate_soft(
     cutoff: f64,
     p: f64,
     soft_val: f64,
+    mean_soft: f64,
 ) -> f64 {
     let n = nb.len();
     let mut est = p;
@@ -476,7 +500,10 @@ fn indicator_estimate_soft(
         let ind = if vals[i] <= cutoff { 1.0 } else { 0.0 };
         est += w[ii] * (ind - p);
     }
-    est += w[n] * (soft_val - p);
+    // Each simple-kriging datum enters as a deviation from its own mean:
+    // the soft channel's mean is `mean_soft` (from calibration), not the
+    // hard indicator's global proportion `p` (AUDIT-2026-07-v2.md §1.7).
+    est += w[n] * (soft_val - mean_soft);
     est
 }
 
@@ -503,7 +530,15 @@ pub(crate) fn indicator_ccdf_soft<const D: usize>(
     for k in 0..cutoffs.len() {
         let model = if models.len() == 1 { &models[0] } else { &models[k] };
         let w = indicator_weights_soft(coords, nb, model, target, calib[k])?;
-        ccdf[k] = indicator_estimate_soft(&w, nb, vals, cutoffs[k], props[k], soft[k]);
+        ccdf[k] = indicator_estimate_soft(
+            &w,
+            nb,
+            vals,
+            cutoffs[k],
+            props[k],
+            soft[k],
+            calib[k].mean_soft,
+        );
     }
     Ok(())
 }
@@ -741,5 +776,49 @@ mod tests {
                 prop_assert!(raw.iter().all(|&f| (0.0..=1.0).contains(&f)), "{raw:?}");
             }
         }
+    }
+
+    /// AUDIT-2026-07-v2.md §1.7: `indicator_estimate_soft` must use the soft
+    /// datum's own calibrated mean, not the hard indicator's global
+    /// proportion `p`, as the deviation point for the soft term -- a
+    /// mismatch (soft channel calibrated to a mean far from `p`) must not
+    /// silently leak into every prediction.
+    #[test]
+    fn indicator_estimate_soft_deviates_from_its_own_mean_not_from_p() {
+        let w = [0.1, 0.2, 0.15]; // 2 hard neighbours + 1 soft weight
+        let nb = [0usize, 1usize];
+        let vals = [10.0, 20.0];
+        let cutoff = 15.0;
+        let p = 0.4; // hard indicator's global proportion, deliberately != mean_soft
+
+        // Soft value fed to the target sits exactly at its own calibrated
+        // mean: with a correct implementation the soft term's contribution
+        // is exactly `w[2] * (soft_val - mean_soft) = 0`, regardless of how
+        // far `mean_soft` is from `p`.
+        let mean_soft = 0.9;
+        let soft_val = mean_soft;
+        let est = indicator_estimate_soft(&w, &nb, &vals, cutoff, p, soft_val, mean_soft);
+        let hard_only: f64 = p
+            + w[..2]
+                .iter()
+                .zip(&nb)
+                .map(|(&wi, &i)| wi * (if vals[i] <= cutoff { 1.0 } else { 0.0 } - p))
+                .sum::<f64>();
+        assert!(
+            (est - hard_only).abs() < 1e-12,
+            "soft term should vanish when soft_val == mean_soft: {est} vs {hard_only}"
+        );
+
+        // Changing `mean_soft` while holding `soft_val` fixed must shift the
+        // estimate by exactly `-w[2] * delta` (linear in mean_soft) -- the
+        // old code (deviating from `p` instead) would not respond to
+        // `mean_soft` at all.
+        let est_shifted = indicator_estimate_soft(&w, &nb, &vals, cutoff, p, soft_val, 0.2);
+        let expected_delta = -w[2] * (0.2 - mean_soft);
+        assert!(
+            (est_shifted - est - expected_delta).abs() < 1e-12,
+            "{est_shifted} vs {} (est {est} + delta {expected_delta})",
+            est + expected_delta
+        );
     }
 }

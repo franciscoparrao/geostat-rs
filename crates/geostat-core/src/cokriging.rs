@@ -250,6 +250,19 @@ impl<'a, const D: usize> CoKriging<'a, D> {
                 "search radius must be positive, got {r}"
             )));
         }
+        // AUDIT-2026-07-v2.md §1's follow-up: duplicate coordinates within a
+        // single dataset make its rows in the per-variable neighbourhood
+        // system identical -> a singular LU -> a silent per-target NaN
+        // (the same failure mode Fase 0 already closed for `Kriging` and
+        // `CollocatedCokriging` via this same check).
+        for (v, d) in datasets.iter().enumerate() {
+            if let Some((i, j)) = d.duplicate_pair() {
+                return Err(GeostatError::InvalidParameter(format!(
+                    "dataset {v}: duplicate data points at indices {i} and {j} share the same \
+                     coordinates (collapse or jitter duplicates first)"
+                )));
+            }
+        }
         let local = config.max_neighbors.is_some() || config.search_radius.is_some();
         let trees = datasets
             .iter()
@@ -795,6 +808,34 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn rejects_duplicate_points_in_any_dataset() {
+        // AUDIT-2026-07-v2.md §1's follow-up: `Kriging`/`CollocatedCokriging`
+        // already reject duplicate coordinates (Fase 0); `CoKriging::new`
+        // did not, so a duplicate in either dataset silently produced a
+        // singular per-variable system (and so a NaN estimate) instead of a
+        // clear construction-time error.
+        let m = lmc(0.8);
+        let dup_primary = PointSet::new(
+            vec![[0.0, 0.0], [0.0, 0.0], [10.0, 10.0]],
+            vec![1.0, 1.0, 2.0],
+        )
+        .unwrap();
+        let s = secondary();
+        assert!(CoKriging::new(vec![&dup_primary, &s], &m, CoKrigingConfig::default()).is_err());
+
+        let p = primary();
+        let dup_secondary = PointSet::new(
+            vec![[0.0, 0.0], [0.0, 0.0], [10.0, 10.0]],
+            vec![2.0, 2.0, 5.0],
+        )
+        .unwrap();
+        assert!(CoKriging::new(vec![&p, &dup_secondary], &m, CoKrigingConfig::default()).is_err());
+
+        // Regression guard: distinct, duplicate-free datasets must still work.
+        assert!(CoKriging::new(vec![&p, &s], &m, CoKrigingConfig::default()).is_ok());
     }
 
     #[test]

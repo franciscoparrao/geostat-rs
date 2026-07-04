@@ -111,6 +111,16 @@ impl<'a, const D: usize> CollocatedCokriging<'a, D> {
                     .into(),
             ));
         }
+        let dim_offender = model1.invalid_structure_for_dim(D).or_else(|| match &markov {
+            MarkovModel::Mm2 { secondary_model } => secondary_model.invalid_structure_for_dim(D),
+            MarkovModel::Mm1 => None,
+        });
+        if let Some(kind) = dim_offender {
+            return Err(GeostatError::InvalidParameter(format!(
+                "{kind:?} is not a valid covariance in {D} dimensions; use Spherical instead for \
+                 a 3-D-safe bounded structure"
+            )));
+        }
         if !rho12.is_finite() || !(-1.0..=1.0).contains(&rho12) {
             return Err(GeostatError::InvalidParameter(format!(
                 "rho12 must be finite and in [-1, 1], got {rho12}"
@@ -148,14 +158,32 @@ impl<'a, const D: usize> CollocatedCokriging<'a, D> {
         })
     }
 
-    /// Cross-covariance `C12(dh)` under the configured Markov model.
+    /// Cross-covariance `C12(dh)` under the configured Markov model:
+    /// `rho12 * sigma1 * sigma2 * rho_k(dh)`, where `rho_k = Ck(dh)/Ck(0)`
+    /// is the *correlogram* of whichever model (`k = 1` for MM1, `k = 2` for
+    /// MM2) the Markov screening hypothesis follows.
+    ///
+    /// Using the correlogram (not the raw covariance) is what makes this
+    /// consistent with the `C12(0) = rho12 * sigma1 * sigma2` identity the
+    /// module docs state: `sigma1`/`sigma2` are caller-supplied marginal
+    /// standard deviations (typically sample estimates from
+    /// [`estimate_collocated_stats`]), which need not exactly equal
+    /// `sqrt(model1.covariance_dh(0))` / `sqrt(secondary_model.covariance_dh(0))`
+    /// -- fitting a variogram and estimating a sample variance are two
+    /// different estimators of the same quantity. The raw-covariance formula
+    /// used before this fix silently assumed they matched exactly
+    /// (AUDIT-2026-07-v2.md §1.6): the predict system's data-secondary
+    /// cross terms and its RHS `C12(0)` entry were built from two formulas
+    /// that agreed only in that special case.
     fn c12(&self, dh: [f64; D]) -> f64 {
         match &self.markov {
             MarkovModel::Mm1 => {
-                self.rho12 * (self.sigma2 / self.sigma1) * self.model1.covariance_dh(dh)
+                let c11_0 = self.model1.covariance_dh([0.0; D]);
+                self.rho12 * self.sigma1 * self.sigma2 * (self.model1.covariance_dh(dh) / c11_0)
             }
             MarkovModel::Mm2 { secondary_model } => {
-                self.rho12 * (self.sigma1 / self.sigma2) * secondary_model.covariance_dh(dh)
+                let c22_0 = secondary_model.covariance_dh([0.0; D]);
+                self.rho12 * self.sigma1 * self.sigma2 * (secondary_model.covariance_dh(dh) / c22_0)
             }
         }
     }
@@ -358,38 +386,96 @@ mod tests {
     }
 
     #[test]
-    fn mm1_perfectly_collinear_secondary_can_be_singular() {
-        // Documented edge case: rho12=1 with sigma2==sigma1 makes MM1's
-        // C12(h) *identical* to C1(h) -- the secondary becomes an exact
-        // informational duplicate of the primary. The row for a primary
-        // neighbour at zero separation and the (linearly dependent) row for
-        // the collocated secondary can then make the system singular enough
-        // that partial-pivoting LU picks an unexpected solution (weight on
-        // the secondary instead of the coincident primary datum) rather
-        // than erroring outright -- this pins the actual observed behavior
-        // so a future change is not surprised by it. `rho12` is a *sample*
-        // correlation in practice and is essentially never exactly `1.0`,
-        // so this is not expected to bite real usage.
+    fn mm1_perfectly_collinear_secondary_errors_instead_of_guessing() {
+        // Documented edge case: rho12=1 with sigma1==sigma2==sqrt(C1(0))
+        // makes MM1's C12(h) *identical* to C1(h) -- the secondary becomes
+        // an exact informational duplicate of the primary, so the row for a
+        // primary neighbour at zero separation and the (linearly dependent)
+        // row for the collocated secondary make the system exactly
+        // singular. Before AUDIT-2026-07-v2.md §1.6's fix, `c12` used the
+        // raw covariance (`rho12 * (sigma2/sigma1) * C1(h)`), which reached
+        // this exact-duplicate condition for *any* sigma1==sigma2 --
+        // including sigma values that did not match the model's own
+        // C1(0), an internal inconsistency described in the audit. That
+        // bug happened to make partial-pivoting LU land on a near-zero (but
+        // nonzero) pivot, returning an "unexpected but not erroring"
+        // solution. The corrected, internally-consistent correlogram
+        // formula (`rho12 * sigma1 * sigma2 * (C1(h)/C1(0))`) reaches the
+        // true exact-duplicate condition only when sigma matches the
+        // model's C1(0), and there the pivot is exactly zero: the fixed
+        // code reports `SingularSystem` explicitly instead of silently
+        // returning an arbitrary answer -- an improvement over the old
+        // "unexpected but not erroring" behavior, not a regression.
+        // `rho12` is a *sample* correlation in practice and is essentially
+        // never exactly `1.0`, so this is not expected to bite real usage.
         let data = primary();
         let m = model1();
+        let sigma = m.covariance_dh([0.0, 0.0]).sqrt();
         let cck = CollocatedCokriging::new(
             &data,
             &m,
             data.mean(),
             data.mean(),
             1.0,
-            0.6,
-            0.6,
+            sigma,
+            sigma,
             MarkovModel::Mm1,
             CollocatedConfig::default(),
         )
         .unwrap();
-        let est = cck.predict([0.0, 0.0], 42.0).unwrap();
+        let err = cck.predict([0.0, 0.0], 42.0).unwrap_err();
         assert!(
-            (est.value - 42.0).abs() < 1e-6,
-            "expected the degenerate system to weight the secondary, got {}",
-            est.value
+            matches!(err, GeostatError::SingularSystem(_)),
+            "expected a clean singular-system error, got {err:?}"
         );
+    }
+
+    #[test]
+    fn c12_matches_rho_sigma1_sigma2_at_zero_lag_even_when_sigma_mismatches_the_model_sill() {
+        // AUDIT-2026-07-v2.md §1.6: the module docs (and `predict`'s use of
+        // `c12_0 = rho12 * sigma1 * sigma2` as the system's RHS) require
+        // `C12(0) == rho12 * sigma1 * sigma2` exactly. Before the fix this
+        // only held when sigma1^2 happened to equal `model1.covariance_dh(0)`
+        // (MM1) / `secondary_model.covariance_dh(0)` (MM2); this test
+        // deliberately picks a sigma that does *not* match either model's
+        // sill, which would have broken the identity under the old
+        // raw-covariance formula.
+        let data = primary();
+        let m1 = model1(); // sill = 1.0
+        let rho12 = 0.4;
+        let (sigma1, sigma2) = (3.0, 7.0); // neither is sqrt(1.0)
+        let expected = rho12 * sigma1 * sigma2;
+
+        let mm1 = CollocatedCokriging::new(
+            &data,
+            &m1,
+            0.0,
+            0.0,
+            rho12,
+            sigma1,
+            sigma2,
+            MarkovModel::Mm1,
+            CollocatedConfig::default(),
+        )
+        .unwrap();
+        assert!((mm1.c12([0.0, 0.0]) - expected).abs() < 1e-10);
+
+        let secondary_model =
+            VariogramModel::new(0.0, vec![Structure::new(ModelKind::Exponential, 5.0, 15.0)])
+                .unwrap(); // sill = 5.0, also mismatched
+        let mm2 = CollocatedCokriging::new(
+            &data,
+            &m1,
+            0.0,
+            0.0,
+            rho12,
+            sigma1,
+            sigma2,
+            MarkovModel::Mm2 { secondary_model },
+            CollocatedConfig::default(),
+        )
+        .unwrap();
+        assert!((mm2.c12([0.0, 0.0]) - expected).abs() < 1e-10);
     }
 
     #[test]

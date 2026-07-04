@@ -1300,8 +1300,9 @@ fn sis(
 }
 
 /// 3-D experimental semivariogram. Returns `(h, gamma, n_pairs)` lists.
-/// `dip` (degrees, positive downward) and `azimuth` enable a directional
-/// cone; omit both for an omnidirectional variogram.
+/// `dip` (degrees; same sign convention as a fitted model's rotation --
+/// GSLIB ang2 / gstat) and `azimuth` enable a directional cone; omit both
+/// for an omnidirectional variogram.
 #[pyfunction]
 #[pyo3(signature = (x, y, z, values, n_lags = 15, max_dist = None,
     azimuth = None, dip = 0.0, tolerance = 22.5))]

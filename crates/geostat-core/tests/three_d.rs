@@ -2,8 +2,10 @@
 //! `PointSet<3>` — same code paths as 2-D via const generics.
 
 use geostat_core::{
-    Grid3D, Kriging, KrigingConfig, KrigingMethod, ModelKind, PointSet, Rng, SgsConfig, Structure,
-    VariogramConfig, VariogramModel, experimental_variogram, fit_best, leave_one_out, sgs_at,
+    CollocatedConfig, CollocatedCokriging, Grid3D, IkConfig, Kriging, KrigingConfig,
+    KrigingMethod, MarkovModel, ModelKind, PointSet, Rng, SgsConfig, SisConfig, Structure,
+    TailModel, VariogramConfig, VariogramModel, experimental_variogram, fit_best,
+    indicator_kriging, leave_one_out, sgs_at, sis_at, vecchia_loglik, vecchia_predict,
 };
 
 fn synthetic_3d(n: usize, seed: u64) -> PointSet<3> {
@@ -228,4 +230,111 @@ fn cv_3d_beats_mean_predictor() {
         / data.len() as f64)
         .sqrt();
     assert!(cv.rmse() < 0.6 * std, "rmse {} vs std {std}", cv.rmse());
+}
+
+// AUDIT-2026-07-v2.md §1.5: `ModelKind::Circular` (the disk covariance) is
+// only positive-definite in <= 2 dimensions; nothing previously stopped it
+// from being used with `PointSet<3>`, silently risking a non-PD covariance
+// matrix in every engine below. Each engine must reject it with a clear
+// error instead.
+
+fn circular_model_3d() -> VariogramModel {
+    VariogramModel::new(0.01, vec![Structure::new(ModelKind::Circular, 1.0, 30.0)]).unwrap()
+}
+
+#[test]
+fn circular_model_is_still_valid_in_2d() {
+    // Regression guard: the dimensional guard must not over-reject the
+    // dimension it was actually designed for.
+    let data: PointSet<2> = PointSet::new(
+        vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.4, 0.6]],
+        vec![1.0, 2.0, 1.5, 2.5, 1.7],
+    )
+    .unwrap();
+    let model =
+        VariogramModel::new(0.01, vec![Structure::new(ModelKind::Circular, 1.0, 5.0)]).unwrap();
+    assert!(Kriging::new(&data, &model, KrigingConfig::default()).is_ok());
+}
+
+#[test]
+fn kriging_3d_rejects_circular_model() {
+    let data = synthetic_3d(30, 3);
+    let model = circular_model_3d();
+    assert!(Kriging::new(&data, &model, KrigingConfig::default()).is_err());
+}
+
+#[test]
+fn vecchia_3d_rejects_circular_model() {
+    let data = synthetic_3d(30, 3);
+    let model = circular_model_3d();
+    assert!(vecchia_loglik(&data, &model, 10, None).is_err());
+    assert!(vecchia_predict(&data, &model, &[[1.0, 1.0, 1.0]], 10).is_err());
+}
+
+#[test]
+fn sis_3d_rejects_circular_model() {
+    let data = synthetic_3d(30, 3);
+    let cfg = SisConfig {
+        cutoffs: vec![0.0],
+        models: vec![circular_model_3d()],
+        n_realizations: 1,
+        ..SisConfig::default()
+    };
+    assert!(sis_at(&data, &[[1.0, 1.0, 1.0]], &cfg).is_err());
+}
+
+#[test]
+fn ik_3d_rejects_circular_model() {
+    let data = synthetic_3d(30, 3);
+    let cfg = IkConfig {
+        cutoffs: vec![0.0],
+        models: vec![circular_model_3d()],
+        ordinary: false,
+        max_neighbors: None,
+        search_radius: None,
+        tail_min: None,
+        tail_max: None,
+        lower_tail: TailModel::Linear,
+        upper_tail: TailModel::Linear,
+    };
+    assert!(indicator_kriging(&data, &[[1.0, 1.0, 1.0]], &cfg).is_err());
+}
+
+#[test]
+fn collocated_3d_rejects_circular_model() {
+    let data = synthetic_3d(30, 3);
+    // Circular as the primary's own model (used by both MM1 and MM2).
+    assert!(
+        CollocatedCokriging::<3>::new(
+            &data,
+            &circular_model_3d(),
+            0.0,
+            0.0,
+            0.5,
+            1.0,
+            1.0,
+            MarkovModel::Mm1,
+            CollocatedConfig::default(),
+        )
+        .is_err()
+    );
+    // Circular as MM2's secondary-only model, with a valid primary.
+    let primary = VariogramModel::new(0.01, vec![Structure::new(ModelKind::Spherical, 1.0, 30.0)])
+        .unwrap();
+    assert!(
+        CollocatedCokriging::<3>::new(
+            &data,
+            &primary,
+            0.0,
+            0.0,
+            0.5,
+            1.0,
+            1.0,
+            MarkovModel::Mm2 {
+                secondary_model: circular_model_3d(),
+            },
+            CollocatedConfig::default(),
+        )
+        .is_err()
+    );
 }

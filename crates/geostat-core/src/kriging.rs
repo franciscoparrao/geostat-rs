@@ -160,6 +160,19 @@ impl<'a, const D: usize, M: Covariance<D>> Kriging<'a, D, M> {
                 "measurement error with external drift is not supported yet".into(),
             ));
         }
+        if model.has_power() {
+            // Power (IRF-0) systems are built in semivariogram form, where
+            // the data-data diagonal is `gamma(0) = 0` rather than a real
+            // covariance `C(0)`; adding an error variance there would need
+            // the opposite sign of the covariance-form case (`-err` instead
+            // of `+err`, since `C(0,err) = C(0) - err` translates to
+            // `gamma(0,err) = -err` after the `C = c0 - gamma` substitution)
+            // and has not been derived/tested. Reject explicitly rather than
+            // silently building an inconsistent system.
+            return Err(GeostatError::InvalidParameter(
+                "measurement error with Power (IRF-0) models is not supported yet".into(),
+            ));
+        }
         if errors.len() != data.len() {
             return Err(GeostatError::DimensionMismatch(format!(
                 "{} error variances vs {} data points",
@@ -238,6 +251,13 @@ impl<'a, const D: usize, M: Covariance<D>> Kriging<'a, D, M> {
                  directly in semivariogram form, the classical IRF-0 generalization)"
                     .into(),
             ));
+        }
+        if !Covariance::<D>::is_valid_dim(model) {
+            return Err(GeostatError::InvalidParameter(format!(
+                "this model is not a valid covariance in {D} dimensions (e.g. Circular is only \
+                 positive-definite for dim <= 2; use Spherical instead for a 3-D-safe bounded \
+                 structure)"
+            )));
         }
         if let Some(r) = config.search_radius
             && !(r > 0.0)
@@ -1014,6 +1034,38 @@ mod tests {
             ..Default::default()
         };
         assert!(Kriging::new(&data, &m, cfg).is_err());
+    }
+
+    #[test]
+    fn power_model_rejects_measurement_error() {
+        // AUDIT-2026-07-v2.md §1.2: Power's semivariogram-form diagonal
+        // (`gamma(0) = 0`) needs the opposite sign for an error variance
+        // (`-err`, not `+err`) relative to the covariance-form case; that
+        // path was never derived, so the combination must be rejected
+        // rather than silently building an inconsistent system.
+        let data = sample_data();
+        let m = VariogramModel::new(0.0, vec![Structure::new(ModelKind::Power(1.0), 1.0, 1.0)])
+            .unwrap();
+        assert!(
+            Kriging::with_measurement_error(
+                &data,
+                &m,
+                KrigingConfig::default(),
+                vec![0.1; data.len()]
+            )
+            .is_err()
+        );
+        // Even an all-zero error vector is rejected: the guard is on the
+        // model, not the error magnitude, matching the other Power guards.
+        assert!(
+            Kriging::with_measurement_error(
+                &data,
+                &m,
+                KrigingConfig::default(),
+                vec![0.0; data.len()]
+            )
+            .is_err()
+        );
     }
 
     #[test]

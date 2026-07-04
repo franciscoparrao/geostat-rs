@@ -60,6 +60,16 @@ pub trait Covariance<const D: usize = 2>: Send + Sync {
     fn has_power(&self) -> bool {
         false
     }
+
+    /// `true` if this covariance is mathematically valid in `D` dimensions
+    /// (e.g. positive-definite). Defaults to `true` — correct for most
+    /// hand-rolled covariances, which typically aren't tied to a dimension;
+    /// [`VariogramModel`] overrides this for kinds like
+    /// [`crate::variogram::ModelKind::Circular`] that are only valid in
+    /// `D <= 2` (see [`VariogramModel::invalid_structure_for_dim`]).
+    fn is_valid_dim(&self) -> bool {
+        true
+    }
 }
 
 impl<const D: usize> Covariance<D> for VariogramModel {
@@ -77,6 +87,10 @@ impl<const D: usize> Covariance<D> for VariogramModel {
 
     fn has_power(&self) -> bool {
         VariogramModel::has_power(self)
+    }
+
+    fn is_valid_dim(&self) -> bool {
+        self.invalid_structure_for_dim(D).is_none()
     }
 }
 
