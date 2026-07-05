@@ -16,9 +16,30 @@ use pyo3::types::PyDict;
 
 use geostat_core as core;
 use geostat_core::{
-    DirectionConfig, Grid2D, Kriging, KrigingConfig, KrigingMethod, PointSet, SgsConfig, SisConfig,
-    VariogramConfig,
+    Anisotropy, DirectionConfig, Grid2D, Kriging, KrigingConfig, KrigingMethod, PointSet,
+    SgsConfig, SisConfig, VariogramConfig,
 };
+
+/// Builds `KrigingConfig::anisotropic_search` from the CLI-mirroring
+/// `search_azimuth`/`search_ratio`/`search_ratio_z`/`search_dip`/
+/// `search_rake` parameters shared by `krige`/`krige_grid`: `None` unless
+/// `search_azimuth` is given.
+#[allow(clippy::too_many_arguments)]
+fn anisotropic_search(
+    search_azimuth: Option<f64>,
+    search_ratio: f64,
+    search_ratio_z: f64,
+    search_dip: f64,
+    search_rake: f64,
+) -> Option<Anisotropy> {
+    search_azimuth.map(|azimuth_deg| Anisotropy {
+        azimuth_deg,
+        ratio: search_ratio,
+        ratio_z: search_ratio_z,
+        dip_deg: search_dip,
+        rake_deg: search_rake,
+    })
+}
 
 /// A pair of same-length 1-D numpy arrays (predictions, variances).
 type ArrayPair = (Py<PyArray1<f64>>, Py<PyArray1<f64>>);
@@ -167,14 +188,30 @@ fn maybe_detrend(
     Ok(data)
 }
 
+fn parse_estimator(s: &str) -> PyResult<core::EstimatorKind> {
+    match s.trim().to_lowercase().as_str() {
+        "matheron" => Ok(core::EstimatorKind::Matheron),
+        "cressie-hawkins" | "cressie_hawkins" | "ch" => Ok(core::EstimatorKind::CressieHawkins),
+        "dowd" => Ok(core::EstimatorKind::Dowd),
+        "madogram" => Ok(core::EstimatorKind::Madogram),
+        other => Err(PyValueError::new_err(format!(
+            "unknown estimator '{other}' (expected matheron, cressie-hawkins, dowd or madogram)"
+        ))),
+    }
+}
+
 /// Experimental semivariogram. Returns `(h, gamma, n_pairs)` lists; empty
 /// bins carry NaN gamma. `detrend` (degree 1 or 2) computes the variogram on
 /// OLS residuals of a polynomial trend — the correct variography for
 /// universal kriging; `detrend_drift` (one row of covariates per point) does
-/// the same for an external drift (KED).
+/// the same for an external drift (KED). `estimator` selects the point-pair
+/// estimator: "matheron" (default, mean-squared-difference),
+/// "cressie-hawkins"/"ch", "dowd" or "madogram" -- the latter three trade
+/// some efficiency under Gaussian differences for resistance to a few
+/// outlier pairs (GSLIB `gamv`/gstat estimator family).
 #[pyfunction]
 #[pyo3(signature = (x, y, values, n_lags = 15, max_dist = None, azimuth = None, tolerance = 22.5,
-    detrend = None, detrend_drift = None))]
+    detrend = None, detrend_drift = None, estimator = "matheron"))]
 #[allow(clippy::too_many_arguments)]
 fn experimental_variogram(
     py: Python<'_>,
@@ -187,11 +224,13 @@ fn experimental_variogram(
     tolerance: f64,
     detrend: Option<u8>,
     detrend_drift: Option<Vec<Vec<f64>>>,
+    estimator: &str,
 ) -> PyResult<(Vec<f64>, Vec<f64>, Vec<usize>)> {
     let data = maybe_detrend(point_set(x, y, values)?, detrend, detrend_drift)?;
+    let estimator = parse_estimator(estimator)?;
     py.allow_threads(|| {
         let cfg = vario_config(&data, n_lags, max_dist, azimuth, 0.0, tolerance);
-        let ev = core::experimental_variogram(&data, &cfg).map_err(err)?;
+        let ev = core::experimental_variogram_robust(&data, &cfg, estimator).map_err(err)?;
         let mut h = Vec::new();
         let mut gamma = Vec::new();
         let mut np = Vec::new();
@@ -453,11 +492,17 @@ fn vecchia_loglik(
 /// Kriging at arbitrary target locations. Returns `(predictions, variances)`;
 /// failed targets yield NaN. `min_neighbors` (GSLIB ndmin) fails estimates
 /// with too few conditioning points; `octant` (GSLIB noct) caps the
-/// neighbors taken per quadrant to balance clustered data.
+/// neighbors taken per quadrant to balance clustered data. With
+/// `search_azimuth` set, the search neighborhood is a rotated ellipsoid
+/// (GSLIB kt3d sang1/sanis1) instead of a Euclidean one: `radius` becomes
+/// the major-axis radius, and `search_ratio`/`search_dip`/`search_rake`
+/// shape it the same way an anisotropic variogram's `ratio`/`dip`/`rake` do.
 #[pyfunction]
 #[pyo3(signature = (x, y, values, model, target_x, target_y, method = "ordinary",
     mean = None, degree = 1, max_neighbors = None, radius = None,
-    min_neighbors = None, octant = None, measurement_error = None))]
+    min_neighbors = None, octant = None, measurement_error = None,
+    search_azimuth = None, search_ratio = 1.0, search_ratio_z = 1.0,
+    search_dip = 0.0, search_rake = 0.0))]
 #[allow(clippy::too_many_arguments)]
 fn krige(
     py: Python<'_>,
@@ -475,6 +520,11 @@ fn krige(
     min_neighbors: Option<usize>,
     octant: Option<usize>,
     measurement_error: Option<Vec<f64>>,
+    search_azimuth: Option<f64>,
+    search_ratio: f64,
+    search_ratio_z: f64,
+    search_dip: f64,
+    search_rake: f64,
 ) -> PyResult<ArrayPair> {
     if target_x.len() != target_y.len() {
         return Err(PyValueError::new_err(
@@ -482,13 +532,21 @@ fn krige(
         ));
     }
     let data = point_set(x, y, values)?;
-    let config = KrigingConfig {
-        method: build_method(method, mean, degree, &data)?,
-        max_neighbors,
-        search_radius: radius,
-        min_neighbors,
-        max_per_octant: octant,
-    };
+    // `KrigingConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields.
+    let mut config = KrigingConfig::default();
+    config.method = build_method(method, mean, degree, &data)?;
+    config.max_neighbors = max_neighbors;
+    config.search_radius = radius;
+    config.min_neighbors = min_neighbors;
+    config.max_per_octant = octant;
+    config.anisotropic_search = anisotropic_search(
+        search_azimuth,
+        search_ratio,
+        search_ratio_z,
+        search_dip,
+        search_rake,
+    );
     let targets: Vec<[f64; 2]> = target_x
         .into_iter()
         .zip(target_y)
@@ -548,12 +606,12 @@ fn lognormal_kriging(
             )));
         }
     };
-    let config = KrigingConfig {
-        method: kmethod,
-        max_neighbors,
-        search_radius: radius,
-        ..Default::default()
-    };
+    // `KrigingConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields.
+    let mut config = KrigingConfig::default();
+    config.method = kmethod;
+    config.max_neighbors = max_neighbors;
+    config.search_radius = radius;
     let targets: Vec<[f64; 2]> = target_x
         .into_iter()
         .zip(target_y)
@@ -568,11 +626,14 @@ fn lognormal_kriging(
 }
 
 /// Kriging over a regular grid (`bbox = (xmin, ymin, xmax, ymax)`), row-major
-/// cell centers with y increasing. Returns `(predictions, variances)`.
+/// cell centers with y increasing. Returns `(predictions, variances)`. With
+/// `search_azimuth` set, the search neighborhood is a rotated ellipsoid
+/// instead of a Euclidean one -- see `krige`.
 #[pyfunction]
 #[pyo3(signature = (x, y, values, model, bbox, nx, ny, method = "ordinary",
     mean = None, degree = 1, max_neighbors = None, radius = None, block = None, block_discr = (4, 4),
-    min_neighbors = None, octant = None))]
+    min_neighbors = None, octant = None, search_azimuth = None, search_ratio = 1.0,
+    search_ratio_z = 1.0, search_dip = 0.0, search_rake = 0.0))]
 #[allow(clippy::too_many_arguments)]
 fn krige_grid(
     py: Python<'_>,
@@ -592,16 +653,29 @@ fn krige_grid(
     block_discr: (usize, usize),
     min_neighbors: Option<usize>,
     octant: Option<usize>,
+    search_azimuth: Option<f64>,
+    search_ratio: f64,
+    search_ratio_z: f64,
+    search_dip: f64,
+    search_rake: f64,
 ) -> PyResult<ArrayPair> {
     let data = point_set(x, y, values)?;
     let grid = Grid2D::from_bbox([bbox.0, bbox.1], [bbox.2, bbox.3], nx, ny).map_err(err)?;
-    let config = KrigingConfig {
-        method: build_method(method, mean, degree, &data)?,
-        max_neighbors,
-        search_radius: radius,
-        min_neighbors,
-        max_per_octant: octant,
-    };
+    // `KrigingConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields.
+    let mut config = KrigingConfig::default();
+    config.method = build_method(method, mean, degree, &data)?;
+    config.max_neighbors = max_neighbors;
+    config.search_radius = radius;
+    config.min_neighbors = min_neighbors;
+    config.max_per_octant = octant;
+    config.anisotropic_search = anisotropic_search(
+        search_azimuth,
+        search_ratio,
+        search_ratio_z,
+        search_dip,
+        search_rake,
+    );
     let (values, variances) = py.allow_threads(|| {
         let kriging = Kriging::new(&data, &model.inner, config).map_err(err)?;
         match block {
@@ -644,13 +718,14 @@ fn loo_cv(
     blocks: Option<(usize, usize)>,
 ) -> PyResult<Py<PyDict>> {
     let data = point_set(x, y, values)?;
-    let config = KrigingConfig {
-        method: build_method(method, mean, degree, &data)?,
-        max_neighbors,
-        search_radius: radius,
-        min_neighbors,
-        max_per_octant: octant,
-    };
+    // `KrigingConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields.
+    let mut config = KrigingConfig::default();
+    config.method = build_method(method, mean, degree, &data)?;
+    config.max_neighbors = max_neighbors;
+    config.search_radius = radius;
+    config.min_neighbors = min_neighbors;
+    config.max_per_octant = octant;
     if blocks.is_some() && folds.is_some() {
         return Err(PyValueError::new_err(
             "blocks and folds are mutually exclusive",
@@ -774,12 +849,12 @@ fn regression_kriging(
         }
     };
 
-    let config = KrigingConfig {
-        method: KrigingMethod::Ordinary,
-        max_neighbors,
-        search_radius: radius,
-        ..Default::default()
-    };
+    // `KrigingConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields.
+    let mut config = KrigingConfig::default();
+    config.method = KrigingMethod::Ordinary;
+    config.max_neighbors = max_neighbors;
+    config.search_radius = radius;
     let (prediction, variance) = py.allow_threads(|| {
         let rk = RegressionKriging::new(&data, &trend_data).map_err(err)?;
         let cfg = vario_config(rk.residuals(), n_lags, max_dist, None, 0.0, 22.5);
@@ -945,12 +1020,12 @@ fn compare_methods(
     knn_k: usize,
 ) -> PyResult<Py<PyDict>> {
     let data = point_set(x, y, values)?;
-    let ok_config = KrigingConfig {
-        method: KrigingMethod::Ordinary,
-        max_neighbors,
-        search_radius: radius,
-        ..Default::default()
-    };
+    // `KrigingConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields.
+    let mut ok_config = KrigingConfig::default();
+    ok_config.method = KrigingMethod::Ordinary;
+    ok_config.max_neighbors = max_neighbors;
+    ok_config.search_radius = radius;
 
     let entries = py.allow_threads(|| {
         let cfg = vario_config(&data, n_lags, max_dist, None, 0.0, 22.5);
@@ -1254,11 +1329,14 @@ fn sgs(
 /// interpolation between `tail_min`/`tail_max` (default: data extremes) and
 /// the extreme cutoffs; hyperbolic upper tails are capped at `tail_max`.
 /// `ordinary=True` uses ordinary (Σw=1) instead of simple indicator kriging.
+/// `decluster_cell`, `max_node_neighbors` and `multigrid` mirror `sgs`'s
+/// same-named parameters (GSLIB declus/nodmax/nmult).
 #[pyfunction]
 #[pyo3(signature = (x, y, values, cutoffs, bbox, nx, ny, n_realizations = 10,
     seed = 42, max_neighbors = 16, radius = None, n_lags = 15, max_dist = None,
     fit = "spherical,exponential", ltail = "linear", utail = "linear",
-    tail_min = None, tail_max = None, mik = false, ordinary = false))]
+    tail_min = None, tail_max = None, mik = false, ordinary = false,
+    decluster_cell = None, max_node_neighbors = None, multigrid = 0))]
 #[allow(clippy::too_many_arguments)]
 fn sis(
     py: Python<'_>,
@@ -1282,6 +1360,9 @@ fn sis(
     tail_max: Option<f64>,
     mik: bool,
     ordinary: bool,
+    decluster_cell: Option<f64>,
+    max_node_neighbors: Option<usize>,
+    multigrid: u8,
 ) -> PyResult<Py<PyArray2<f64>>> {
     let data = point_set(x, y, values)?;
     let grid = Grid2D::from_bbox([bbox.0, bbox.1], [bbox.2, bbox.3], nx, ny).map_err(err)?;
@@ -1294,6 +1375,10 @@ fn sis(
     };
     let lower_tail = parse_tail(ltail)?;
     let upper_tail = parse_tail(utail)?;
+    let decluster_weights = match decluster_cell {
+        Some(size) => Some(core::cell_declustering_weights(&data, size, 4).map_err(err)?),
+        None => None,
+    };
     // `SisConfig` is `#[non_exhaustive]`: build from `Default::default()`
     // and assign fields.
     let mut cfg = SisConfig::default();
@@ -1308,6 +1393,9 @@ fn sis(
     cfg.tail_max = tail_max;
     cfg.lower_tail = lower_tail;
     cfg.upper_tail = upper_tail;
+    cfg.decluster_weights = decluster_weights;
+    cfg.max_node_neighbors = max_node_neighbors;
+    cfg.multigrid = multigrid;
     let realizations = py.allow_threads(|| {
         core::sequential_indicator_simulation(&data, &grid, &cfg)
             .map_err(err)
@@ -1417,12 +1505,12 @@ fn krige_3d(
             )));
         }
     };
-    let config = KrigingConfig {
-        method: kmethod,
-        max_neighbors,
-        search_radius: radius,
-        ..Default::default()
-    };
+    // `KrigingConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields.
+    let mut config = KrigingConfig::default();
+    config.method = kmethod;
+    config.max_neighbors = max_neighbors;
+    config.search_radius = radius;
     let targets: Vec<[f64; 3]> = target_x
         .into_iter()
         .zip(target_y)

@@ -12,12 +12,25 @@ use ndarray::Array2;
 use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
 use crate::grid::Grid2D;
-use crate::linalg::solve;
+use crate::linalg::{cholesky_solve_in_place, solve};
 use crate::rng::{Rng, splitmix64};
 use crate::search::BucketGrid;
 use crate::simulation::SgsResult;
 use crate::tails::{self, TailModel};
 use crate::variogram::VariogramModel;
+
+/// Reusable buffers for [`indicator_weights`]' system, avoiding a fresh
+/// allocation per node/target -- mirrors `SkWorkspace` in `simulation.rs`
+/// (AUDIT-2026-07-v2.md §7 Fase 6 item #15: SIS was "a generation behind"
+/// SGS in its own hot loop). Shared by [`crate::sis::simulate_one`]
+/// (reused across every simulated node in a realization) and
+/// [`crate::ik::indicator_kriging`] (reused across a target's cutoffs).
+#[derive(Default)]
+pub(crate) struct IndicatorWorkspace {
+    a: Vec<f64>,
+    b: Vec<f64>,
+    sol: Vec<f64>,
+}
 
 /// Configuration for sequential indicator simulation.
 ///
@@ -56,6 +69,24 @@ pub struct SisConfig {
     /// Upper-tail interpolation between the last cutoff and `tail_max`
     /// (GSLIB `utail`; hyperbolic tails are capped at `tail_max`).
     pub upper_tail: TailModel,
+    /// Optional declustering weights (one positive weight per data point,
+    /// e.g. from [`crate::declustering::cell_declustering_weights`]): the
+    /// global cutoff proportions (the simple-IK means) are computed as
+    /// weighted means instead of plain counts, so preferential sampling
+    /// does not bias the marginal ccdf the same way it would bias an
+    /// unweighted normal-score transform (AUDIT-2026-07-v2.md §7 Fase 6
+    /// item #15 -- SIS previously ignored declustering entirely).
+    pub decluster_weights: Option<Vec<f64>>,
+    /// Separate quota for previously simulated nodes (GSLIB `nodmax`),
+    /// exactly like [`crate::simulation::SgsConfig::max_node_neighbors`]:
+    /// when set, each neighbourhood takes up to `max_neighbors` original
+    /// data **plus** up to this many simulated nodes, instead of one pool
+    /// where dense simulated nodes can crowd the hard data out.
+    pub max_node_neighbors: Option<usize>,
+    /// Multiple-grid simulation levels (GSLIB `nmult`; grid entry points
+    /// only), exactly like [`crate::simulation::SgsConfig::multigrid`]: `0`
+    /// (default) keeps a fully random path.
+    pub multigrid: u8,
 }
 
 impl Default for SisConfig {
@@ -72,6 +103,9 @@ impl Default for SisConfig {
             tail_max: None,
             lower_tail: TailModel::Linear,
             upper_tail: TailModel::Linear,
+            decluster_weights: None,
+            max_node_neighbors: None,
+            multigrid: 0,
         }
     }
 }
@@ -82,17 +116,54 @@ pub fn sequential_indicator_simulation(
     grid: &Grid2D,
     cfg: &SisConfig,
 ) -> Result<SgsResult> {
-    let realizations = sis_at(data, &grid.centers(), cfg)?;
+    let levels = (cfg.multigrid > 0).then(|| {
+        (0..grid.n_cells())
+            .map(|i| crate::simulation::grid_level(&[i % grid.nx, i / grid.nx], cfg.multigrid))
+            .collect::<Vec<u8>>()
+    });
+    let realizations = sis_at_with_levels(data, &grid.centers(), levels.as_deref(), cfg)?;
     Ok(SgsResult {
         grid: grid.clone(),
         realizations,
     })
 }
 
-/// SIS at an arbitrary set of simulation nodes.
+/// Runs conditional sequential indicator simulation on a 3-D grid, returning
+/// the realizations in grid storage order (mirrors
+/// [`crate::simulation::sequential_gaussian_simulation_3d`]).
+pub fn sequential_indicator_simulation_3d(
+    data: &PointSet<3>,
+    grid: &crate::grid::Grid3D,
+    cfg: &SisConfig,
+) -> Result<Vec<Vec<f64>>> {
+    let levels = (cfg.multigrid > 0).then(|| {
+        (0..grid.n_cells())
+            .map(|i| {
+                let ix = i % grid.nx;
+                let iy = (i / grid.nx) % grid.ny;
+                let iz = i / (grid.nx * grid.ny);
+                crate::simulation::grid_level(&[ix, iy, iz], cfg.multigrid)
+            })
+            .collect::<Vec<u8>>()
+    });
+    sis_at_with_levels(data, &grid.centers(), levels.as_deref(), cfg)
+}
+
+/// SIS at an arbitrary set of simulation nodes. `multigrid` is ignored here
+/// (it needs grid topology); use the grid entry points for multiple-grid
+/// simulation.
 pub fn sis_at<const D: usize>(
     data: &PointSet<D>,
     nodes: &[[f64; D]],
+    cfg: &SisConfig,
+) -> Result<Vec<Vec<f64>>> {
+    sis_at_with_levels(data, nodes, None, cfg)
+}
+
+fn sis_at_with_levels<const D: usize>(
+    data: &PointSet<D>,
+    nodes: &[[f64; D]],
+    levels: Option<&[u8]>,
     cfg: &SisConfig,
 ) -> Result<Vec<Vec<f64>>> {
     let nc = cfg.cutoffs.len();
@@ -142,13 +213,45 @@ pub fn sis_at<const D: usize>(
         )));
     }
 
-    // Global proportions: the SK means of the indicators.
-    let n = data.len() as f64;
-    let props: Vec<f64> = cfg
-        .cutoffs
-        .iter()
-        .map(|&c| data.values().iter().filter(|&&v| v <= c).count() as f64 / n)
-        .collect();
+    // Global proportions: the SK means of the indicators, weighted by
+    // `decluster_weights` when given (unweighted counts otherwise) --
+    // AUDIT-2026-07-v2.md §7 Fase 6 item #15.
+    let props: Vec<f64> = match &cfg.decluster_weights {
+        Some(w) => {
+            if w.len() != data.len() {
+                return Err(GeostatError::DimensionMismatch(format!(
+                    "{} declustering weights vs {} data points",
+                    w.len(),
+                    data.len()
+                )));
+            }
+            let wsum: f64 = w.iter().sum();
+            if !(wsum > 0.0) {
+                return Err(GeostatError::InvalidParameter(
+                    "declustering weights must sum to a positive value".into(),
+                ));
+            }
+            cfg.cutoffs
+                .iter()
+                .map(|&c| {
+                    data.values()
+                        .iter()
+                        .zip(w)
+                        .filter(|&(&v, _)| v <= c)
+                        .map(|(_, &wi)| wi)
+                        .sum::<f64>()
+                        / wsum
+                })
+                .collect()
+        }
+        None => {
+            let n = data.len() as f64;
+            cfg.cutoffs
+                .iter()
+                .map(|&c| data.values().iter().filter(|&&v| v <= c).count() as f64 / n)
+                .collect()
+        }
+    };
     for (k, &p) in props.iter().enumerate() {
         if !(p > 0.0 && p < 1.0) {
             return Err(GeostatError::InvalidParameter(format!(
@@ -177,17 +280,50 @@ pub fn sis_at<const D: usize>(
             "no simulation nodes given".into(),
         ));
     }
+
+    // Extents covering data and nodes, shared by both search structures.
+    let (dbmin, dbmax) = data.bbox();
+    let mut min = dbmin;
+    let mut max = dbmax;
+    for c in nodes {
+        for d in 0..D {
+            min[d] = min[d].min(c[d]);
+            max[d] = max[d].max(c[d]);
+        }
+    }
+    // Static store of the original data, built once and shared across
+    // realizations (only simulated nodes change per realization) --
+    // mirrors `sgs_at_with_levels` in `simulation.rs`.
+    let mut data_grid = BucketGrid::new(min, max, data.len());
+    for &p in data.coords() {
+        data_grid.insert(p);
+    }
+
     crate::parallel::par_try_map(cfg.n_realizations, |r| {
         let mut seed_state = cfg.seed ^ (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let seed_r = splitmix64(&mut seed_state);
-        simulate_one(data, nodes, cfg, &props, tail_min, tail_max, seed_r)
+        simulate_one(
+            data,
+            &data_grid,
+            nodes,
+            levels,
+            (min, max),
+            cfg,
+            &props,
+            tail_min,
+            tail_max,
+            seed_r,
+        )
     })
 }
 
 #[allow(clippy::too_many_arguments)]
 fn simulate_one<const D: usize>(
     data: &PointSet<D>,
+    data_grid: &BucketGrid<D>,
     centers: &[[f64; D]],
+    levels: Option<&[u8]>,
+    extents: ([f64; D], [f64; D]),
     cfg: &SisConfig,
     props: &[f64],
     tail_min: f64,
@@ -197,32 +333,70 @@ fn simulate_one<const D: usize>(
     let nc = cfg.cutoffs.len();
     let mut rng = Rng::new(seed);
     let n_cells = centers.len();
+    let n_data = data.len();
 
+    // Random path; with multigrid levels, coarse levels first (stable sort
+    // keeps the shuffle within each level) -- mirrors `simulate_one` in
+    // `simulation.rs`.
     let mut path: Vec<usize> = (0..n_cells).collect();
     rng.shuffle(&mut path);
-
-    let (dbmin, dbmax) = data.bbox();
-    let mut min = dbmin;
-    let mut max = dbmax;
-    for c in centers {
-        for d in 0..D {
-            min[d] = min[d].min(c[d]);
-            max[d] = max[d].max(c[d]);
-        }
+    if let Some(levels) = levels {
+        path.sort_by_key(|&i| std::cmp::Reverse(levels[i]));
     }
-    let mut search = BucketGrid::new(min, max, data.len() + n_cells);
+
+    // Simulated nodes get their own store; the data store is shared.
+    let (min, max) = extents;
+    let mut node_grid = BucketGrid::new(min, max, n_cells);
     let mut cond_coords: Vec<[f64; D]> = data.coords().to_vec();
     let mut cond_vals: Vec<f64> = data.values().to_vec();
-    for &p in data.coords() {
-        search.insert(p);
-    }
+
+    // Quotas: `max_neighbors` original data plus `nodmax` simulated nodes
+    // (GSLIB ndmax/nodmax), exactly like SGS.
+    let nodmax = cfg.max_node_neighbors.unwrap_or(cfg.max_neighbors);
+    let single_pool = cfg.max_node_neighbors.is_none();
 
     let mut sim = vec![0.0_f64; n_cells];
     let mut ccdf = vec![0.0_f64; nc];
+    let mut ws = IndicatorWorkspace::default();
+    let mut nb: Vec<usize> = Vec::new();
+
+    let d2 = |a: [f64; D], b: [f64; D]| -> f64 {
+        let mut s = 0.0;
+        for d in 0..D {
+            let dd = a[d] - b[d];
+            s += dd * dd;
+        }
+        s
+    };
 
     for &cell in &path {
         let target = centers[cell];
-        let nb = search.k_nearest(target, cfg.max_neighbors, cfg.search_radius);
+        let nd = data_grid.k_nearest(target, cfg.max_neighbors, cfg.search_radius);
+        let nn = node_grid.k_nearest(target, nodmax, cfg.search_radius);
+
+        // Merge the two distance-ascending lists (node indices offset by
+        // n_data into the conditioning arrays).
+        nb.clear();
+        let (mut a, mut b) = (0, 0);
+        while a < nd.len() || b < nn.len() {
+            let take_data = match (nd.get(a), nn.get(b)) {
+                (Some(&i), Some(&j)) => {
+                    d2(target, cond_coords[i]) <= d2(target, cond_coords[n_data + j])
+                }
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if take_data {
+                nb.push(nd[a]);
+                a += 1;
+            } else {
+                nb.push(n_data + nn[b]);
+                b += 1;
+            }
+        }
+        if single_pool {
+            nb.truncate(cfg.max_neighbors);
+        }
 
         if nb.is_empty() {
             ccdf.copy_from_slice(props);
@@ -237,6 +411,7 @@ fn simulate_one<const D: usize>(
                 target,
                 cfg.ordinary,
                 &mut ccdf,
+                &mut ws,
             )?;
             order_corrections(&mut ccdf);
         }
@@ -251,7 +426,7 @@ fn simulate_one<const D: usize>(
             rng.uniform(),
         );
         sim[cell] = z;
-        search.insert(target);
+        node_grid.insert(target);
         cond_coords.push(target);
         cond_vals.push(z);
     }
@@ -260,30 +435,37 @@ fn simulate_one<const D: usize>(
 
 /// Indicator-kriging weights for one target's neighbourhood under a single
 /// covariance model — the expensive part (build + factorize + solve an
-/// `n×n`, or `(n+1)×(n+1)` for ordinary, system). Shared across every
-/// cutoff when the *same* model is used for all of them (median IK, GSLIB
-/// `mik=1`): the weights depend only on the spatial covariance structure,
-/// not on which cutoff's indicator data they are dotted with, so one
-/// factorization serves all `nc` cutoffs — an ~nc× saving in the hot loop
-/// this function is called from (see [`indicator_ccdf`]).
+/// `n×n`, or `(n+1)×(n+1)` for ordinary, system) — written into `ws.sol`
+/// (`nb.len()` entries for simple, one more for ordinary's Lagrange
+/// multiplier) instead of returning a freshly allocated `Vec`, and reusing
+/// `ws`'s buffers instead of allocating a new `Array2` every call
+/// (AUDIT-2026-07-v2.md §7 Fase 6 item #15, mirroring `SkWorkspace` in
+/// `simulation.rs`). Shared across every cutoff when the *same* model is
+/// used for all of them (median IK, GSLIB `mik=1`): the weights depend only
+/// on the spatial covariance structure, not on which cutoff's indicator
+/// data they are dotted with, so one factorization serves all `nc` cutoffs
+/// — an ~nc× saving in the hot loop this function is called from (see
+/// [`indicator_ccdf`]).
 ///
-/// `ordinary` adds the `Σw=1` (Lagrange) row/column — ordinary indicator
-/// kriging instead of simple IK with the global proportion as the known
-/// mean. The returned vector has `nb.len()` entries for simple, one more
-/// (the Lagrange multiplier) for ordinary.
+/// Simple IK's system is SPD (solved by in-place Cholesky, no allocation);
+/// `ordinary` adds the `Σw=1` (Lagrange) row/column, making it indefinite,
+/// so that case still goes through the general (allocating) LU `solve`.
 fn indicator_weights<const D: usize>(
     coords: &[[f64; D]],
     nb: &[usize],
     model: &VariogramModel,
     target: [f64; D],
     ordinary: bool,
-) -> Result<Vec<f64>> {
+    ws: &mut IndicatorWorkspace,
+) -> Result<()> {
     let n = nb.len();
     let c0 = model.covariance_dh([0.0; D]);
     let stabilizer = c0 * 1e-9;
     let dim = if ordinary { n + 1 } else { n };
-    let mut a = Array2::<f64>::zeros((dim, dim));
-    let mut b = vec![0.0; dim];
+    ws.a.clear();
+    ws.a.resize(dim * dim, 0.0);
+    ws.b.clear();
+    ws.b.resize(dim, 0.0);
     let sep = |a: [f64; D], b: [f64; D]| {
         let mut dh = [0.0; D];
         for d in 0..D {
@@ -293,22 +475,36 @@ fn indicator_weights<const D: usize>(
     };
     for (ii, &i) in nb.iter().enumerate() {
         let pi = coords[i];
-        a[[ii, ii]] = c0 + stabilizer;
+        ws.a[ii * dim + ii] = c0 + stabilizer;
         for (jj, &j) in nb.iter().enumerate().skip(ii + 1) {
             let c = c0 - model.gamma_dh(sep(pi, coords[j]));
-            a[[ii, jj]] = c;
-            a[[jj, ii]] = c;
+            ws.a[ii * dim + jj] = c;
+            ws.a[jj * dim + ii] = c;
         }
-        b[ii] = c0 - model.gamma_dh(sep(pi, target));
+        ws.b[ii] = c0 - model.gamma_dh(sep(pi, target));
         if ordinary {
-            a[[ii, n]] = 1.0;
-            a[[n, ii]] = 1.0;
+            ws.a[ii * dim + n] = 1.0;
+            ws.a[n * dim + ii] = 1.0;
         }
     }
     if ordinary {
-        b[n] = 1.0;
+        ws.b[n] = 1.0;
     }
-    solve(a, b)
+    if ordinary {
+        // Indefinite (Lagrange row): needs a pivoted solve, not Cholesky.
+        let mut a = Array2::<f64>::zeros((dim, dim));
+        for r in 0..dim {
+            for c in 0..dim {
+                a[[r, c]] = ws.a[r * dim + c];
+            }
+        }
+        ws.sol = solve(a, ws.b.clone())?;
+    } else {
+        ws.sol.clear();
+        ws.sol.extend_from_slice(&ws.b);
+        cholesky_solve_in_place(&mut ws.a, dim, &mut ws.sol)?;
+    }
+    Ok(())
 }
 
 /// Indicator/ccdf estimate at one cutoff from precomputed weights (see
@@ -346,7 +542,8 @@ fn indicator_estimate(
 /// cutoff (`models.len() == cutoffs.len()`, full IK) otherwise. `ordinary`
 /// selects ordinary vs simple indicator kriging (see [`indicator_weights`]).
 /// This is the single entry point [`crate::sis::simulate_one`] and
-/// [`crate::ik::indicator_kriging`] both call.
+/// [`crate::ik::indicator_kriging`] both call. `ws` is caller-provided so
+/// its buffers can be reused across many targets/nodes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn indicator_ccdf<const D: usize>(
     coords: &[[f64; D]],
@@ -358,16 +555,17 @@ pub(crate) fn indicator_ccdf<const D: usize>(
     target: [f64; D],
     ordinary: bool,
     ccdf: &mut [f64],
+    ws: &mut IndicatorWorkspace,
 ) -> Result<()> {
     if models.len() == 1 {
-        let w = indicator_weights(coords, nb, &models[0], target, ordinary)?;
+        indicator_weights(coords, nb, &models[0], target, ordinary, ws)?;
         for k in 0..cutoffs.len() {
-            ccdf[k] = indicator_estimate(&w, nb, vals, cutoffs[k], props[k], ordinary);
+            ccdf[k] = indicator_estimate(&ws.sol, nb, vals, cutoffs[k], props[k], ordinary);
         }
     } else {
         for k in 0..cutoffs.len() {
-            let w = indicator_weights(coords, nb, &models[k], target, ordinary)?;
-            ccdf[k] = indicator_estimate(&w, nb, vals, cutoffs[k], props[k], ordinary);
+            indicator_weights(coords, nb, &models[k], target, ordinary, ws)?;
+            ccdf[k] = indicator_estimate(&ws.sol, nb, vals, cutoffs[k], props[k], ordinary);
         }
     }
     Ok(())
@@ -706,6 +904,114 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn multigrid_and_node_quota_run_reproducibly() {
+        // Mirrors `multigrid_and_node_quota_run_reproducibly` in
+        // `simulation.rs` (AUDIT-2026-07-v2.md §7 Fase 6 item #15: SIS
+        // lacked both features entirely before this).
+        let (data, base, grid) = setup();
+        let plain = sequential_indicator_simulation(&data, &grid, &base).unwrap();
+
+        let mut mg_cfg = base.clone();
+        mg_cfg.multigrid = 2;
+        let mg1 = sequential_indicator_simulation(&data, &grid, &mg_cfg).unwrap();
+        let mg2 = sequential_indicator_simulation(&data, &grid, &mg_cfg).unwrap();
+        assert_eq!(mg1.realizations, mg2.realizations);
+        assert_ne!(mg1.realizations, plain.realizations);
+
+        let mut quota_cfg = base.clone();
+        quota_cfg.max_node_neighbors = Some(6);
+        let q1 = sequential_indicator_simulation(&data, &grid, &quota_cfg).unwrap();
+        let q2 = sequential_indicator_simulation(&data, &grid, &quota_cfg).unwrap();
+        assert_eq!(q1.realizations, q2.realizations);
+        assert_ne!(q1.realizations, plain.realizations);
+
+        let (lo, hi) = data
+            .values()
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), &v| {
+                (l.min(v), h.max(v))
+            });
+        for r in mg1.realizations.iter().chain(&q1.realizations) {
+            for &v in r {
+                assert!(v >= lo - 1e-9 && v <= hi + 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn decluster_weights_shift_the_global_proportions() {
+        // AUDIT-2026-07-v2.md §7 Fase 6 item #15: SIS previously computed
+        // its global cutoff proportions (the simple-IK known mean) as plain
+        // counts, ignoring `decluster_weights` entirely. A tight cluster of
+        // 9 zero-value points plus one isolated value-10 point: unweighted,
+        // 9/10 of the mass sits at 0 (proportion 0.9 for cutoff 5.0);
+        // weighting the cluster down to a combined weight of 1 (matching
+        // the lone point) should pull the proportion to 0.5.
+        //
+        // The target sits far outside `search_radius`, so `sis_at` falls
+        // back to `ccdf[0] = props[0]` exactly (the "no neighbours" branch)
+        // and `sample_ccdf` draws from the lower/upper tail with
+        // probability `props[0]`/`1 - props[0]` -- so the *ensemble*
+        // fraction of realizations landing at or below the cutoff
+        // converges to `props[0]` (the standard inverse-CDF sampling
+        // argument), letting a black-box simulation test the internal,
+        // otherwise-private proportion computation.
+        let mut coords = Vec::new();
+        let mut values = Vec::new();
+        for i in 0..9 {
+            coords.push([(i % 3) as f64 * 0.1, (i / 3) as f64 * 0.1]);
+            values.push(0.0);
+        }
+        coords.push([50.0, 50.0]);
+        values.push(10.0);
+        let data = PointSet::new(coords, values).unwrap();
+        let model = VariogramModel::new(
+            0.02,
+            vec![Structure::new(ModelKind::Exponential, 0.2, 30.0)],
+        )
+        .unwrap();
+        let far_target = [1.0e6, 1.0e6];
+        let base_cfg = SisConfig {
+            cutoffs: vec![5.0],
+            models: vec![model],
+            n_realizations: 400,
+            search_radius: Some(1.0),
+            ..Default::default()
+        };
+
+        let unweighted = sis_at(&data, &[far_target], &base_cfg).unwrap();
+        let below_unweighted =
+            unweighted.iter().filter(|r| r[0] <= 5.0).count() as f64 / unweighted.len() as f64;
+        assert!(
+            (below_unweighted - 0.9).abs() < 0.08,
+            "unweighted ensemble proportion {below_unweighted}"
+        );
+
+        let mut weighted_cfg = base_cfg;
+        weighted_cfg.decluster_weights = Some(
+            std::iter::repeat_n(1.0 / 9.0, 9)
+                .chain(std::iter::once(1.0))
+                .collect(),
+        );
+        let weighted = sis_at(&data, &[far_target], &weighted_cfg).unwrap();
+        let below_weighted =
+            weighted.iter().filter(|r| r[0] <= 5.0).count() as f64 / weighted.len() as f64;
+        assert!(
+            (below_weighted - 0.5).abs() < 0.08,
+            "weighted ensemble proportion {below_weighted}"
+        );
+    }
+
+    #[test]
+    fn decluster_weights_validate_length_and_positivity() {
+        let (data, mut cfg, _grid) = setup();
+        cfg.decluster_weights = Some(vec![1.0; data.len() - 1]); // wrong length
+        assert!(sis_at(&data, &[[50.0, 50.0]], &cfg).is_err());
+        cfg.decluster_weights = Some(vec![0.0; data.len()]); // sums to zero
+        assert!(sis_at(&data, &[[50.0, 50.0]], &cfg).is_err());
     }
 
     #[test]

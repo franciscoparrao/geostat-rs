@@ -129,7 +129,8 @@ pub fn sequential_gaussian_simulation_3d(
 
 /// Multigrid level of a grid cell: the largest `g <= max_level` such that
 /// every index is a multiple of `2^g` (coarser sub-grids get higher levels).
-fn grid_level(idx: &[usize], max_level: u8) -> u8 {
+/// `pub(crate)`: shared with [`crate::sis`]'s multigrid path.
+pub(crate) fn grid_level(idx: &[usize], max_level: u8) -> u8 {
     (0..=max_level)
         .rev()
         .find(|&g| idx.iter().all(|&i| i % (1usize << g) == 0))

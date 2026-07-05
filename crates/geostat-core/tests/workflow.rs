@@ -44,10 +44,10 @@ fn full_workflow_on_synthetic_field() {
 
     // 3. Kriging onto a grid: finite values, non-negative variances.
     // A 32-point neighborhood keeps the test fast and mirrors real usage.
-    let krig_cfg = KrigingConfig {
-        max_neighbors: Some(32),
-        ..Default::default()
-    };
+    // `KrigingConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields.
+    let mut krig_cfg = KrigingConfig::default();
+    krig_cfg.max_neighbors = Some(32);
     let kriging = Kriging::new(&data, model, krig_cfg.clone()).unwrap();
     let grid = Grid2D::from_bbox([0.0, 0.0], [200.0, 200.0], 25, 25).unwrap();
     let (values, variances) = kriging.predict_grid(&grid);

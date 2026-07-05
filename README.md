@@ -51,8 +51,11 @@ Not yet published to crates.io/PyPI — build from source (see below).
   **regression kriging** (a trend fitted separately — built-in OLS or any
   external/ML model — plus kriging of its residuals); per-datum
   **measurement error** (gstat `Err`); octant search (GSLIB `noct`) and
-  `min_neighbors` (`ndmin`); kd-tree moving neighborhoods; parallel over
-  targets; variance maps.
+  `min_neighbors` (`ndmin`); **anisotropic (rotated-ellipsoid) search**
+  (GSLIB `kt3d` `sang`/`sanis`, `--search-azimuth`/`--search-ratio` in the
+  CLI, `search_azimuth=`/`search_ratio=` in Python) instead of the
+  gstat/GSLIB-default Euclidean neighborhood; kd-tree moving neighborhoods;
+  parallel over targets; variance maps.
 - **Vecchia approximation** — for point sets too large for exact kriging:
   O(n log n) maxmin ordering, likelihood-based maximum-likelihood/REML
   fitting (including external-drift REML and joint Matérn-`ν` MLE),

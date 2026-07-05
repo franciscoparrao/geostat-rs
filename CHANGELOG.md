@@ -4,6 +4,44 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 before 0.7.0 predate this file and are reconstructed from commit history.
 
+## [Unreleased]
+
+Fase 6 operational-gap closing (`docs/AUDIT-2026-07-v2.md` §7).
+
+### Added
+- Anisotropic (rotated-ellipsoid) search neighborhoods for kriging (GSLIB
+  `kt3d` `sang1/sang2/sang3/sanis1/sanis2`): `KrigingConfig::anisotropic_search`,
+  CLI `--search-azimuth/--search-ratio/--search-ratio-z/--search-dip/--search-rake`,
+  Python `krige`/`krige_grid` `search_azimuth=`/etc. Octant classification
+  follows the rotated frame when set.
+- SIS brought to parity with SGS: reusable Cholesky workspace for simple
+  indicator kriging (was a fresh `Array2` allocation + LU solve per
+  node/cutoff even though the simple-IK system is SPD), separate
+  data/simulated-node neighbor quotas (`max_node_neighbors`, GSLIB
+  `nodmax`), a multiple-grid path (`multigrid`, GSLIB `nmult`),
+  declustering-weighted global cutoff proportions (`decluster_weights`,
+  previously ignored entirely), and a 3-D grid entry point
+  (`sequential_indicator_simulation_3d`, previously SGS-only). Exposed in
+  the CLI (`sis --declus/--nodmax/--multigrid`) and Python (`sis(...)`
+  gains `decluster_cell=`/`max_node_neighbors=`/`multigrid=`).
+- Robust/alternative point-pair variogram estimators (`EstimatorKind`:
+  Cressie-Hawkins, Dowd, madogram, alongside the existing Matheron
+  default) via `experimental_variogram_robust`, CLI `variogram --estimator`
+  and Python `experimental_variogram(estimator=...)` — the classical
+  mean-squared-difference estimator lets a single outlier pair dominate a
+  lag bin; Dowd's median-based estimator is immune to it entirely. Also:
+  the variogram cloud (`variogram_cloud`, one unbinned point per pair, for
+  tracing an outlier bin back to its locations), an ergodic correlogram
+  derived from an experimental variogram (`correlogram`), and a
+  `coincident_pairs` count on `ExperimentalVariogram` (previously silently
+  dropped). Non-ergodic (per-lag head/tail) correlograms and relative
+  variograms are explicitly out of scope for this pass — see
+  `docs/AUDIT-2026-07-v2.md` §4.
+
+### Changed
+- `KrigingConfig` is now `#[non_exhaustive]` (was already the case for
+  `SgsConfig`/`SisConfig`/etc.).
+
 ## [0.7.0] — 2026-07-04
 
 Audit-driven hardening pass (`docs/AUDIT-2026-07.md`, `docs/AUDIT-2026-07-v2.md`)

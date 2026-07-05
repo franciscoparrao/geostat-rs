@@ -4,8 +4,8 @@
 use geostat_core::{
     CollocatedCokriging, CollocatedConfig, Grid3D, IkConfig, Kriging, KrigingConfig, KrigingMethod,
     MarkovModel, ModelKind, PointSet, Rng, SgsConfig, SisConfig, Structure, VariogramConfig,
-    VariogramModel, experimental_variogram, fit_best, indicator_kriging, leave_one_out, sgs_at,
-    sis_at, vecchia_loglik, vecchia_predict,
+    VariogramModel, experimental_variogram, fit_best, indicator_kriging, leave_one_out,
+    sequential_indicator_simulation_3d, sgs_at, sis_at, vecchia_loglik, vecchia_predict,
 };
 
 fn synthetic_3d(n: usize, seed: u64) -> PointSet<3> {
@@ -59,15 +59,11 @@ fn kriging_3d_exact_and_consistent() {
     let far = k.predict([1e5, 1e5, 1e5]).unwrap();
     assert!(far.variance >= 0.99 * model.total_sill());
     // kd-tree neighborhood at k = n matches global.
-    let local: Kriging<'_, 3> = Kriging::new(
-        &data,
-        &model,
-        KrigingConfig {
-            max_neighbors: Some(data.len()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    // `KrigingConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields.
+    let mut local_cfg = KrigingConfig::default();
+    local_cfg.max_neighbors = Some(data.len());
+    let local: Kriging<'_, 3> = Kriging::new(&data, &model, local_cfg).unwrap();
     for t in [[50.0, 50.0, 20.0], [10.0, 80.0, 5.0]] {
         let a = k.predict(t).unwrap();
         let b = local.predict(t).unwrap();
@@ -96,15 +92,11 @@ fn universal_kriging_3d_reproduces_drift() {
         vec![Structure::new(ModelKind::Exponential, 1.0, 30.0)],
     )
     .unwrap();
-    let k: Kriging<'_, 3> = Kriging::new(
-        &data,
-        &model,
-        KrigingConfig {
-            method: KrigingMethod::Universal { degree: 1 },
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    // `KrigingConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields.
+    let mut universal_cfg = KrigingConfig::default();
+    universal_cfg.method = KrigingMethod::Universal { degree: 1 };
+    let k: Kriging<'_, 3> = Kriging::new(&data, &model, universal_cfg).unwrap();
     let t = [15.0, 25.0, 7.5];
     let expected = 1.0 + 0.2 * t[0] - 0.1 * t[1] + 0.5 * t[2];
     let est = k.predict(t).unwrap();
@@ -171,6 +163,55 @@ fn sgs_3d_reproducible_and_bounded() {
             assert!(v >= lo - 1e-9 && v <= hi + 1e-9);
         }
     }
+}
+
+#[test]
+fn sis_3d_grid_reproducible_bounded_and_multigrid_runs() {
+    // `sequential_indicator_simulation_3d` (AUDIT-2026-07-v2.md §7 Fase 6
+    // item #15): SIS previously had no 3-D grid entry point at all, unlike
+    // SGS's `sequential_gaussian_simulation_3d`.
+    let data = synthetic_3d(80, 7);
+    let mut sorted = data.values().to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let median = sorted[sorted.len() / 2];
+    let model = VariogramModel::new(
+        0.02,
+        vec![Structure::new(ModelKind::Exponential, 0.2, 30.0)],
+    )
+    .unwrap();
+    let grid = Grid3D::from_bbox([0.0, 0.0, 0.0], [100.0, 100.0, 40.0], 6, 6, 3).unwrap();
+
+    let mut cfg = SisConfig::default();
+    cfg.cutoffs = vec![median];
+    cfg.models = vec![model];
+    cfg.n_realizations = 2;
+    cfg.seed = 5;
+    cfg.max_neighbors = 12;
+
+    let a = sequential_indicator_simulation_3d(&data, &grid, &cfg).unwrap();
+    let b = sequential_indicator_simulation_3d(&data, &grid, &cfg).unwrap();
+    assert_eq!(a, b);
+    assert_eq!(a.len(), 2);
+    assert_eq!(a[0].len(), grid.n_cells());
+    let (lo, hi) = data
+        .values()
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), &v| {
+            (l.min(v), h.max(v))
+        });
+    for r in &a {
+        for &v in r {
+            assert!(v >= lo - 1e-9 && v <= hi + 1e-9);
+        }
+    }
+
+    // Multigrid path on the same 3-D grid: reproducible and distinct.
+    let mut mg_cfg = cfg;
+    mg_cfg.multigrid = 1;
+    let mg1 = sequential_indicator_simulation_3d(&data, &grid, &mg_cfg).unwrap();
+    let mg2 = sequential_indicator_simulation_3d(&data, &grid, &mg_cfg).unwrap();
+    assert_eq!(mg1, mg2);
+    assert_ne!(mg1, a);
 }
 
 #[test]

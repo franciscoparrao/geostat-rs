@@ -175,6 +175,7 @@ pub fn indicator_kriging<const D: usize>(
         if nb.is_empty() {
             ccdf.copy_from_slice(&props);
         } else {
+            let mut ws = crate::sis::IndicatorWorkspace::default();
             indicator_ccdf(
                 data.coords(),
                 data.values(),
@@ -185,6 +186,7 @@ pub fn indicator_kriging<const D: usize>(
                 target,
                 cfg.ordinary,
                 &mut ccdf,
+                &mut ws,
             )?;
             order_corrections(&mut ccdf);
         }

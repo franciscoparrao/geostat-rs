@@ -644,7 +644,11 @@ mod tests {
                 }
             })
             .collect();
-        ExperimentalVariogram { bins, max_dist }
+        ExperimentalVariogram {
+            bins,
+            max_dist,
+            coincident_pairs: 0,
+        }
     }
 
     #[test]

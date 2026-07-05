@@ -957,6 +957,7 @@ mod tests {
             ExperimentalVariogram {
                 bins,
                 max_dist: cfg.max_dist,
+                coincident_pairs: 0,
             }
         };
         let template =
@@ -990,6 +991,7 @@ mod tests {
             ExperimentalVariogram {
                 bins,
                 max_dist: 24.0,
+                coincident_pairs: 0,
             }
         };
         let template =
@@ -1026,6 +1028,7 @@ mod tests {
             ExperimentalVariogram {
                 bins,
                 max_dist: 24.0,
+                coincident_pairs: 0,
             }
         };
         let template = VariogramModel::new(
@@ -1073,6 +1076,7 @@ mod tests {
             ExperimentalVariogram {
                 bins,
                 max_dist: 24.0,
+                coincident_pairs: 0,
             }
         };
         let template =

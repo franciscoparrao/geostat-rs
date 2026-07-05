@@ -89,10 +89,10 @@ pub fn krige_grid(
     let parsed: VariogramModel = serde_json::from_str(model_json).map_err(err)?;
     let model = VariogramModel::new(parsed.nugget, parsed.structures).map_err(err)?;
     let grid = Grid2D::from_bbox([xmin, ymin], [xmax, ymax], nx, ny).map_err(err)?;
-    let config = KrigingConfig {
-        max_neighbors: (max_neighbors > 0).then_some(max_neighbors),
-        ..Default::default()
-    };
+    // `KrigingConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields.
+    let mut config = KrigingConfig::default();
+    config.max_neighbors = (max_neighbors > 0).then_some(max_neighbors);
     let kriging = Kriging::new(&data, &model, config).map_err(err)?;
     let (mut preds, vars) = kriging.predict_grid(&grid);
     preds.extend(vars);

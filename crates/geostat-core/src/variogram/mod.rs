@@ -9,7 +9,8 @@ mod model;
 
 pub use cross::experimental_cross_variogram;
 pub use experimental::{
-    DirectionConfig, ExperimentalVariogram, LagBin, VariogramConfig, experimental_variogram,
+    CloudPair, DirectionConfig, EstimatorKind, ExperimentalVariogram, LagBin, VariogramConfig,
+    correlogram, experimental_variogram, experimental_variogram_robust, variogram_cloud,
 };
 pub use fit::{
     FitResult, FitWeights, fit_anisotropic, fit_best, fit_indicator_models, fit_matern,

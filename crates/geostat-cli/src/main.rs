@@ -7,13 +7,14 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use geostat_core::{
-    CoKriging, CoKrigingConfig, DirectionConfig, Grid2D, IkConfig, Kriging, KrigingConfig,
-    KrigingMethod, ModelKind, PointSet, SgsConfig, SisConfig, Tails, VariogramConfig,
-    VariogramModel, block_cv, cell_declustering_weights, decluster_scan, default_lag_width,
-    detrend_external, detrend_polynomial, experimental_variogram, fit_anisotropic, fit_best,
-    fit_indicator_models, fit_lmc_collocated, fit_median_indicator_model, indicator_kriging,
-    k_fold, leave_one_out, leave_one_out_with_drift, sequential_gaussian_simulation,
-    sequential_indicator_simulation, variogram_map, vecchia_mle, vecchia_predict, vecchia_reml,
+    Anisotropy, CoKriging, CoKrigingConfig, DirectionConfig, EstimatorKind, Grid2D, IkConfig,
+    Kriging, KrigingConfig, KrigingMethod, ModelKind, PointSet, SgsConfig, SisConfig, Tails,
+    VariogramConfig, VariogramModel, block_cv, cell_declustering_weights, decluster_scan,
+    default_lag_width, detrend_external, detrend_polynomial, experimental_variogram,
+    experimental_variogram_robust, fit_anisotropic, fit_best, fit_indicator_models,
+    fit_lmc_collocated, fit_median_indicator_model, indicator_kriging, k_fold, leave_one_out,
+    leave_one_out_with_drift, sequential_gaussian_simulation, sequential_indicator_simulation,
+    variogram_map, vecchia_mle, vecchia_predict, vecchia_reml,
 };
 
 #[derive(Parser)]
@@ -205,7 +206,9 @@ struct NeighborOpts {
     /// Maximum number of nearest neighbors per estimate (default: all points)
     #[arg(long)]
     max_neighbors: Option<usize>,
-    /// Search radius for conditioning points
+    /// Search radius for conditioning points. With --search-azimuth, this is
+    /// the major-axis radius of a rotated search ellipsoid instead of a
+    /// plain Euclidean radius (GSLIB kt3d radius_hmax)
     #[arg(long)]
     radius: Option<f64>,
     /// Minimum conditioning points per estimate (GSLIB ndmin): estimates
@@ -213,9 +216,52 @@ struct NeighborOpts {
     #[arg(long)]
     min_neighbors: Option<usize>,
     /// Maximum conditioning points per octant/quadrant around the target
-    /// (GSLIB noct): balances the neighborhood for clustered data
+    /// (GSLIB noct): balances the neighborhood for clustered data. Sectors
+    /// follow --search-azimuth's rotated frame when set
     #[arg(long)]
     octant: Option<usize>,
+    /// Search a rotated ellipsoid instead of a Euclidean neighborhood
+    /// (GSLIB kt3d sang1): degrees clockwise from north. Requires --radius
+    /// (the major-axis radius); --search-ratio/--search-ratio-z/
+    /// --search-dip/--search-rake shape the ellipsoid the same way they
+    /// shape an anisotropic variogram
+    #[arg(long)]
+    search_azimuth: Option<f64>,
+    /// Minor/major search-ellipsoid radius ratio (GSLIB sanis1), in (0, 1]
+    #[arg(long, default_value_t = 1.0)]
+    search_ratio: f64,
+    /// Vertical/major search-ellipsoid radius ratio, 3-D only (GSLIB sanis2)
+    #[arg(long, default_value_t = 1.0)]
+    search_ratio_z: f64,
+    /// Search-ellipsoid dip, 3-D only (GSLIB sang2); see the model's
+    /// `Anisotropy::dip_deg` for the sign convention
+    #[arg(long, default_value_t = 0.0)]
+    search_dip: f64,
+    /// Search-ellipsoid rake, 3-D only (GSLIB sang3)
+    #[arg(long, default_value_t = 0.0)]
+    search_rake: f64,
+}
+
+impl NeighborOpts {
+    /// Builds a full `KrigingConfig` for `method` from these options.
+    /// `KrigingConfig` is `#[non_exhaustive]`: build from
+    /// `Default::default()` and assign fields.
+    fn config(&self, method: KrigingMethod) -> KrigingConfig {
+        let mut cfg = KrigingConfig::default();
+        cfg.method = method;
+        cfg.max_neighbors = self.max_neighbors;
+        cfg.search_radius = self.radius;
+        cfg.min_neighbors = self.min_neighbors;
+        cfg.max_per_octant = self.octant;
+        cfg.anisotropic_search = self.search_azimuth.map(|azimuth_deg| Anisotropy {
+            azimuth_deg,
+            ratio: self.search_ratio,
+            ratio_z: self.search_ratio_z,
+            dip_deg: self.search_dip,
+            rake_deg: self.search_rake,
+        });
+        cfg
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -294,12 +340,30 @@ struct VariogramCmd {
     /// kriging with an external drift
     #[arg(long, value_name = "COLS")]
     detrend_cols: Option<String>,
+    /// Point-pair estimator: matheron (default, mean-squared-difference),
+    /// cressie-hawkins/ch, dowd, or madogram (GSLIB `gamv`/gstat estimator
+    /// family) — the latter three trade some efficiency under Gaussian
+    /// differences for resistance to a few outlier pairs
+    #[arg(long, default_value = "matheron")]
+    estimator: String,
     /// Write experimental variogram bins to a CSV file
     #[arg(short, long)]
     output: Option<PathBuf>,
     /// Write the fitted model to a JSON file
     #[arg(long)]
     model_out: Option<PathBuf>,
+}
+
+fn parse_estimator(s: &str) -> Result<EstimatorKind> {
+    match s.trim().to_lowercase().as_str() {
+        "matheron" => Ok(EstimatorKind::Matheron),
+        "cressie-hawkins" | "cressie_hawkins" | "ch" => Ok(EstimatorKind::CressieHawkins),
+        "dowd" => Ok(EstimatorKind::Dowd),
+        "madogram" => Ok(EstimatorKind::Madogram),
+        other => bail!(
+            "unknown estimator '{other}' (expected matheron, cressie-hawkins, dowd or madogram)"
+        ),
+    }
 }
 
 #[derive(Args)]
@@ -577,6 +641,21 @@ struct SisCmd {
     /// proportion as the known mean)
     #[arg(long)]
     ordinary: bool,
+    /// Cell-declustering cell size: compute the global cutoff proportions
+    /// as declustering-weighted means instead of plain counts (see the
+    /// `declus` subcommand to choose a size)
+    #[arg(long)]
+    declus: Option<f64>,
+    /// Separate quota for previously simulated nodes (GSLIB nodmax): each
+    /// neighborhood takes up to --max-neighbors data plus this many nodes,
+    /// so simulated nodes cannot crowd out the hard data
+    #[arg(long)]
+    nodmax: Option<usize>,
+    /// Multiple-grid simulation levels (GSLIB nmult): coarsest sub-grid
+    /// (stride 2^levels) first, then refinements; improves long-range
+    /// variogram reproduction on dense grids
+    #[arg(long, default_value_t = 0)]
+    multigrid: u8,
     /// Output CSV file (x,y,sim1..simN)
     #[arg(short, long)]
     output: PathBuf,
@@ -947,13 +1026,7 @@ fn run_compare(cmd: CompareCmd) -> Result<()> {
     let ev = experimental_variogram(&data, &cfg)?;
     let model = fit_best(&ev, &ModelKind::ALL)?.model;
     println!("  fitted variogram (for OK): {model}");
-    let ok_config = KrigingConfig {
-        method: KrigingMethod::Ordinary,
-        max_neighbors: cmd.neighbors.max_neighbors,
-        search_radius: cmd.neighbors.radius,
-        min_neighbors: cmd.neighbors.min_neighbors,
-        max_per_octant: cmd.neighbors.octant,
-    };
+    let ok_config = cmd.neighbors.config(KrigingMethod::Ordinary);
 
     let mn = cmd.neighbors.max_neighbors;
     let rad = cmd.neighbors.radius;
@@ -1054,13 +1127,7 @@ fn run_rk(cmd: RkCmd) -> Result<()> {
         &covar_cols,
     )?;
     let trend_at_targets: Vec<f64> = target_covars.iter().map(|c| trend.predict(c)).collect();
-    let config = KrigingConfig {
-        method: KrigingMethod::Ordinary,
-        max_neighbors: cmd.neighbors.max_neighbors,
-        search_radius: cmd.neighbors.radius,
-        min_neighbors: cmd.neighbors.min_neighbors,
-        max_per_octant: cmd.neighbors.octant,
-    };
+    let config = cmd.neighbors.config(KrigingMethod::Ordinary);
     let ests = rk.predict(&coords, &trend_at_targets, &resid_model, &config)?;
     let n_nan = ests.iter().filter(|e| e.value.is_nan()).count();
     println!(
@@ -1235,9 +1302,13 @@ fn anisotropic_report(data: &PointSet<2>, cmd: &VariogramCmd) -> Result<()> {
 
 fn variogram_report<const D: usize>(data: &PointSet<D>, cmd: &VariogramCmd) -> Result<()> {
     let cfg = cmd.vario.config(data);
-    let ev = experimental_variogram(data, &cfg)?;
+    let estimator = parse_estimator(&cmd.estimator)?;
+    let ev = experimental_variogram_robust(data, &cfg, estimator)?;
 
     println!("\nExperimental variogram (max_dist = {:.2}):", cfg.max_dist);
+    if estimator != EstimatorKind::Matheron {
+        println!("Estimator: {}", cmd.estimator);
+    }
     println!("{:>4} {:>12} {:>12} {:>8}", "lag", "h", "gamma", "pairs");
     for (i, b) in ev.bins.iter().enumerate() {
         let gamma = if b.n_pairs > 0 {
@@ -1246,6 +1317,13 @@ fn variogram_report<const D: usize>(data: &PointSet<D>, cmd: &VariogramCmd) -> R
             "NA".to_string()
         };
         println!("{:>4} {:>12.2} {:>12} {:>8}", i + 1, b.h, gamma, b.n_pairs);
+    }
+    if ev.coincident_pairs > 0 {
+        println!(
+            "Note: {} coincident (zero-distance) pair(s) dropped from all bins -- check for \
+             duplicate locations",
+            ev.coincident_pairs
+        );
     }
 
     if cmd.mle {
@@ -1316,13 +1394,7 @@ fn run_krige(cmd: KrigeCmd) -> Result<()> {
             .context("3-D kriging requires --targets (CSV with x, y, z)")?;
         let data = cmd.input.read3()?;
         println!("Loaded {} 3-D points; model: {model}", data.len());
-        let config = KrigingConfig {
-            method: cmd.method.build(&data),
-            max_neighbors: cmd.neighbors.max_neighbors,
-            search_radius: cmd.neighbors.radius,
-            min_neighbors: cmd.neighbors.min_neighbors,
-            max_per_octant: cmd.neighbors.octant,
-        };
+        let config = cmd.neighbors.config(cmd.method.build(&data));
         let kriging: Kriging<'_, 3> = Kriging::new(&data, &model, config)?;
         let targets =
             io_utils::read_targets3(targets_path, &cmd.input.x_col, &cmd.input.y_col, z_col)?;
@@ -1350,15 +1422,9 @@ fn run_krige(cmd: KrigeCmd) -> Result<()> {
             data.len(),
             drift_cols.join(", ")
         );
-        let config = KrigingConfig {
-            method: KrigingMethod::ExternalDrift {
-                n_vars: drift_cols.len(),
-            },
-            max_neighbors: cmd.neighbors.max_neighbors,
-            search_radius: cmd.neighbors.radius,
-            min_neighbors: cmd.neighbors.min_neighbors,
-            max_per_octant: cmd.neighbors.octant,
-        };
+        let config = cmd.neighbors.config(KrigingMethod::ExternalDrift {
+            n_vars: drift_cols.len(),
+        });
         let kriging = Kriging::with_external_drift(&data, &model, config, drift_data)?;
         let (coords, target_drift) = io_utils::read_targets(
             targets_path,
@@ -1390,13 +1456,7 @@ fn run_krige(cmd: KrigeCmd) -> Result<()> {
     println!("Loaded {} points; model: {model}", data.len());
 
     let grid = cmd.grid.build(&data)?;
-    let config = KrigingConfig {
-        method: cmd.method.build(&data),
-        max_neighbors: cmd.neighbors.max_neighbors,
-        search_radius: cmd.neighbors.radius,
-        min_neighbors: cmd.neighbors.min_neighbors,
-        max_per_octant: cmd.neighbors.octant,
-    };
+    let config = cmd.neighbors.config(cmd.method.build(&data));
 
     if cmd.lognormal {
         if cmd.block.is_some() || cmd.drift_cols.is_some() {
@@ -1652,13 +1712,7 @@ fn run_cv(cmd: CvCmd) -> Result<()> {
         }
         let data = cmd.input.read3()?;
         println!("Loaded {} 3-D points; model: {model}", data.len());
-        let config = KrigingConfig {
-            method: cmd.method.build(&data),
-            max_neighbors: cmd.neighbors.max_neighbors,
-            search_radius: cmd.neighbors.radius,
-            min_neighbors: cmd.neighbors.min_neighbors,
-            max_per_octant: cmd.neighbors.octant,
-        };
+        let config = cmd.neighbors.config(cmd.method.build(&data));
         let (cv, method_label) = match cmd.folds {
             Some(k) => (
                 k_fold(&data, &model, &config, k, cmd.seed)?,
@@ -1696,27 +1750,15 @@ fn run_cv(cmd: CvCmd) -> Result<()> {
             data.len(),
             drift_cols.join(", ")
         );
-        let config = KrigingConfig {
-            method: KrigingMethod::ExternalDrift {
-                n_vars: drift_cols.len(),
-            },
-            max_neighbors: cmd.neighbors.max_neighbors,
-            search_radius: cmd.neighbors.radius,
-            min_neighbors: cmd.neighbors.min_neighbors,
-            max_per_octant: cmd.neighbors.octant,
-        };
+        let config = cmd.neighbors.config(KrigingMethod::ExternalDrift {
+            n_vars: drift_cols.len(),
+        });
         let cv = leave_one_out_with_drift(&data, &drift_data, &model, &config)?;
         (data, cv, "Leave-one-out cross-validation (external drift)")
     } else {
         let data = cmd.input.read()?;
         println!("Loaded {} points; model: {model}", data.len());
-        let config = KrigingConfig {
-            method: cmd.method.build(&data),
-            max_neighbors: cmd.neighbors.max_neighbors,
-            search_radius: cmd.neighbors.radius,
-            min_neighbors: cmd.neighbors.min_neighbors,
-            max_per_octant: cmd.neighbors.octant,
-        };
+        let config = cmd.neighbors.config(cmd.method.build(&data));
         let (cv, method_label) = match (&cmd.blocks, cmd.folds) {
             (Some(spec), _) => (
                 block_cv(&data, &model, &config, parse_blocks_2d(spec)?)?,
@@ -1916,6 +1958,23 @@ fn run_sis(cmd: SisCmd) -> Result<()> {
         }
     }
 
+    let decluster_weights = match cmd.declus {
+        Some(size) => {
+            let w = cell_declustering_weights(&data, size, 4)?;
+            let mean = w
+                .iter()
+                .zip(data.values())
+                .map(|(&wi, &v)| wi * v)
+                .sum::<f64>()
+                / data.len() as f64;
+            println!(
+                "Declustering (cell {size}): naive mean {:.4}, declustered mean {mean:.4}",
+                data.mean()
+            );
+            Some(w)
+        }
+        None => None,
+    };
     let grid = cmd.grid.build(&data)?;
     // `SisConfig` is `#[non_exhaustive]`: build from `Default::default()`
     // and assign fields.
@@ -1931,6 +1990,9 @@ fn run_sis(cmd: SisCmd) -> Result<()> {
     cfg.tail_max = cmd.tail_max;
     cfg.lower_tail = cmd.ltail.parse()?;
     cfg.upper_tail = cmd.utail.parse()?;
+    cfg.decluster_weights = decluster_weights;
+    cfg.max_node_neighbors = cmd.nodmax;
+    cfg.multigrid = cmd.multigrid;
     let res = sequential_indicator_simulation(&data, &grid, &cfg)?;
 
     println!(

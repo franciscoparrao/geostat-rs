@@ -166,6 +166,76 @@ fn block_cv_and_kfold_cv_print_their_own_method_label() {
 }
 
 #[test]
+fn robust_estimator_flag_changes_the_reported_gamma() {
+    // AUDIT-2026-07-v2.md §4/§7 Fase 6 item #16: robust estimators
+    // (Cressie-Hawkins/Dowd/madogram) previously had no CLI surface at all.
+    let data = temp_path("fixture_estimator.csv");
+    write_fixture(&data);
+
+    let matheron = run(geostat().args(["variogram", "-i"]).arg(&data).args([
+        "--value-col",
+        "z",
+        "--n-lags",
+        "5",
+    ]));
+    assert_success(&matheron, "variogram (matheron)");
+    let matheron_out = String::from_utf8_lossy(&matheron.stdout).into_owned();
+    assert!(!matheron_out.contains("Estimator:"));
+
+    let dowd = run(geostat().args(["variogram", "-i"]).arg(&data).args([
+        "--value-col",
+        "z",
+        "--n-lags",
+        "5",
+        "--estimator",
+        "dowd",
+    ]));
+    assert_success(&dowd, "variogram --estimator dowd");
+    let dowd_out = String::from_utf8_lossy(&dowd.stdout).into_owned();
+    assert!(dowd_out.contains("Estimator: dowd"));
+    // Different estimator, same data: the printed gamma values must differ
+    // (this is the whole point of the flag actually reaching the engine).
+    assert_ne!(matheron_out, dowd_out);
+
+    let bad = run(geostat().args(["variogram", "-i"]).arg(&data).args([
+        "--value-col",
+        "z",
+        "--estimator",
+        "bogus",
+    ]));
+    assert!(!bad.status.success());
+
+    std::fs::remove_file(&data).ok();
+}
+
+#[test]
+fn coincident_pairs_are_reported_by_the_cli() {
+    let data = temp_path("fixture_coincident.csv");
+    // Two points share a location; the CLI must surface that instead of
+    // silently dropping the pair.
+    std::fs::write(
+        &data,
+        "x,y,z\n0,0,1.0\n0,0,5.0\n1,0,2.0\n2,0,3.0\n3,1,4.0\n",
+    )
+    .unwrap();
+
+    let out = run(geostat().args(["variogram", "-i"]).arg(&data).args([
+        "--value-col",
+        "z",
+        "--n-lags",
+        "4",
+    ]));
+    assert_success(&out, "variogram (coincident points)");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("coincident"),
+        "expected a coincident-pairs note, got: {stdout}"
+    );
+
+    std::fs::remove_file(&data).ok();
+}
+
+#[test]
 fn missing_column_gives_a_clear_error_not_a_panic() {
     let data = temp_path("fixture_badcol.csv");
     std::fs::write(&data, "east,north,val\n0,0,1.0\n1,1,2.0\n").unwrap();

@@ -88,7 +88,7 @@ pub use simulation::{
 };
 pub use sis::{
     MarkovBayesCalibration, SisConfig, calibrate_markov_bayes, sequential_indicator_simulation,
-    sis_at,
+    sequential_indicator_simulation_3d, sis_at,
 };
 pub use tails::TailModel;
 pub use trans::{LognormalEstimate, lognormal_kriging};
@@ -99,11 +99,12 @@ pub use validation::{
     leave_one_out_with_drift,
 };
 pub use variogram::{
-    Anisotropy, DirectionConfig, ExperimentalVariogram, FitResult, FitWeights, LagBin, ModelKind,
-    Structure, VariogramConfig, VariogramMap, VariogramModel, default_lag_width,
-    experimental_cross_variogram, experimental_variogram, fit_anisotropic, fit_best,
-    fit_indicator_models, fit_matern, fit_median_indicator_model, fit_model, fit_model_weighted,
-    fit_nested, fit_stable, variogram_map,
+    Anisotropy, CloudPair, DirectionConfig, EstimatorKind, ExperimentalVariogram, FitResult,
+    FitWeights, LagBin, ModelKind, Structure, VariogramConfig, VariogramMap, VariogramModel,
+    correlogram, default_lag_width, experimental_cross_variogram, experimental_variogram,
+    experimental_variogram_robust, fit_anisotropic, fit_best, fit_indicator_models, fit_matern,
+    fit_median_indicator_model, fit_model, fit_model_weighted, fit_nested, fit_stable,
+    variogram_cloud, variogram_map,
 };
 pub use vecchia::{
     VecchiaEstimate, VecchiaFit, VecchiaPlan, maxmin_order, vecchia_loglik, vecchia_loglik_grouped,

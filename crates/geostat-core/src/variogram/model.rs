@@ -331,6 +331,31 @@ pub struct Anisotropy {
 }
 
 impl Anisotropy {
+    /// Rotates and scales a separation vector into the anisotropic-equivalent
+    /// frame: the Euclidean norm of the result is the structure's effective
+    /// (isotropic-equivalent) lag distance. Exposed beyond that internal
+    /// use so the same rotation can drive an
+    /// anisotropic *search* neighborhood: transform every point's
+    /// coordinates once (linearity means this commutes with taking
+    /// differences), then an ordinary Euclidean kd-tree/bucket-grid in the
+    /// transformed frame is exactly a rotated-ellipsoid search in the
+    /// original one — see `KrigingConfig::anisotropic_search`.
+    pub fn transform_vector<const D: usize>(&self, dh: [f64; D]) -> [f64; D] {
+        let mut out = [0.0; D];
+        if D == 3 {
+            let (h0, h1, h2) = (dh[0], dh[1], dh[2]);
+            let rot = self.rotation_matrix_3d();
+            out[0] = rot[0][0] * h0 + rot[0][1] * h1 + rot[0][2] * h2;
+            out[1] = rot[1][0] * h0 + rot[1][1] * h1 + rot[1][2] * h2;
+            out[2] = rot[2][0] * h0 + rot[2][1] * h1 + rot[2][2] * h2;
+        } else {
+            let (s, c) = self.azimuth_deg.to_radians().sin_cos();
+            out[0] = dh[0] * s + dh[1] * c;
+            out[1] = (dh[0] * c - dh[1] * s) / self.ratio;
+        }
+        out
+    }
+
     /// GSLIB `setrot`-equivalent rotation+scaling matrix: applying it to a
     /// separation vector and taking the Euclidean norm of the result gives
     /// the isotropic-equivalent effective distance (before dividing by the
@@ -460,19 +485,12 @@ impl Structure {
                 s.sqrt()
             }
             Some(a) => {
-                if D == 3 {
-                    let (h0, h1, h2) = (dh[0], dh[1], dh[2]);
-                    let rot = a.rotation_matrix_3d();
-                    let e0 = rot[0][0] * h0 + rot[0][1] * h1 + rot[0][2] * h2;
-                    let e1 = rot[1][0] * h0 + rot[1][1] * h1 + rot[1][2] * h2;
-                    let e2 = rot[2][0] * h0 + rot[2][1] * h1 + rot[2][2] * h2;
-                    (e0 * e0 + e1 * e1 + e2 * e2).sqrt()
-                } else {
-                    let (s, c) = a.azimuth_deg.to_radians().sin_cos();
-                    let h_major = dh[0] * s + dh[1] * c;
-                    let h_minor = (dh[0] * c - dh[1] * s) / a.ratio;
-                    (h_major * h_major + h_minor * h_minor).sqrt()
+                let e = a.transform_vector(dh);
+                let mut s = 0.0;
+                for &v in &e {
+                    s += v * v;
                 }
+                s.sqrt()
             }
         }
     }

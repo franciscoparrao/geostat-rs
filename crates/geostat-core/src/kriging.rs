@@ -8,7 +8,17 @@ use crate::error::{GeostatError, Result};
 use crate::grid::Grid2D;
 use crate::linalg::{Lu, lu_factor, solve};
 use crate::search::KdTree;
-use crate::variogram::VariogramModel;
+use crate::variogram::{Anisotropy, VariogramModel};
+
+/// Transforms a point into the anisotropic search frame, or returns it
+/// unchanged when `anis` is `None`. See
+/// [`Anisotropy::transform_vector`]/[`KrigingConfig::anisotropic_search`].
+fn search_point<const D: usize>(anis: Option<Anisotropy>, p: [f64; D]) -> [f64; D] {
+    match anis {
+        Some(a) => a.transform_vector(p),
+        None => p,
+    }
+}
 
 /// Kriging flavor.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -53,8 +63,15 @@ impl KrigingMethod {
 ///
 /// With `max_neighbors`, `search_radius` and `max_per_octant` unset, a
 /// global neighborhood (all data points) is used. Neighbor distances are
-/// Euclidean even for anisotropic models (gstat/GSLIB behavior).
+/// Euclidean by default, even for anisotropic models (gstat/GSLIB's
+/// long-standing default) -- set `anisotropic_search` to search a rotated
+/// ellipsoid matching the model's anisotropy instead (GSLIB `kt3d`'s
+/// `sang1`/`sang2`/`sang3`/`sanis1`/`sanis2`).
+///
+/// `#[non_exhaustive]`: construct via `KrigingConfig { method, ..
+/// Default::default() }` (AUDIT-2026-07-v2.md §7 Fase 6).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct KrigingConfig {
     /// Kriging flavor.
     pub method: KrigingMethod,
@@ -69,8 +86,19 @@ pub struct KrigingConfig {
     /// Maximum conditioning points taken per octant around the target
     /// (GSLIB `noct`; quadrants in 2-D). Balances the neighborhood when the
     /// data are clustered: nearest-only search would take every point from
-    /// one side and screen the rest of the domain.
+    /// one side and screen the rest of the domain. Octants/quadrants are
+    /// aligned with `anisotropic_search`'s rotated frame when set, or with
+    /// the raw coordinate axes otherwise.
     pub max_per_octant: Option<usize>,
+    /// Search a rotated, scaled ellipsoid instead of a Euclidean
+    /// neighborhood: `search_radius` becomes the major-axis radius, and
+    /// `anisotropic_search`'s `ratio`/`ratio_z` shrink the minor/vertical
+    /// radii the same way they shrink the variogram's range (GSLIB `kt3d`
+    /// default; AUDIT-2026-07-v2.md called this out as "the #1 remaining
+    /// operational gap" vs GSLIB). Typically the dominant structure's own
+    /// anisotropy, but specified independently -- as in GSLIB, the search
+    /// ellipsoid need not match the covariance exactly.
+    pub anisotropic_search: Option<Anisotropy>,
 }
 
 impl Default for KrigingConfig {
@@ -81,6 +109,7 @@ impl Default for KrigingConfig {
             search_radius: None,
             min_neighbors: None,
             max_per_octant: None,
+            anisotropic_search: None,
         }
     }
 }
@@ -329,7 +358,18 @@ impl<'a, const D: usize, M: Covariance<D>> Kriging<'a, D, M> {
         let tree = (config.max_neighbors.is_some()
             || config.search_radius.is_some()
             || config.max_per_octant.is_some())
-        .then(|| KdTree::build(data.coords()));
+        .then(|| {
+            // Anisotropic search: transform every stored point once into the
+            // rotated/scaled frame (linearity means an ordinary Euclidean
+            // kd-tree there is exactly a rotated-ellipsoid search in the
+            // original coordinates -- see `search_point`).
+            let transformed: Vec<[f64; D]> = data
+                .coords()
+                .iter()
+                .map(|&p| search_point(config.anisotropic_search, p))
+                .collect();
+            KdTree::build(&transformed)
+        });
 
         let mut kriging = Self {
             data,
@@ -393,9 +433,14 @@ impl<'a, const D: usize, M: Covariance<D>> Kriging<'a, D, M> {
         let Some(tree) = &self.tree else {
             return (0..self.data.len()).collect();
         };
+        // The tree was built on `search_point`-transformed coordinates (see
+        // `Kriging::build`), so the target and every candidate must be
+        // transformed the same way before comparing against it -- a no-op
+        // when `anisotropic_search` is `None`.
+        let search_target = search_point(self.config.anisotropic_search, target);
         let Some(per_octant) = self.config.max_per_octant else {
             return tree.k_nearest(
-                target,
+                search_target,
                 self.config.max_neighbors.unwrap_or(self.data.len()),
                 self.config.search_radius,
             );
@@ -403,19 +448,24 @@ impl<'a, const D: usize, M: Covariance<D>> Kriging<'a, D, M> {
         // Octant search (GSLIB noct): walk the radius-bounded candidates in
         // distance order, taking at most `per_octant` per 2^D sector around
         // the target, then cap the total at max_neighbors (GSLIB ndmax).
-        let mut cand = tree.k_nearest(target, self.data.len(), self.config.search_radius);
+        // Sectors are aligned with the search ellipsoid's rotated frame when
+        // `anisotropic_search` is set, matching GSLIB's rotated octants.
+        let mut cand = tree.k_nearest(search_target, self.data.len(), self.config.search_radius);
+        let search_coord = |i: usize| -> [f64; D] {
+            search_point(self.config.anisotropic_search, self.data.coord(i))
+        };
         let d2 = |i: usize| -> f64 {
-            let c = self.data.coord(i);
-            (0..D).map(|d| (c[d] - target[d]).powi(2)).sum()
+            let c = search_coord(i);
+            (0..D).map(|d| (c[d] - search_target[d]).powi(2)).sum()
         };
         cand.sort_by(|&a, &b| d2(a).total_cmp(&d2(b)));
         let mut counts = vec![0_usize; 1 << D];
         let mut selected = Vec::new();
         for &i in &cand {
-            let c = self.data.coord(i);
+            let c = search_coord(i);
             let mut oct = 0;
             for d in 0..D {
-                if c[d] >= target[d] {
+                if c[d] >= search_target[d] {
                     oct |= 1 << d;
                 }
             }
@@ -947,6 +997,184 @@ mod tests {
             "octant {} vs nearest {}",
             octant.value,
             nearest.value
+        );
+    }
+
+    #[test]
+    fn anisotropic_search_prefers_the_major_axis_neighbor() {
+        // AUDIT-2026-07-v2.md §7 Fase 6 item #14 ("the #1 remaining
+        // operational gap"): with azimuth=0, the major axis points along
+        // +y (matching `Anisotropy::transform_vector`'s 2-D convention: at
+        // az=0, `out[0] = dh[1]` (major = y), `out[1] = dh[0]/ratio` (minor
+        // = x, stretched)). Point A sits on the major axis at raw distance
+        // 3.0; point B sits on the minor axis at raw distance 1.0 -- B is
+        // physically closer, so plain Euclidean search must prefer it, but
+        // a strongly anisotropic ellipsoid (ratio 0.2) must flip the
+        // preference to A (transformed distances: A -> 3.0, B -> 1.0/0.2 =
+        // 5.0).
+        let a = [0.0, 3.0];
+        let b = [1.0, 0.0];
+        let data = PointSet::new(vec![a, b], vec![100.0, 0.0]).unwrap();
+        let m = model();
+
+        // Plain Euclidean search: B is nearer (1.0 < 3.0), so a single
+        // neighbor's OK prediction (which exactly reproduces that one
+        // datum) must equal B's value.
+        let isotropic_cfg = KrigingConfig {
+            max_neighbors: Some(1),
+            ..Default::default()
+        };
+        let isotropic = Kriging::new(&data, &m, isotropic_cfg).unwrap();
+        let iso_est = isotropic.predict([0.0, 0.0]).unwrap();
+        assert!(
+            (iso_est.value - 0.0).abs() < 1e-8,
+            "expected the isotropically-nearer point B (value 0.0), got {}",
+            iso_est.value
+        );
+
+        // Anisotropic search ellipsoid (major axis along +y, ratio 0.2):
+        // A becomes the nearer point in the search metric.
+        let aniso_cfg = KrigingConfig {
+            max_neighbors: Some(1),
+            anisotropic_search: Some(Anisotropy {
+                azimuth_deg: 0.0,
+                ratio: 0.2,
+                ratio_z: 1.0,
+                dip_deg: 0.0,
+                rake_deg: 0.0,
+            }),
+            ..Default::default()
+        };
+        let anisotropic = Kriging::new(&data, &m, aniso_cfg).unwrap();
+        let aniso_est = anisotropic.predict([0.0, 0.0]).unwrap();
+        assert!(
+            (aniso_est.value - 100.0).abs() < 1e-8,
+            "expected the anisotropically-nearer point A (value 100.0), got {}",
+            aniso_est.value
+        );
+    }
+
+    #[test]
+    fn anisotropic_search_radius_is_the_major_axis_radius() {
+        // `search_radius` is the major-axis radius of the search ellipsoid
+        // (GSLIB kt3d `radius_hmax`): with ratio 0.5, a point at physical
+        // distance 5.0 along the major axis (transformed distance 5.0) is
+        // inside a radius-5.0 search, while a point at the *same* physical
+        // distance along the minor axis (transformed distance 5.0/0.5 =
+        // 10.0) is not.
+        let inside = [0.0, 5.0]; // major axis (az=0 -> +y), value distinguishable
+        let outside = [5.0, 0.0]; // minor axis, same raw distance
+        let data = PointSet::new(vec![inside, outside], vec![100.0, 999.0]).unwrap();
+        let m = model();
+
+        let cfg = KrigingConfig {
+            search_radius: Some(5.0),
+            anisotropic_search: Some(Anisotropy {
+                azimuth_deg: 0.0,
+                ratio: 0.5,
+                ratio_z: 1.0,
+                dip_deg: 0.0,
+                rake_deg: 0.0,
+            }),
+            ..Default::default()
+        };
+        let k = Kriging::new(&data, &m, cfg).unwrap();
+        // If `outside` were (wrongly) included, the value would be a blend
+        // with 999.0; since only `inside` is within the ellipsoid, ordinary
+        // kriging with one neighbor exactly reproduces its value.
+        let est = k.predict([0.0, 0.0]).unwrap();
+        assert!(
+            (est.value - 100.0).abs() < 1e-6,
+            "expected only the major-axis point in range, got {}",
+            est.value
+        );
+    }
+
+    #[test]
+    fn anisotropic_search_octants_follow_the_rotated_frame() {
+        // Same setup as `octant_search_balances_clustered_neighbors`, but
+        // rotated 90 degrees and searched with a matching
+        // `anisotropic_search` azimuth: octant classification must follow
+        // the rotated frame, not the raw x/y axes, so the balancing effect
+        // survives the rotation.
+        let mut coords = vec![
+            [0.1, 1.0],
+            [-0.1, 1.1],
+            [0.2, 1.2],
+            [-0.2, 1.3],
+            [0.05, 1.4],
+        ];
+        let mut values = vec![10.0; coords.len()];
+        coords.extend_from_slice(&[[0.5, -2.0], [-0.5, -2.0], [-2.0, 0.5], [2.0, 0.5]]);
+        values.extend_from_slice(&[0.0, 0.0, 0.0, 0.0]);
+        let data = PointSet::new(coords, values).unwrap();
+        let m = model();
+        let target = [0.0, 0.0];
+
+        let nearest_cfg = KrigingConfig {
+            max_neighbors: Some(4),
+            ..Default::default()
+        };
+        let nearest = Kriging::new(&data, &m, nearest_cfg)
+            .unwrap()
+            .predict(target)
+            .unwrap();
+
+        let octant_cfg = KrigingConfig {
+            max_neighbors: Some(4),
+            max_per_octant: Some(1),
+            anisotropic_search: Some(Anisotropy {
+                azimuth_deg: 90.0,
+                ratio: 1.0,
+                ratio_z: 1.0,
+                dip_deg: 0.0,
+                rake_deg: 0.0,
+            }),
+            ..Default::default()
+        };
+        let octant = Kriging::new(&data, &m, octant_cfg)
+            .unwrap()
+            .predict(target)
+            .unwrap();
+
+        assert!(nearest.value > 9.0, "nearest-only {}", nearest.value);
+        assert!(
+            octant.value < nearest.value - 2.0,
+            "rotated octant {} vs nearest {}",
+            octant.value,
+            nearest.value
+        );
+    }
+
+    #[test]
+    fn anisotropic_search_works_in_3d_with_dip() {
+        // az=0, dip=90 points the major axis straight up (+z) -- see
+        // `direction_matches_model_major_axis` in variogram/model.rs for
+        // the same convention verified against the model's own rotation.
+        // Point A on the (dipped) major axis at raw distance 4.0; point B
+        // on the horizontal minor axis at the same raw distance.
+        let a = [0.0, 0.0, 4.0];
+        let b = [4.0, 0.0, 0.0];
+        let data: PointSet<3> = PointSet::new(vec![a, b], vec![100.0, 0.0]).unwrap();
+        let m = model();
+
+        let cfg = KrigingConfig {
+            max_neighbors: Some(1),
+            anisotropic_search: Some(Anisotropy {
+                azimuth_deg: 0.0,
+                ratio: 0.2,
+                ratio_z: 1.0,
+                dip_deg: 90.0,
+                rake_deg: 0.0,
+            }),
+            ..Default::default()
+        };
+        let k: Kriging<'_, 3> = Kriging::new(&data, &m, cfg).unwrap();
+        let est = k.predict([0.0, 0.0, 0.0]).unwrap();
+        assert!(
+            (est.value - 100.0).abs() < 1e-6,
+            "expected the dipped-major-axis point A, got {}",
+            est.value
         );
     }
 

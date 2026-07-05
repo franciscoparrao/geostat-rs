@@ -48,9 +48,12 @@ def experimental_variogram(
     tolerance: float = 22.5,
     detrend: Optional[int] = None,
     detrend_drift: Optional[Sequence[Sequence[float]]] = None,
+    estimator: str = "matheron",
 ) -> tuple[list[float], list[float], list[int]]:
     """Experimental semivariogram. Returns ``(h, gamma, n_pairs)`` lists;
-    empty bins carry NaN gamma."""
+    empty bins carry NaN gamma. ``estimator``: "matheron" (default),
+    "cressie-hawkins"/"ch", "dowd" or "madogram" -- the latter three are
+    more resistant to a few outlier pairs."""
 
 def variogram_map(
     x: Sequence[float],
@@ -163,9 +166,16 @@ def krige(
     min_neighbors: Optional[int] = None,
     octant: Optional[int] = None,
     measurement_error: Optional[Sequence[float]] = None,
+    search_azimuth: Optional[float] = None,
+    search_ratio: float = 1.0,
+    search_ratio_z: float = 1.0,
+    search_dip: float = 0.0,
+    search_rake: float = 0.0,
 ) -> tuple[FloatArray, FloatArray]:
     """Kriging at arbitrary target locations. Returns
-    ``(predictions, variances)``; failed targets yield NaN."""
+    ``(predictions, variances)``; failed targets yield NaN. With
+    ``search_azimuth`` set, searches a rotated ellipsoid (``radius`` becomes
+    the major-axis radius) instead of a Euclidean neighborhood."""
 
 def lognormal_kriging(
     x: Sequence[float],
@@ -199,9 +209,15 @@ def krige_grid(
     block_discr: tuple[int, int] = (4, 4),
     min_neighbors: Optional[int] = None,
     octant: Optional[int] = None,
+    search_azimuth: Optional[float] = None,
+    search_ratio: float = 1.0,
+    search_ratio_z: float = 1.0,
+    search_dip: float = 0.0,
+    search_rake: float = 0.0,
 ) -> tuple[FloatArray, FloatArray]:
     """Kriging over a regular grid. Returns ``(predictions, variances)``,
-    row-major with y increasing."""
+    row-major with y increasing. With ``search_azimuth`` set, searches a
+    rotated ellipsoid instead of a Euclidean neighborhood -- see ``krige``."""
 
 def loo_cv(
     x: Sequence[float],
@@ -398,11 +414,16 @@ def sis(
     tail_max: Optional[float] = None,
     mik: bool = False,
     ordinary: bool = False,
+    decluster_cell: Optional[float] = None,
+    max_node_neighbors: Optional[int] = None,
+    multigrid: int = 0,
 ) -> FloatArray:
     """Conditional sequential indicator simulation. Returns an
     ``n_realizations x n_cells`` array, one row per realization. ``fit`` is
     a comma-separated list of candidate variogram families for the
-    per-cutoff auto-fit (e.g. "spherical,exponential,matern:1.5")."""
+    per-cutoff auto-fit (e.g. "spherical,exponential,matern:1.5").
+    ``decluster_cell``/``max_node_neighbors``/``multigrid`` mirror ``sgs``'s
+    same-named parameters."""
 
 def experimental_variogram_3d(
     x: Sequence[float],

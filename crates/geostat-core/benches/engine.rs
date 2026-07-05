@@ -42,10 +42,10 @@ fn bench_kriging(c: &mut Criterion) {
     let data = synthetic(1000, 2);
     let m = model();
     let grid = Grid2D::from_bbox([0.0, 0.0], [1000.0, 1000.0], 50, 50).unwrap();
-    let cfg = KrigingConfig {
-        max_neighbors: Some(32),
-        ..Default::default()
-    };
+    // `KrigingConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields.
+    let mut cfg = KrigingConfig::default();
+    cfg.max_neighbors = Some(32);
     c.bench_function("ok_2500_cells_1k_data_k32", |b| {
         b.iter(|| {
             let k = Kriging::new(black_box(&data), &m, cfg.clone()).unwrap();
