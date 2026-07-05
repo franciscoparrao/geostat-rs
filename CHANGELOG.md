@@ -37,6 +37,25 @@ Fase 6 operational-gap closing (`docs/AUDIT-2026-07-v2.md` §7).
   dropped). Non-ergodic (per-lag head/tail) correlograms and relative
   variograms are explicitly out of scope for this pass — see
   `docs/AUDIT-2026-07-v2.md` §4.
+- Analytical gradients for the Vecchia log-likelihood w.r.t. `(nugget,
+  psill, range)` for the covariance families with a closed-form range
+  derivative (Spherical, Exponential, Gaussian, Matérn 3/2, Matérn 5/2),
+  propagated through each point's local GLS system with one extra `O(m^2)`
+  triangular solve per parameter on top of the existing `O(m^3)`
+  factorization. A new `bfgs`/`bfgs_multistart` quasi-Newton optimizer
+  (`optim.rs`) uses them to fit `vecchia_mle`/`vecchia_mle_grouped` --
+  orders of magnitude fewer likelihood evaluations than the previous
+  Nelder-Mead multistart (measured: ~40x wall-clock on a 60-point/m=12
+  fit) with an identical fitted optimum. Kinds without a closed-form
+  gradient, and grouped (Guinness-blocked) likelihoods, keep the
+  gradient-free Nelder-Mead path unchanged. `vecchia_param_se` reuses the
+  same analytical gradient for a semi-analytical Hessian (finite-
+  differencing the exact gradient once, instead of double-differencing
+  the raw log-likelihood) for the same covariance families, addressing
+  the "Hessiano por diferencias finitas frágil" note in
+  AUDIT-2026-07-v2.md §5.1. Full Fisher scoring, a custom `erfc`, a
+  small-*x* Bessel branch, and configurable rcond/jitter policy remain
+  out of scope for this pass.
 
 ### Changed
 - `KrigingConfig` is now `#[non_exhaustive]` (was already the case for

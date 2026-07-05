@@ -26,9 +26,10 @@ use ndarray::Array2;
 use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
 use crate::linalg::{
-    cholesky_factor_in_place, cholesky_forward_solve, cholesky_solve_in_place, lu_factor,
+    cholesky_back_solve, cholesky_factor_in_place, cholesky_forward_solve, cholesky_solve_in_place,
+    lu_factor,
 };
-use crate::optim::nelder_mead_multistart;
+use crate::optim::{bfgs_multistart, nelder_mead_multistart};
 use crate::search::BucketGrid;
 use crate::variogram::{ModelKind, Structure, VariogramModel};
 
@@ -314,6 +315,222 @@ fn loglik_with_plan<const D: usize>(
         loglik += -0.5 * ((2.0 * PI).ln() + var.ln() + r * r / var);
     }
     Ok(loglik)
+}
+
+/// Shape function `g(d)` and its derivative `dg/dd` at the normalized lag
+/// `d = h/range`, for the covariance families with a closed form here --
+/// the classic bounded families, which cover the overwhelming majority of
+/// Vecchia MLE usage (AUDIT-2026-07-v2.md §5.1: "las derivadas ∂C/∂θ son
+/// cerradas para todo el catálogo salvo ∂K_ν/∂ν; implementarlas para
+/// (nugget, sill, range) con ν fijo cubre el 90% del uso"). `None` for
+/// every other kind (`Circular`, `Stable`, `Hole`, `Wave`, `Matern(nu)`,
+/// `Power`): [`mle_fit_with_plan`] falls back to the existing
+/// gradient-free Nelder-Mead multistart for those.
+///
+/// Each derivative was cross-checked against the standard closed-form
+/// correlation derivatives (e.g. Matérn 3/2's `rho'(d) = -3d*exp(-sqrt(3)d)`
+/// and 5/2's `rho'(d) = -5d(1+sqrt(5)d)/3*exp(-sqrt(5)d)`) and is verified
+/// numerically against central finite differences of [`ModelKind::g`] in
+/// `g_and_dg_matches_finite_differences` below.
+fn g_and_dg(kind: ModelKind, d: f64) -> Option<(f64, f64)> {
+    match kind {
+        ModelKind::Spherical => {
+            if d >= 1.0 {
+                Some((1.0, 0.0))
+            } else {
+                Some((1.5 * d - 0.5 * d * d * d, 1.5 - 1.5 * d * d))
+            }
+        }
+        ModelKind::Exponential => {
+            let e = (-d).exp();
+            Some((1.0 - e, e))
+        }
+        ModelKind::Gaussian => {
+            let e = (-(d * d)).exp();
+            Some((1.0 - e, 2.0 * d * e))
+        }
+        ModelKind::Matern15 => {
+            let s = 3.0_f64.sqrt() * d;
+            let e = (-s).exp();
+            Some((1.0 - (1.0 + s) * e, 3.0 * d * e))
+        }
+        ModelKind::Matern25 => {
+            let s = 5.0_f64.sqrt() * d;
+            let e = (-s).exp();
+            Some((
+                1.0 - (1.0 + s + s * s / 3.0) * e,
+                5.0 * d * (1.0 + s) / 3.0 * e,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Dense matrix-vector product `y = a*x` for a row-major `n x n` matrix.
+fn matvec(a: &[f64], x: &[f64], n: usize, y: &mut Vec<f64>) {
+    y.clear();
+    y.resize(n, 0.0);
+    for r in 0..n {
+        let row = &a[r * n..(r + 1) * n];
+        y[r] = row.iter().zip(x).map(|(&aij, &xj)| aij * xj).sum();
+    }
+}
+
+/// Vecchia log-likelihood **and** its analytical gradient w.r.t. `(nugget,
+/// psill, range)`, for a single-structure isotropic model whose `kind` has
+/// a closed-form range derivative (see [`g_and_dg`]); `None` otherwise.
+///
+/// Propagates the parameter derivative through each point's local
+/// generalized-least-squares system exactly like GpGp's Vecchia gradient
+/// (Guinness 2021, §3): with `w = K_SS^{-1} k_i` already computed and
+/// `K_SS` already Cholesky-factored, `dw/dθ = K_SS^{-1}(dk_i/dθ -
+/// dK_SS/dθ · w)` reuses the **same** factorization (one extra `O(m^2)`
+/// triangular solve per parameter, not a fresh `O(m^3)` factorization).
+/// From there `dμ/dθ = dw/dθ · z_S`, `dσ²/dθ = dsill/dθ - d(w·k_i)/dθ`, and
+/// the per-point log-density derivative follows from the standard Gaussian
+/// log-likelihood identity `d/dθ[-0.5(ln σ² + r²/σ²)] = -0.5 dσ²/dθ/σ² +
+/// r·dμ/dθ/σ² + 0.5 r²/σ⁴ · dσ²/dθ` (r = z_i - μ, dr/dθ = -dμ/dθ).
+///
+/// `nugget`'s derivative is a special case worth noting: `dK_SS/dnugget =
+/// I` and `dk_i/dnugget = 0` exactly (the nugget only ever appears on
+/// pairs at zero separation, which never occur between a point and its own
+/// neighbours), so its gradient solve's right-hand side is simply `-w`.
+fn loglik_grad_with_plan<const D: usize>(
+    data: &PointSet<D>,
+    kind: ModelKind,
+    nugget: f64,
+    psill: f64,
+    range: f64,
+    plan: &VecchiaPlan,
+) -> Option<Result<(f64, [f64; 3])>> {
+    g_and_dg(kind, 0.5)?;
+    Some(loglik_grad_inner(data, kind, nugget, psill, range, plan))
+}
+
+fn loglik_grad_inner<const D: usize>(
+    data: &PointSet<D>,
+    kind: ModelKind,
+    nugget: f64,
+    psill: f64,
+    range: f64,
+    plan: &VecchiaPlan,
+) -> Result<(f64, [f64; 3])> {
+    let coords = data.coords();
+    let mean = data.mean();
+    let z: Vec<f64> = data.values().iter().map(|v| v - mean).collect();
+    let sill = nugget + psill;
+
+    let mut kss: Vec<f64> = Vec::new();
+    let mut ki: Vec<f64> = Vec::new();
+    let mut w: Vec<f64> = Vec::new();
+    let mut dk_psill: Vec<f64> = Vec::new();
+    let mut dk_range: Vec<f64> = Vec::new();
+    let mut dki_psill: Vec<f64> = Vec::new();
+    let mut dki_range: Vec<f64> = Vec::new();
+    let mut rhs: Vec<f64> = Vec::new();
+    let mut dw: Vec<f64> = Vec::new();
+
+    let mut loglik = 0.0;
+    let mut grad = [0.0_f64; 3];
+
+    for (k, &i) in plan.order.iter().enumerate() {
+        let nb = &plan.neighbours[k];
+        if nb.is_empty() {
+            // First point: marginal N(0, sill); only nugget/psill move sill.
+            let var = sill;
+            let r = z[i];
+            loglik += -0.5 * ((2.0 * PI).ln() + var.ln() + r * r / var);
+            let common = -0.5 / var + 0.5 * r * r / (var * var);
+            grad[0] += common; // dsill/dnugget = 1
+            grad[1] += common; // dsill/dpsill = 1
+            continue;
+        }
+        let s = nb.len();
+        kss.clear();
+        kss.resize(s * s, 0.0);
+        ki.clear();
+        ki.resize(s, 0.0);
+        dk_psill.clear();
+        dk_psill.resize(s * s, 0.0);
+        dk_range.clear();
+        dk_range.resize(s * s, 0.0);
+        dki_psill.clear();
+        dki_psill.resize(s, 0.0);
+        dki_range.clear();
+        dki_range.resize(s, 0.0);
+
+        for a in 0..s {
+            let h_ia = dist2(&coords[i], &coords[nb[a]]).sqrt();
+            let (g_ia, dg_ia) = g_and_dg(kind, h_ia / range).expect("checked by caller");
+            ki[a] = sill - (nugget + psill * g_ia);
+            dki_psill[a] = 1.0 - g_ia;
+            dki_range[a] = psill * dg_ia * h_ia / (range * range);
+            kss[a * s + a] = sill;
+            dk_psill[a * s + a] = 1.0;
+            for b in (a + 1)..s {
+                let h_ab = dist2(&coords[nb[a]], &coords[nb[b]]).sqrt();
+                let (g_ab, dg_ab) = g_and_dg(kind, h_ab / range).expect("checked by caller");
+                let c = sill - (nugget + psill * g_ab);
+                kss[a * s + b] = c;
+                kss[b * s + a] = c;
+                let dp = 1.0 - g_ab;
+                dk_psill[a * s + b] = dp;
+                dk_psill[b * s + a] = dp;
+                let dr = psill * dg_ab * h_ab / (range * range);
+                dk_range[a * s + b] = dr;
+                dk_range[b * s + a] = dr;
+            }
+        }
+
+        // Factor K_SS once; reuse for the main solve and every gradient solve.
+        cholesky_factor_in_place(&mut kss, s)?;
+        w.clear();
+        w.extend_from_slice(&ki);
+        cholesky_forward_solve(&kss, s, &mut w);
+        cholesky_back_solve(&kss, s, &mut w);
+
+        let mu: f64 = w.iter().zip(nb).map(|(&wj, &j)| wj * z[j]).sum();
+        let reduction: f64 = w.iter().zip(&ki).map(|(&wj, &kj)| wj * kj).sum();
+        let var = (sill - reduction).max(1e-12);
+        let r = z[i] - mu;
+        loglik += -0.5 * ((2.0 * PI).ln() + var.ln() + r * r / var);
+
+        // Shared tail of the per-parameter derivative:
+        // d(loglik_k)/dp = -0.5 dvar/p/var + r*dmu/dp/var + 0.5 r^2/var^2 * dvar/dp.
+        let mut solve_param = |dsill_dp: f64, dk_dp: Option<&[f64]>, dki_dp: &[f64]| -> f64 {
+            rhs.clear();
+            rhs.resize(s, 0.0);
+            if let Some(dk) = dk_dp {
+                matvec(dk, &w, s, &mut dw); // reuse dw as scratch for dK*w
+                for a in 0..s {
+                    rhs[a] = dki_dp[a] - dw[a];
+                }
+            } else {
+                // nugget: dK_SS = I, dk_i = 0 -> rhs = -w.
+                for a in 0..s {
+                    rhs[a] = -w[a];
+                }
+            }
+            dw.clear();
+            dw.extend_from_slice(&rhs);
+            cholesky_forward_solve(&kss, s, &mut dw);
+            cholesky_back_solve(&kss, s, &mut dw);
+            let dmu: f64 = dw.iter().zip(nb).map(|(&dwj, &j)| dwj * z[j]).sum();
+            let dreduction: f64 = dw.iter().zip(&ki).map(|(&dwj, &kj)| dwj * kj).sum::<f64>()
+                + w.iter()
+                    .zip(dki_dp)
+                    .map(|(&wj, &dkj)| wj * dkj)
+                    .sum::<f64>();
+            let dvar = dsill_dp - dreduction;
+            -0.5 * dvar / var + r * dmu / var + 0.5 * r * r / (var * var) * dvar
+        };
+
+        let zeros = vec![0.0; s];
+        grad[0] += solve_param(1.0, None, &zeros);
+        grad[1] += solve_param(1.0, Some(&dk_psill), &dki_psill);
+        grad[2] += solve_param(0.0, Some(&dk_range), &dki_range);
+    }
+    Ok((loglik, grad))
 }
 
 /// Fraction of a candidate point's own `m` neighbours that may be new to a
@@ -735,18 +952,20 @@ fn mle_fit_with_plan<const D: usize>(
     // are log-parametrized (strictly positive, span orders of magnitude), so
     // the domain is intrinsic and no boundary penalty is needed
     // (AUDIT-2026-07.md §2.6).
+    let range_max = 10.0 * extent;
+    let reg_of = |range: f64| -> f64 {
+        // A range far beyond the domain is unidentifiable (indistinguishable
+        // from a trend); regularize it back rather than letting it run away.
+        if range > range_max {
+            ((range - range_max) / range_max).powi(2)
+        } else {
+            0.0
+        }
+    };
     let objective = |x: &[f64]| -> f64 {
         let nugget = x[0] * x[0];
         let psill = x[1].exp();
         let range = x[2].exp();
-        // A range far beyond the domain is unidentifiable (indistinguishable
-        // from a trend); regularize it back rather than letting it run away.
-        let range_max = 10.0 * extent;
-        let reg = if range > range_max {
-            ((range - range_max) / range_max).powi(2)
-        } else {
-            0.0
-        };
         let model = VariogramModel {
             nugget,
             structures: vec![Structure::new(kind, psill, range)],
@@ -757,7 +976,7 @@ fn mle_fit_with_plan<const D: usize>(
             None => loglik_with_plan(data, &model, plan),
         };
         match ll {
-            Ok(ll) if ll.is_finite() => -ll + 1e6 * reg,
+            Ok(ll) if ll.is_finite() => -ll + 1e6 * reg_of(range),
             _ => 1e12,
         }
     };
@@ -769,7 +988,40 @@ fn mle_fit_with_plan<const D: usize>(
         .into_iter()
         .map(|f| vec![(0.1 * var0).sqrt(), (0.9 * var0).ln(), ln_range0 + f.ln()])
         .collect();
-    let (xb, neg_ll) = nelder_mead_multistart(objective, &starts, 0.3, 2000);
+
+    // Analytical-gradient BFGS when available (AUDIT-2026-07-v2.md §5.1,
+    // Fase 6 item #17: "cheaper alternative" to full Fisher scoring) --
+    // orders of magnitude fewer likelihood evaluations than Nelder-Mead's
+    // thousands of simplex steps. Only defined for the *ungrouped*
+    // likelihood (`loglik_grad_with_plan` mirrors `loglik_with_plan`, not
+    // `loglik_with_blocks`) and the covariance families with a closed-form
+    // range derivative (see `g_and_dg`); everything else keeps the
+    // gradient-free Nelder-Mead multistart unchanged.
+    let (xb, neg_ll) = if blocks.is_none() && g_and_dg(kind, 0.5).is_some() {
+        let objective_grad = |x: &[f64]| -> Vec<f64> {
+            let nugget = x[0] * x[0];
+            let psill = x[1].exp();
+            let range = x[2].exp();
+            match loglik_grad_with_plan(data, kind, nugget, psill, range, plan) {
+                Some(Ok((_, g))) => {
+                    let mut gx = vec![-g[0] * 2.0 * x[0], -g[1] * psill, -g[2] * range];
+                    if range > range_max {
+                        let dreg_drange = 2.0 * (range - range_max) / (range_max * range_max);
+                        gx[2] += 1e6 * dreg_drange * range;
+                    }
+                    gx
+                }
+                // Singular system (degenerate candidate point): no
+                // meaningful direction. The objective's matching `1e12`
+                // penalty keeps a sane line search from ever selecting
+                // such a point except in extremis.
+                _ => vec![0.0, 0.0, 0.0],
+            }
+        };
+        bfgs_multistart(objective, objective_grad, &starts, 200)
+    } else {
+        nelder_mead_multistart(objective, &starts, 0.3, 2000)
+    };
     let model = VariogramModel::new(
         xb[0] * xb[0],
         vec![Structure::new(kind, xb[1].exp(), xb[2].exp())],
@@ -1352,12 +1604,17 @@ fn reml_fit_with_basis<const D: usize>(
 /// parameters `(nugget, partial sill, range)`, from the observed Fisher
 /// information of the constant-mean Vecchia log-likelihood at `model`.
 ///
-/// The information matrix is the numerical Hessian of the negative
-/// log-likelihood; the standard errors are the square roots of the diagonal of
-/// its inverse. A parameter sitting on a boundary (e.g.\ a zero nugget) or a
-/// non-positive-definite Hessian yields `NaN` for that entry --- the asymptotic
-/// theory does not apply there. This is inference the variogram-WLS path cannot
-/// provide.
+/// The information matrix is the Hessian of the negative log-likelihood; the
+/// standard errors are the square roots of the diagonal of its inverse. When
+/// `model`'s kind has a closed-form gradient (see `g_and_dg`), the Hessian
+/// is **semi-analytical**: it finite-differences the *exact* analytical
+/// gradient once, rather than double-differencing the raw log-likelihood
+/// (which compounds two independent finite-difference errors into the same
+/// estimate -- fragile enough that AUDIT-2026-07-v2.md §5.1 calls it out by
+/// name). Other kinds keep the previous fully-numerical Hessian. A parameter
+/// sitting on a boundary (e.g.\ a zero nugget) or a non-positive-definite
+/// Hessian yields `NaN` for that entry --- the asymptotic theory does not
+/// apply there. This is inference the variogram-WLS path cannot provide.
 pub fn vecchia_param_se<const D: usize>(
     data: &PointSet<D>,
     model: &VariogramModel,
@@ -1379,49 +1636,105 @@ pub fn vecchia_param_se<const D: usize>(
         model.structures[0].range,
     ];
 
-    // Negative log-likelihood at a parameter vector (reusing the plan).
-    let nll = |p: &[f64; 3]| -> f64 {
-        if p[1] <= 0.0 || p[2] <= 0.0 || p[0] < 0.0 {
-            return f64::INFINITY;
-        }
-        let model = VariogramModel {
-            nugget: p[0],
-            structures: vec![Structure::new(kind, p[1], p[2])],
-        };
-        match loglik_with_plan(data, &model, &plan) {
-            Ok(ll) if ll.is_finite() => -ll,
-            _ => f64::INFINITY,
-        }
-    };
-
     // Relative finite-difference steps.
     let h: [f64; 3] = std::array::from_fn(|i| (theta[i].abs() * 1e-3).max(1e-5));
-    let f0 = nll(&theta);
-    let mut hess = [[0.0; 3]; 3];
-    for i in 0..3 {
-        let mut tp = theta;
-        let mut tm = theta;
-        tp[i] += h[i];
-        tm[i] -= h[i];
-        hess[i][i] = (nll(&tp) - 2.0 * f0 + nll(&tm)) / (h[i] * h[i]);
-        for j in (i + 1)..3 {
-            let mut tpp = theta;
-            let mut tpm = theta;
-            let mut tmp = theta;
-            let mut tmm = theta;
-            tpp[i] += h[i];
-            tpp[j] += h[j];
-            tpm[i] += h[i];
-            tpm[j] -= h[j];
-            tmp[i] -= h[i];
-            tmp[j] += h[j];
-            tmm[i] -= h[i];
-            tmm[j] -= h[j];
-            let v = (nll(&tpp) - nll(&tpm) - nll(&tmp) + nll(&tmm)) / (4.0 * h[i] * h[j]);
-            hess[i][j] = v;
-            hess[j][i] = v;
+
+    // Semi-analytical Hessian when `kind` has a closed-form gradient (see
+    // `g_and_dg`/`loglik_grad_with_plan`, Fase 6 item #17): finite-differencing
+    // the *exact* gradient once, instead of double-differencing the raw
+    // log-likelihood, avoids compounding two separate finite-difference
+    // truncation/rounding errors into the same estimate -- the "Hessiano por
+    // diferencias finitas frágil" AUDIT-2026-07-v2.md §5.1 specifically
+    // flags. Falls back to the previous full-finite-difference Hessian
+    // (unchanged) for kinds without one.
+    let hess = if g_and_dg(kind, 0.5).is_some() {
+        let grad_nll = |p: &[f64; 3]| -> Option<[f64; 3]> {
+            if p[1] <= 0.0 || p[2] <= 0.0 || p[0] < 0.0 {
+                return None;
+            }
+            loglik_grad_with_plan(data, kind, p[0], p[1], p[2], &plan)?
+                .ok()
+                .map(|(_, g)| [-g[0], -g[1], -g[2]]) // gradient of the NLL
+        };
+        let mut hess = [[0.0; 3]; 3];
+        let mut ok = true;
+        for i in 0..3 {
+            let mut tp = theta;
+            let mut tm = theta;
+            tp[i] += h[i];
+            tm[i] -= h[i];
+            match (grad_nll(&tp), grad_nll(&tm)) {
+                (Some(gp), Some(gm)) => {
+                    for j in 0..3 {
+                        hess[i][j] = (gp[j] - gm[j]) / (2.0 * h[i]);
+                    }
+                }
+                _ => ok = false,
+            }
         }
-    }
+        if ok {
+            // Symmetrize: the true Hessian is symmetric, but two
+            // independent one-sided differences of a 3-vector gradient are
+            // not exactly so.
+            for &(i, j) in &[(0, 1), (0, 2), (1, 2)] {
+                let avg = 0.5 * (hess[i][j] + hess[j][i]);
+                hess[i][j] = avg;
+                hess[j][i] = avg;
+            }
+            Some(hess)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let hess = match hess {
+        Some(h) => h,
+        None => {
+            // Negative log-likelihood at a parameter vector (reusing the plan).
+            let nll = |p: &[f64; 3]| -> f64 {
+                if p[1] <= 0.0 || p[2] <= 0.0 || p[0] < 0.0 {
+                    return f64::INFINITY;
+                }
+                let model = VariogramModel {
+                    nugget: p[0],
+                    structures: vec![Structure::new(kind, p[1], p[2])],
+                };
+                match loglik_with_plan(data, &model, &plan) {
+                    Ok(ll) if ll.is_finite() => -ll,
+                    _ => f64::INFINITY,
+                }
+            };
+            let f0 = nll(&theta);
+            let mut hess = [[0.0; 3]; 3];
+            for i in 0..3 {
+                let mut tp = theta;
+                let mut tm = theta;
+                tp[i] += h[i];
+                tm[i] -= h[i];
+                hess[i][i] = (nll(&tp) - 2.0 * f0 + nll(&tm)) / (h[i] * h[i]);
+                for j in (i + 1)..3 {
+                    let mut tpp = theta;
+                    let mut tpm = theta;
+                    let mut tmp = theta;
+                    let mut tmm = theta;
+                    tpp[i] += h[i];
+                    tpp[j] += h[j];
+                    tpm[i] += h[i];
+                    tpm[j] -= h[j];
+                    tmp[i] -= h[i];
+                    tmp[j] += h[j];
+                    tmm[i] -= h[i];
+                    tmm[j] -= h[j];
+                    let v = (nll(&tpp) - nll(&tpm) - nll(&tmp) + nll(&tmm)) / (4.0 * h[i] * h[j]);
+                    hess[i][j] = v;
+                    hess[j][i] = v;
+                }
+            }
+            hess
+        }
+    };
 
     // Invert the 3x3 information matrix; SE_i = sqrt((H^{-1})_ii).
     let flat: Vec<f64> = hess.iter().flatten().copied().collect();
@@ -2168,6 +2481,101 @@ mod tests {
         );
     }
 
+    /// Reference implementation of the *previous* `vecchia_param_se`: a
+    /// fully numerical Hessian (double-differencing the raw log-likelihood),
+    /// kept only in this test to validate the new semi-analytical path
+    /// (finite-differencing the exact gradient once) against it.
+    fn nll_hessian_se_reference<const D: usize>(
+        data: &PointSet<D>,
+        model: &VariogramModel,
+        plan: &VecchiaPlan,
+    ) -> [f64; 3] {
+        let kind = model.structures[0].kind;
+        let theta = [
+            model.nugget,
+            model.structures[0].sill,
+            model.structures[0].range,
+        ];
+        let nll = |p: &[f64; 3]| -> f64 {
+            if p[1] <= 0.0 || p[2] <= 0.0 || p[0] < 0.0 {
+                return f64::INFINITY;
+            }
+            let model = VariogramModel {
+                nugget: p[0],
+                structures: vec![Structure::new(kind, p[1], p[2])],
+            };
+            match loglik_with_plan(data, &model, plan) {
+                Ok(ll) if ll.is_finite() => -ll,
+                _ => f64::INFINITY,
+            }
+        };
+        let h: [f64; 3] = std::array::from_fn(|i| (theta[i].abs() * 1e-3).max(1e-5));
+        let f0 = nll(&theta);
+        let mut hess = [[0.0; 3]; 3];
+        for i in 0..3 {
+            let mut tp = theta;
+            let mut tm = theta;
+            tp[i] += h[i];
+            tm[i] -= h[i];
+            hess[i][i] = (nll(&tp) - 2.0 * f0 + nll(&tm)) / (h[i] * h[i]);
+            for j in (i + 1)..3 {
+                let mut tpp = theta;
+                let mut tpm = theta;
+                let mut tmp = theta;
+                let mut tmm = theta;
+                tpp[i] += h[i];
+                tpp[j] += h[j];
+                tpm[i] += h[i];
+                tpm[j] -= h[j];
+                tmp[i] -= h[i];
+                tmp[j] += h[j];
+                tmm[i] -= h[i];
+                tmm[j] -= h[j];
+                let v = (nll(&tpp) - nll(&tpm) - nll(&tmp) + nll(&tmm)) / (4.0 * h[i] * h[j]);
+                hess[i][j] = v;
+                hess[j][i] = v;
+            }
+        }
+        let flat: Vec<f64> = hess.iter().flatten().copied().collect();
+        let arr = Array2::from_shape_vec((3, 3), flat).expect("3x3");
+        let lu = lu_factor(arr).expect("well-conditioned in this test");
+        std::array::from_fn(|i| {
+            let mut e = vec![0.0; 3];
+            e[i] = 1.0;
+            lu.solve(e)[i].sqrt()
+        })
+    }
+
+    #[test]
+    fn semi_analytical_se_matches_the_full_finite_difference_reference() {
+        // Validates the new gradient-based Hessian in `vecchia_param_se`
+        // (Fase 6 item #17) against the previous fully-numerical approach,
+        // on a model whose kind has closed-form gradients.
+        let data = field(80, 17);
+        let model = VariogramModel::new(0.08, vec![Structure::new(ModelKind::Matern15, 0.9, 18.0)])
+            .unwrap();
+        let plan = vecchia_plan(data.coords(), 10, None).unwrap();
+
+        let se_new = vecchia_param_se(&data, &model, 10, None).unwrap();
+        let se_ref = nll_hessian_se_reference(&data, &model, &plan);
+        for i in 0..3 {
+            if se_ref[i].is_nan() {
+                assert!(
+                    se_new[i].is_nan(),
+                    "param {i}: reference NaN, new {}",
+                    se_new[i]
+                );
+                continue;
+            }
+            assert!(
+                (se_new[i] - se_ref[i]).abs() < 1e-3 * se_ref[i].max(1.0),
+                "param {i}: semi-analytical {} vs full finite-difference {}",
+                se_new[i],
+                se_ref[i]
+            );
+        }
+    }
+
     #[test]
     fn param_se_rejects_multi_structure() {
         let data = field(20, 1);
@@ -2187,5 +2595,108 @@ mod tests {
         let data = field(4, 1);
         // Degree 2 in 2-D needs 6 basis columns -> >7 points required.
         assert!(vecchia_reml(&data, ModelKind::Exponential, 3, 2, None).is_err());
+    }
+
+    #[test]
+    fn g_and_dg_matches_finite_differences() {
+        // Cross-checks the closed-form dg/dd against central finite
+        // differences of `ModelKind::g` itself (range=1, so d=h), for every
+        // kind `loglik_grad_with_plan` claims support for.
+        let kinds = [
+            ModelKind::Spherical,
+            ModelKind::Exponential,
+            ModelKind::Gaussian,
+            ModelKind::Matern15,
+            ModelKind::Matern25,
+        ];
+        let h = 1e-6;
+        for kind in kinds {
+            for &d in &[0.1, 0.3, 0.7, 1.5, 2.5] {
+                let (g, dg) = g_and_dg(kind, d).unwrap();
+                assert!((g - kind.g(d, 1.0)).abs() < 1e-12, "{kind:?} g({d})");
+                let fd = (kind.g(d + h, 1.0) - kind.g(d - h, 1.0)) / (2.0 * h);
+                assert!(
+                    (dg - fd).abs() < 1e-5,
+                    "{kind:?} dg({d}): analytical {dg} vs finite-diff {fd}"
+                );
+            }
+        }
+        // Kinds without a closed form here must return `None`.
+        assert!(g_and_dg(ModelKind::Circular, 0.5).is_none());
+        assert!(g_and_dg(ModelKind::Stable(1.5), 0.5).is_none());
+        assert!(g_and_dg(ModelKind::Hole, 0.5).is_none());
+        assert!(g_and_dg(ModelKind::Wave, 0.5).is_none());
+        assert!(g_and_dg(ModelKind::Matern(0.8), 0.5).is_none());
+    }
+
+    #[test]
+    fn loglik_gradient_matches_finite_differences() {
+        // The critical correctness check for the whole analytical-gradient
+        // machinery: perturb each of (nugget, psill, range) by a small
+        // amount and compare against a central finite difference of the
+        // plain (gradient-free) log-likelihood.
+        let data = field(60, 11);
+        let plan = vecchia_plan(data.coords(), 8, None).unwrap();
+        for kind in [
+            ModelKind::Spherical,
+            ModelKind::Exponential,
+            ModelKind::Gaussian,
+            ModelKind::Matern15,
+            ModelKind::Matern25,
+        ] {
+            let (nugget, psill, range) = (0.05, 0.9, 22.0);
+            let (ll, grad) = loglik_grad_with_plan(&data, kind, nugget, psill, range, &plan)
+                .unwrap()
+                .unwrap();
+
+            let ll_at = |nugget: f64, psill: f64, range: f64| -> f64 {
+                let model =
+                    VariogramModel::new(nugget, vec![Structure::new(kind, psill, range)]).unwrap();
+                loglik_with_plan(&data, &model, &plan).unwrap()
+            };
+            assert!(
+                (ll - ll_at(nugget, psill, range)).abs() < 1e-9,
+                "{kind:?} loglik value"
+            );
+
+            let h_nugget = nugget * 1e-4;
+            let fd_nugget = (ll_at(nugget + h_nugget, psill, range)
+                - ll_at(nugget - h_nugget, psill, range))
+                / (2.0 * h_nugget);
+            let h_psill = psill * 1e-4;
+            let fd_psill = (ll_at(nugget, psill + h_psill, range)
+                - ll_at(nugget, psill - h_psill, range))
+                / (2.0 * h_psill);
+            let h_range = range * 1e-4;
+            let fd_range = (ll_at(nugget, psill, range + h_range)
+                - ll_at(nugget, psill, range - h_range))
+                / (2.0 * h_range);
+
+            assert!(
+                (grad[0] - fd_nugget).abs() < 1e-2 * fd_nugget.abs().max(1.0),
+                "{kind:?} d/dnugget: analytical {} vs finite-diff {fd_nugget}",
+                grad[0]
+            );
+            assert!(
+                (grad[1] - fd_psill).abs() < 1e-2 * fd_psill.abs().max(1.0),
+                "{kind:?} d/dpsill: analytical {} vs finite-diff {fd_psill}",
+                grad[1]
+            );
+            assert!(
+                (grad[2] - fd_range).abs() < 1e-2 * fd_range.abs().max(1.0),
+                "{kind:?} d/drange: analytical {} vs finite-diff {fd_range}",
+                grad[2]
+            );
+        }
+    }
+
+    #[test]
+    fn loglik_gradient_is_none_for_unsupported_kinds() {
+        let data = field(20, 2);
+        let plan = vecchia_plan(data.coords(), 5, None).unwrap();
+        assert!(loglik_grad_with_plan(&data, ModelKind::Circular, 0.1, 0.9, 20.0, &plan).is_none());
+        assert!(
+            loglik_grad_with_plan(&data, ModelKind::Stable(1.2), 0.1, 0.9, 20.0, &plan).is_none()
+        );
     }
 }
