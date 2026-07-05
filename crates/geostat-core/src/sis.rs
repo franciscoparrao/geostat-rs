@@ -771,9 +771,12 @@ pub(crate) fn order_corrections(ccdf: &mut [f64]) {
 }
 
 /// Draws a value from the corrected ccdf with intra-class linear
-/// interpolation and the configured tail models.
+/// interpolation and the configured tail models. `pub(crate)`: also used as
+/// a deterministic ccdf quantile lookup by
+/// [`crate::validation::accuracy_plot_ccdf`] (passing a fixed probability
+/// instead of a random draw for `u` is exactly the inverse-ccdf transform).
 #[allow(clippy::too_many_arguments)]
-fn sample_ccdf(
+pub(crate) fn sample_ccdf(
     ccdf: &[f64],
     cutoffs: &[f64],
     tail_min: f64,

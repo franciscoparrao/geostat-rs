@@ -56,6 +56,22 @@ Fase 6 operational-gap closing (`docs/AUDIT-2026-07-v2.md` §7).
   AUDIT-2026-07-v2.md §5.1. Full Fisher scoring, a custom `erfc`, a
   small-*x* Bessel branch, and configurable rcond/jitter policy remain
   out of scope for this pass.
+- Unified cross-validation, previously `Kriging`-only:
+  `leave_one_out_cokriging`, `leave_one_out_collocated`,
+  `leave_one_out_lognormal` (with the correct back-transformed lognormal
+  predictive variance, not just log-space variance reused verbatim), and
+  `leave_one_out_indicator` (returns an `IkCvResult` with a Ranked
+  Probability Score over the held-out ccdfs, since IK's whole point is a
+  distribution, not a point estimate RMSE-family measures assume). Also:
+  `accuracy_plot_ccdf` (Deutsch 1997's original ccdf-based formulation,
+  reusing `sis`'s ccdf-interpolation as a deterministic quantile lookup
+  instead of `accuracy_plot`'s Gaussian-interval approximation), and
+  `realization_variogram_qc` (SGS/SIS ensemble variogram-reproduction
+  check, promoting a check every simulation workflow already does
+  informally to a library API). k-fold/block CV accepting external
+  drift/measurement error, and CLI/Python exposure of the new CV
+  functions, remain out of scope for this pass (core-only, matching the
+  precedent already set for collocated cokriging/Markov-Bayes).
 
 ### Changed
 - `KrigingConfig` is now `#[non_exhaustive]` (was already the case for

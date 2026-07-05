@@ -95,8 +95,10 @@ pub use trans::{LognormalEstimate, lognormal_kriging};
 pub use transform::{NormalScore, Tails, norm_cdf};
 pub use tuning::{TuneResult, tune_idw_power, tune_knn_k, tune_kriging_neighbors};
 pub use validation::{
-    AccuracyPlot, AccuracyPoint, CvResult, accuracy_plot, block_cv, k_fold, leave_one_out,
-    leave_one_out_with_drift,
+    AccuracyPlot, AccuracyPoint, CvResult, IkCvResult, VariogramQc, VariogramQcPoint,
+    accuracy_plot, accuracy_plot_ccdf, block_cv, k_fold, leave_one_out, leave_one_out_cokriging,
+    leave_one_out_collocated, leave_one_out_indicator, leave_one_out_lognormal,
+    leave_one_out_with_drift, realization_variogram_qc,
 };
 pub use variogram::{
     Anisotropy, CloudPair, DirectionConfig, EstimatorKind, ExperimentalVariogram, FitResult,
