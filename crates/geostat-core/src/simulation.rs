@@ -161,6 +161,16 @@ fn sgs_at_with_levels<const D: usize>(
             "SGS needs a valid covariance function and cannot use the unbounded Power model".into(),
         ));
     }
+    // AUDIT-2026-07-v3.md §1.6: the dimensional guard (e.g. `Circular` is not
+    // a valid covariance in 3-D) landed in Kriging/SIS/IK/collocated but not
+    // here -- SGS with such a model used to simulate silently from a non-PD
+    // covariance instead of erroring.
+    if let Some(kind) = model_ns.invalid_structure_for_dim(D) {
+        return Err(GeostatError::InvalidParameter(format!(
+            "{kind:?} is not a valid covariance in {D} dimensions; use Spherical instead for a \
+             3-D-safe bounded structure"
+        )));
+    }
     if cfg.n_realizations == 0 {
         return Err(GeostatError::InvalidParameter(
             "n_realizations must be at least 1".into(),

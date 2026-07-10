@@ -211,11 +211,26 @@ impl<'a, const D: usize> CollocatedCokriging<'a, D> {
     /// value collocated with it. With zero primary neighbours (e.g. an
     /// empty search radius) this degenerates gracefully to simple linear
     /// regression on the secondary alone.
+    ///
+    /// The primary block is built from `sigma1^2 * rho1(h)` (`rho1` being
+    /// `model1`'s own correlogram), not `model1`'s raw covariance
+    /// (AUDIT-2026-07-v3.md §1.4): `sigma1` is a caller-supplied marginal
+    /// standard deviation (typically a sample estimate) that need not equal
+    /// `sqrt(model1.covariance_dh(0))` — mixing the two scales (as the raw
+    /// covariance did) makes the joint primary+secondary system PSD only by
+    /// accident (`rho12^2 * sigma1^2 <= model1.covariance_dh(0)`), and
+    /// violating it produces negative "variance" silently clamped to zero
+    /// (false certainty from what is really a plain regression on the
+    /// secondary). Standardizing throughout to sigma1^2/sigma2^2 matches
+    /// the Markov-model construction in Journel (1999): the combined
+    /// covariance is then PSD for any `|rho12| <= 1`, by the same argument
+    /// that guarantees `c12`'s cross term is a valid covariance.
     pub fn predict(&self, target: [f64; D], secondary_at_target: f64) -> Result<KrigingEstimate> {
         let nb = self.neighbors(target);
         let n = nb.len();
         let dim = n + 1;
         let c11_0 = self.model1.covariance_dh([0.0; D]);
+        let sigma1_sq = self.sigma1 * self.sigma1;
         let c22_0 = self.sigma2 * self.sigma2;
         let c12_0 = self.rho12 * self.sigma1 * self.sigma2;
 
@@ -224,16 +239,16 @@ impl<'a, const D: usize> CollocatedCokriging<'a, D> {
         let mut b = vec![0.0; dim];
         for (ii, &i) in nb.iter().enumerate() {
             let pi = coords[i];
-            a[[ii, ii]] = c11_0 + self.config.ridge;
+            a[[ii, ii]] = sigma1_sq + self.config.ridge;
             for (jj, &j) in nb.iter().enumerate().skip(ii + 1) {
-                let c = self.model1.covariance_dh(sep(pi, coords[j]));
+                let c = sigma1_sq * (self.model1.covariance_dh(sep(pi, coords[j])) / c11_0);
                 a[[ii, jj]] = c;
                 a[[jj, ii]] = c;
             }
             let c1s = self.c12(sep(pi, target));
             a[[ii, n]] = c1s;
             a[[n, ii]] = c1s;
-            b[ii] = self.model1.covariance_dh(sep(pi, target));
+            b[ii] = sigma1_sq * (self.model1.covariance_dh(sep(pi, target)) / c11_0);
         }
         a[[n, n]] = c22_0 + self.config.ridge;
         b[n] = c12_0;
@@ -246,7 +261,7 @@ impl<'a, const D: usize> CollocatedCokriging<'a, D> {
             value += w[ii] * (values[i] - self.mean1);
             reduction += w[ii] * b[ii];
         }
-        let variance = (c11_0 - reduction).max(0.0);
+        let variance = (sigma1_sq - reduction).max(0.0);
         Ok(KrigingEstimate {
             value,
             variance,
@@ -599,6 +614,78 @@ mod tests {
         assert!((rho12 - (-0.8)).abs() < 0.05, "rho12 {rho12}");
         assert!((sigma1 - 3.0).abs() < 0.3, "sigma1 {sigma1}");
         assert!((sigma2 - 1.5).abs() < 0.15, "sigma2 {sigma2}");
+    }
+
+    #[test]
+    fn predict_variance_matches_conditional_gaussian_formula_with_no_primary_neighbours() {
+        // AUDIT-2026-07-v3.md §1.4: with the primary neighbourhood empty,
+        // `predict` degenerates to plain regression on the secondary, whose
+        // exact conditional variance is `sigma1^2 * (1 - rho12^2)`
+        // (bivariate normal conditioning) -- always non-negative for
+        // `|rho12| <= 1`. Before standardizing the primary block to
+        // `sigma1^2` (instead of `model1`'s own, generally different,
+        // `C1(0)`), this could be deeply negative (the audit found -6.29
+        // with these exact rho12=0.9/sigma1=3/sigma2=7 values, sill=1.0)
+        // and got clamped to a false-certainty 0.
+        let data = primary();
+        let m = model1(); // sill = 1.0
+        for &(rho12, sigma1, sigma2) in &[(0.9, 3.0, 7.0), (0.4, 3.0, 7.0), (-0.7, 5.0, 2.0)] {
+            let cck = CollocatedCokriging::new(
+                &data,
+                &m,
+                data.mean(),
+                0.0,
+                rho12,
+                sigma1,
+                sigma2,
+                MarkovModel::Mm1,
+                CollocatedConfig {
+                    max_neighbors: Some(0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let est = cck.predict([3.0, 4.0], 1.0).unwrap();
+            let expected = sigma1 * sigma1 * (1.0 - rho12 * rho12);
+            assert!(
+                (est.variance - expected).abs() < 1e-9,
+                "rho12={rho12} sigma1={sigma1}: variance {} vs expected {expected}",
+                est.variance
+            );
+        }
+    }
+
+    #[test]
+    fn predict_variance_stays_bounded_with_mismatched_sigma_and_primary_neighbours() {
+        // Same mismatch (sigma1 != sqrt(model1's C1(0))) but with a real
+        // primary neighbourhood: the standardized system must still keep
+        // 0 <= variance <= sigma1^2 for any valid rho12, not just the
+        // empty-neighbourhood closed-form case above.
+        let data = primary();
+        let m = model1();
+        for &(rho12, sigma1, sigma2) in &[(0.9, 3.0, 7.0), (-0.6, 4.0, 0.5)] {
+            let cck = CollocatedCokriging::new(
+                &data,
+                &m,
+                data.mean(),
+                0.0,
+                rho12,
+                sigma1,
+                sigma2,
+                MarkovModel::Mm1,
+                CollocatedConfig::default(),
+            )
+            .unwrap();
+            for &target in &[[3.0, 4.0], [7.0, 2.0], [-1.0, -1.0]] {
+                let est = cck.predict(target, 1.0).unwrap();
+                assert!(
+                    (0.0..=sigma1 * sigma1 + 1e-9).contains(&est.variance),
+                    "rho12={rho12} sigma1={sigma1} target={target:?}: variance {} out of [0, {}]",
+                    est.variance,
+                    sigma1 * sigma1
+                );
+            }
+        }
     }
 
     #[test]

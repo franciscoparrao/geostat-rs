@@ -2,10 +2,11 @@
 //! `PointSet<3>` — same code paths as 2-D via const generics.
 
 use geostat_core::{
-    CollocatedCokriging, CollocatedConfig, Grid3D, IkConfig, Kriging, KrigingConfig, KrigingMethod,
-    MarkovModel, ModelKind, PointSet, Rng, SgsConfig, SisConfig, Structure, VariogramConfig,
-    VariogramModel, experimental_variogram, fit_best, indicator_kriging, leave_one_out,
-    sequential_indicator_simulation_3d, sgs_at, sis_at, vecchia_loglik, vecchia_predict,
+    CoKriging, CoKrigingConfig, CollocatedCokriging, CollocatedConfig, Grid3D, IkConfig, Kriging,
+    KrigingConfig, KrigingMethod, Lmc, LmcStructure, MarkovModel, ModelKind, PointSet, Rng,
+    SgsConfig, SisConfig, Structure, VariogramConfig, VariogramModel, experimental_variogram,
+    fit_best, indicator_kriging, leave_one_out, sequential_indicator_simulation_3d, sgs_at,
+    sis_at, vecchia_loglik, vecchia_mle, vecchia_mle_grouped, vecchia_predict, vecchia_reml,
 };
 
 fn synthetic_3d(n: usize, seed: u64) -> PointSet<3> {
@@ -372,4 +373,64 @@ fn collocated_3d_rejects_circular_model() {
         )
         .is_err()
     );
+}
+
+// AUDIT-2026-07-v3.md §1.6: the dimensional guard reached Kriging/SIS/IK/
+// collocated (above) and the model-based Vecchia entry points
+// (`vecchia_3d_rejects_circular_model`), but not SGS, `CoKriging`/`Lmc`, or
+// the by-`kind` Vecchia MLE/REML entry points -- SGS used to simulate
+// silently from a non-PD covariance, and the by-kind Vecchia fits just
+// landed on the optimizer's penalty value without erroring.
+
+#[test]
+fn sgs_3d_rejects_circular_model() {
+    let data = synthetic_3d(30, 3);
+    let cfg = SgsConfig::default();
+    assert!(sgs_at(&data, &circular_model_3d(), &[[1.0, 1.0, 1.0]], &cfg).is_err());
+}
+
+#[test]
+fn cokriging_3d_rejects_circular_model() {
+    let primary = synthetic_3d(15, 4);
+    let secondary = synthetic_3d(15, 5);
+    let lmc = Lmc::new(
+        vec![vec![0.05, 0.0], vec![0.0, 0.05]],
+        vec![LmcStructure {
+            kind: ModelKind::Circular,
+            range: 30.0,
+            anis: None,
+            sills: vec![vec![1.0, 0.5], vec![0.5, 1.0]],
+        }],
+    )
+    .unwrap();
+    assert!(CoKriging::<3>::new(vec![&primary, &secondary], &lmc, CoKrigingConfig::default()).is_err());
+}
+
+#[test]
+fn cokriging_3d_accepts_spherical_lmc() {
+    // Regression guard: the new dimensional check must not over-reject a
+    // structure that is actually valid in 3-D.
+    let primary = synthetic_3d(15, 4);
+    let secondary = synthetic_3d(15, 5);
+    let lmc = Lmc::new(
+        vec![vec![0.05, 0.0], vec![0.0, 0.05]],
+        vec![LmcStructure {
+            kind: ModelKind::Spherical,
+            range: 30.0,
+            anis: None,
+            sills: vec![vec![1.0, 0.5], vec![0.5, 1.0]],
+        }],
+    )
+    .unwrap();
+    assert!(CoKriging::<3>::new(vec![&primary, &secondary], &lmc, CoKrigingConfig::default()).is_ok());
+}
+
+#[test]
+fn vecchia_mle_3d_rejects_circular_kind() {
+    let data = synthetic_3d(30, 3);
+    assert!(vecchia_mle(&data, ModelKind::Circular, 10, None).is_err());
+    assert!(vecchia_mle_grouped(&data, ModelKind::Circular, 10, None, 4).is_err());
+    assert!(vecchia_reml(&data, ModelKind::Circular, 10, 0, None).is_err());
+    // Regression guard: a kind that is valid in 3-D must still fit fine.
+    assert!(vecchia_mle(&data, ModelKind::Spherical, 10, None).is_ok());
 }

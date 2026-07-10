@@ -562,6 +562,13 @@ impl RasterGrid {
     /// `grid-value-is-center`). Returns `None` outside the extent or on a
     /// no-data cell, so it can feed covariates straight into kriging.
     pub fn sample(&self, x: f64, y: f64) -> Option<f64> {
+        // `read_raster` validates `nx, ny >= 1` before ever constructing a
+        // `RasterGrid` (the only constructor); this guard just stops a
+        // `self.nx - 1` underflow-panic from becoming reachable if that
+        // ever changes, instead of silently trusting the invariant.
+        if self.nx == 0 || self.ny == 0 {
+            return None;
+        }
         let [min_x, min_y, max_x, max_y] = self.bbox;
         if x < min_x || x > max_x || y < min_y || y > max_y {
             return None;
@@ -654,9 +661,42 @@ pub fn read_raster(path: &Path, layer: Option<&str>) -> Result<RasterGrid> {
         rusqlite::params![name],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
     )?;
+    // AUDIT-2026-07-v3.md §1.12: `matrix_width`/`matrix_height`/
+    // `tile_width`/`tile_height` come straight from the file. A negative
+    // value wraps to a huge `usize` on cast, and an unchecked product can
+    // silently overflow -- either way `vec![f64::NAN; nx*ny]` below then
+    // tries to allocate an astronomical amount of memory (an OOM abort, not
+    // a catchable error) for a corrupt or hostile `.gpkg`. Cap each
+    // dimension to a generous but finite bound and use checked arithmetic
+    // for the products.
+    const MAX_TILE_DIM: i64 = 1 << 16; // 65536: far beyond any real tile matrix/size
+    const MAX_RASTER_CELLS: usize = 1 << 28; // 268,435,456 cells (~2 GiB as f64)
+    for (label, v) in [
+        ("matrix_width", mw),
+        ("matrix_height", mh),
+        ("tile_width", tw),
+        ("tile_height", th),
+    ] {
+        if !(1..=MAX_TILE_DIM).contains(&v) {
+            bail!("coverage '{name}': {label} = {v} is out of the expected range [1, {MAX_TILE_DIM}]");
+        }
+    }
     let (mw, mh, tw, th) = (mw as usize, mh as usize, tw as usize, th as usize);
-    let nx = mw * tw;
-    let ny = mh * th;
+    let nx = mw
+        .checked_mul(tw)
+        .with_context(|| format!("coverage '{name}': matrix_width * tile_width overflows"))?;
+    let ny = mh
+        .checked_mul(th)
+        .with_context(|| format!("coverage '{name}': matrix_height * tile_height overflows"))?;
+    nx.checked_mul(ny)
+        .filter(|&total| total <= MAX_RASTER_CELLS)
+        .with_context(|| {
+            format!(
+                "coverage '{name}': raster is {nx}x{ny} ({} cells), exceeding the \
+                 {MAX_RASTER_CELLS}-cell sanity limit",
+                nx.saturating_mul(ny)
+            )
+        })?;
 
     // Mosaic the tiles into a north-up image, then flip rows into grid order.
     let mut img = vec![f64::NAN; nx * ny];
@@ -789,13 +829,26 @@ pub fn decode_point(blob: &[u8]) -> Result<(f64, f64)> {
         bail!("WKB too short for a point");
     }
     let le = wkb[0] == 1;
+    let raw_type = rd_u32(&wkb[1..5], le);
     // Base geometry type, robust to ISO Z/M (1001, 2001, 3001) and EWKB flags.
-    let base = (rd_u32(&wkb[1..5], le) & 0x1FFF_FFFF) % 1000;
+    let base = (raw_type & 0x1FFF_FFFF) % 1000;
     if base != 1 {
         bail!("geometry is not a POINT (WKB base type {base})");
     }
-    let x = rd_f64(&wkb[5..13], le);
-    let y = rd_f64(&wkb[13..21], le);
+    // AUDIT-2026-07-v3.md §1.13: EWKB (PostGIS's WKB variant) sets bit
+    // 0x20000000 on the type and inserts a 4-byte SRID between it and the
+    // coordinates. Every code path here already tolerated the EWKB Z/M
+    // flags on `raw_type` (that's what `& 0x1FFF_FFFF` is for), but not
+    // this one -- reading coordinates at the fixed offset 5 silently
+    // decoded the SRID as half of X instead, producing a bogus point with
+    // no error. GDAL/QGIS write ISO WKB (this flag unset) here, so this is
+    // a defensive skip for a spec-legal encoding, not the common case.
+    let coord_start = if raw_type & 0x2000_0000 != 0 { 9 } else { 5 };
+    if wkb.len() < coord_start + 16 {
+        bail!("WKB too short for a point");
+    }
+    let x = rd_f64(&wkb[coord_start..coord_start + 8], le);
+    let y = rd_f64(&wkb[coord_start + 8..coord_start + 16], le);
     Ok((x, y))
 }
 
@@ -839,6 +892,22 @@ mod tests {
     #[test]
     fn rejects_non_gpb() {
         assert!(decode_point(b"not a blob at all").is_err());
+    }
+
+    #[test]
+    fn decodes_ewkb_point_with_srid_flag() {
+        // AUDIT-2026-07-v3.md §1.13: EWKB sets bit 0x20000000 on the WKB
+        // type and inserts a 4-byte SRID before the coordinates. Before this
+        // fix, `decode_point` always read coordinates at the fixed offset 5,
+        // decoding this SRID as (garbage) half of X with no error.
+        let mut b = vec![b'G', b'P', 0x00, 0x01]; // GPB header, no envelope
+        b.extend_from_slice(&4326i32.to_le_bytes());
+        b.push(0x01); // WKB byte order: little-endian
+        b.extend_from_slice(&(1u32 | 0x2000_0000).to_le_bytes()); // EWKB Point + SRID flag
+        b.extend_from_slice(&4326i32.to_le_bytes()); // EWKB SRID
+        b.extend_from_slice(&123.5f64.to_le_bytes());
+        b.extend_from_slice(&(-45.25f64).to_le_bytes());
+        assert_eq!(decode_point(&b).unwrap(), (123.5, -45.25));
     }
 
     #[test]
@@ -979,6 +1048,46 @@ mod tests {
         // Cell index 7 is (ix=2, iy=1); centre it and expect no-data -> None.
         let nd = g.sample(bbox[0] + 2.5 * px, bbox[1] + 1.5 * py);
         assert!(nd.is_none(), "no-data cell must sample to None, got {nd:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_raster_rejects_corrupt_tile_matrix_dimensions_instead_of_oom_or_panicking() {
+        // AUDIT-2026-07-v3.md §1.12: `matrix_width`/`matrix_height`/
+        // `tile_width`/`tile_height` come straight from the file with no
+        // validation before this fix -- a negative value wraps to a huge
+        // `usize` on cast, and `vec![f64::NAN; nx*ny]` then tries an
+        // astronomical allocation (an OOM abort, not a catchable error).
+        let path = std::env::temp_dir().join("geostat_rs_raster_corrupt_dims.gpkg");
+        let _ = std::fs::remove_file(&path);
+        let (nx, ny) = (3, 3);
+        let values: Vec<f64> = (0..nx * ny).map(|i| i as f64).collect();
+        write_raster(&path, "dem", 32719, nx, ny, [0.0, 0.0, 30.0, 30.0], &values).unwrap();
+
+        for (col, bad) in [("matrix_width", -1i64), ("tile_width", i64::MAX)] {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                &format!("UPDATE gpkg_tile_matrix SET {col} = ?1 WHERE table_name = 'dem'"),
+                rusqlite::params![bad],
+            )
+            .unwrap();
+            drop(conn);
+
+            let err = read_raster(&path, None);
+            assert!(
+                err.is_err(),
+                "{col} = {bad} should be rejected, not silently accepted"
+            );
+
+            // Restore for the next iteration.
+            let conn = Connection::open(&path).unwrap();
+            let restore = if col == "matrix_width" { 1 } else { nx as i64 };
+            conn.execute(
+                &format!("UPDATE gpkg_tile_matrix SET {col} = ?1 WHERE table_name = 'dem'"),
+                rusqlite::params![restore],
+            )
+            .unwrap();
+        }
         let _ = std::fs::remove_file(&path);
     }
 

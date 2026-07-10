@@ -247,6 +247,21 @@ impl<'a, const D: usize> CoKriging<'a, D> {
                 "max_neighbors must be at least 1".into(),
             ));
         }
+        // AUDIT-2026-07-v3.md §1.6: `Lmc::new` rejects Power but, unlike
+        // Kriging/SIS/IK/collocated, has no way to know `D` (it isn't
+        // generic over it) -- so a dimensionally invalid structure (e.g.
+        // `Circular` in 3-D) only surfaces here, where `D` is known.
+        if let Some(kind) = lmc
+            .structures
+            .iter()
+            .map(|st| st.kind)
+            .find(|k| !k.valid_in_dim(D))
+        {
+            return Err(GeostatError::InvalidParameter(format!(
+                "{kind:?} is not a valid covariance in {D} dimensions; use Spherical instead for \
+                 a 3-D-safe bounded structure"
+            )));
+        }
         if let Some(r) = config.search_radius
             && !(r > 0.0)
         {

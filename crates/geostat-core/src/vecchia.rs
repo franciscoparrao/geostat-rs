@@ -71,6 +71,24 @@ fn reject_power_kind(kind: ModelKind) -> Result<()> {
     Ok(())
 }
 
+/// Like [`reject_invalid_dim_model`], but for the by-`kind` MLE/REML entry
+/// points, which pick their own sill/range/nugget and so only carry a
+/// [`ModelKind`], not a full [`VariogramModel`].
+///
+/// AUDIT-2026-07-v3.md §1.6: without this, `vecchia_mle::<3>(_, Circular,
+/// ..)` doesn't error -- most Nelder-Mead evaluations just land on the
+/// `1e12` penalty for a non-PD covariance and the search returns its own
+/// starting point as the "fit", silently.
+fn reject_invalid_dim_kind<const D: usize>(kind: ModelKind) -> Result<()> {
+    if !kind.valid_in_dim(D) {
+        return Err(GeostatError::InvalidParameter(format!(
+            "{kind:?} is not a valid covariance in {D} dimensions; use Spherical instead for a \
+             3-D-safe bounded structure"
+        )));
+    }
+    Ok(())
+}
+
 /// Squared Euclidean distance between two points.
 fn dist2<const D: usize>(a: &[f64; D], b: &[f64; D]) -> f64 {
     let mut s = 0.0;
@@ -491,7 +509,17 @@ fn loglik_grad_inner<const D: usize>(
 
         let mu: f64 = w.iter().zip(nb).map(|(&wj, &j)| wj * z[j]).sum();
         let reduction: f64 = w.iter().zip(&ki).map(|(&wj, &kj)| wj * kj).sum();
-        let var = (sill - reduction).max(1e-12);
+        let raw_var = sill - reduction;
+        let var = raw_var.max(1e-12);
+        // AUDIT-2026-07-v3.md §1.7: when the clamp is active (near-singular
+        // neighbourhood), the objective the optimizer actually evaluates
+        // (`var`, floored) is locally constant in every parameter, so its
+        // true derivative is 0 -- not `dsill_dp - dreduction`, which is the
+        // derivative of the *unclamped* `raw_var`. Propagating the latter
+        // fed BFGS a curvature that didn't match the function it was
+        // extremizing, right where near-singularity already makes the fit
+        // fragile.
+        let clamped = raw_var <= 1e-12;
         let r = z[i] - mu;
         loglik += -0.5 * ((2.0 * PI).ln() + var.ln() + r * r / var);
 
@@ -521,7 +549,11 @@ fn loglik_grad_inner<const D: usize>(
                     .zip(dki_dp)
                     .map(|(&wj, &dkj)| wj * dkj)
                     .sum::<f64>();
-            let dvar = dsill_dp - dreduction;
+            let dvar = if clamped {
+                0.0
+            } else {
+                dsill_dp - dreduction
+            };
             -0.5 * dvar / var + r * dmu / var + 0.5 * r * r / (var * var) * dvar
         };
 
@@ -893,6 +925,7 @@ pub fn vecchia_mle<const D: usize>(
     order: Option<&[usize]>,
 ) -> Result<VecchiaFit> {
     reject_power_kind(kind)?;
+    reject_invalid_dim_kind::<D>(kind)?;
     let plan = vecchia_plan(data.coords(), m, order)?;
     mle_fit_with_plan(data, kind, &plan, 1)
 }
@@ -911,6 +944,7 @@ pub fn vecchia_mle_grouped<const D: usize>(
     group_size: usize,
 ) -> Result<VecchiaFit> {
     reject_power_kind(kind)?;
+    reject_invalid_dim_kind::<D>(kind)?;
     let plan = vecchia_plan(data.coords(), m, order)?;
     mle_fit_with_plan(data, kind, &plan, group_size)
 }
@@ -1022,6 +1056,20 @@ fn mle_fit_with_plan<const D: usize>(
     } else {
         nelder_mead_multistart(objective, &starts, 0.3, 2000)
     };
+    // AUDIT-2026-07-v3.md §1.9: `neg_ll` only ever reaches the objective's
+    // own `1e12` sentinel when every evaluated point across every start
+    // was singular/degenerate for the optimizer's entire iteration budget
+    // -- total failure, not a plausible fit. Without this check,
+    // `VariogramModel::new` below happily built a "fit" from whatever
+    // starting point the optimizer never moved away from, silently
+    // reporting it as a converged optimum.
+    if neg_ll >= 1e12 {
+        return Err(GeostatError::SingularSystem(
+            "Vecchia MLE did not converge to a feasible fit: every starting point stayed on a \
+             singular/degenerate covariance (try a different `m`, ordering, or model kind)"
+                .into(),
+        ));
+    }
     let model = VariogramModel::new(
         xb[0] * xb[0],
         vec![Structure::new(kind, xb[1].exp(), xb[2].exp())],
@@ -1417,6 +1465,7 @@ pub fn vecchia_reml<const D: usize>(
     order: Option<&[usize]>,
 ) -> Result<VecchiaFit> {
     reject_power_kind(kind)?;
+    reject_invalid_dim_kind::<D>(kind)?;
     let plan = vecchia_plan(data.coords(), m, order)?;
     let basis = poly_basis(data.coords(), drift_degree);
     reml_fit_with_basis(data, kind, &plan, &basis, 1)
@@ -1435,6 +1484,7 @@ pub fn vecchia_reml_grouped<const D: usize>(
     group_size: usize,
 ) -> Result<VecchiaFit> {
     reject_power_kind(kind)?;
+    reject_invalid_dim_kind::<D>(kind)?;
     let plan = vecchia_plan(data.coords(), m, order)?;
     let basis = poly_basis(data.coords(), drift_degree);
     reml_fit_with_basis(data, kind, &plan, &basis, group_size)
@@ -1455,6 +1505,7 @@ pub fn vecchia_reml_drift<const D: usize>(
     order: Option<&[usize]>,
 ) -> Result<VecchiaFit> {
     reject_power_kind(kind)?;
+    reject_invalid_dim_kind::<D>(kind)?;
     let n = data.len();
     if drift.len() != n {
         return Err(GeostatError::DimensionMismatch(format!(
@@ -1492,6 +1543,7 @@ pub fn vecchia_reml_drift_grouped<const D: usize>(
     group_size: usize,
 ) -> Result<VecchiaFit> {
     reject_power_kind(kind)?;
+    reject_invalid_dim_kind::<D>(kind)?;
     let n = data.len();
     if drift.len() != n {
         return Err(GeostatError::DimensionMismatch(format!(
@@ -1639,20 +1691,53 @@ pub fn vecchia_param_se<const D: usize>(
     // Relative finite-difference steps.
     let h: [f64; 3] = std::array::from_fn(|i| (theta[i].abs() * 1e-3).max(1e-5));
 
+    // AUDIT-2026-07-v3.md §1.8: a nugget at (or within a finite-difference
+    // step of) the `nugget >= 0` boundary breaks the interior-point
+    // Hessian/Fisher asymptotics for *that* parameter -- not a finite-
+    // difference implementation detail to patch around. The standard
+    // remedy is to treat it as fixed and report SEs for the remaining,
+    // unconstrained parameters from the restricted (sill, range)
+    // sub-problem. The previous behavior (falling through a failed 3x3
+    // Hessian to a fully-numerical one with the same boundary problem)
+    // returned `[NaN; 3]` -- including for sill/range, which are perfectly
+    // identified and have nothing to do with the boundary; inverting the
+    // full 3x3 matrix mixes every row/column together, so a single bad row
+    // contaminates all three reported SEs.
+    if theta[0] - h[0] < 0.0 {
+        let se23 = restricted_sill_range_se(data, kind, theta, &plan);
+        return Ok([f64::NAN, se23[0], se23[1]]);
+    }
+
+    let hess = single_structure_hessian(data, kind, theta, h, &plan);
+    let se = se_from_hessian(hess.iter().flatten().copied(), 3);
+    Ok([se[0], se[1], se[2]])
+}
+
+/// Semi-analytical (or, lacking a closed-form gradient, fully numerical)
+/// Hessian of the negative Vecchia log-likelihood at `theta = [nugget,
+/// sill, range]`. Callers must ensure `theta[0] - h[0] >= 0` (see
+/// `vecchia_param_se`'s boundary handling) -- this assumes central
+/// differences are valid in every direction.
+fn single_structure_hessian<const D: usize>(
+    data: &PointSet<D>,
+    kind: ModelKind,
+    theta: [f64; 3],
+    h: [f64; 3],
+    plan: &VecchiaPlan,
+) -> [[f64; 3]; 3] {
     // Semi-analytical Hessian when `kind` has a closed-form gradient (see
     // `g_and_dg`/`loglik_grad_with_plan`, Fase 6 item #17): finite-differencing
     // the *exact* gradient once, instead of double-differencing the raw
     // log-likelihood, avoids compounding two separate finite-difference
     // truncation/rounding errors into the same estimate -- the "Hessiano por
     // diferencias finitas frágil" AUDIT-2026-07-v2.md §5.1 specifically
-    // flags. Falls back to the previous full-finite-difference Hessian
-    // (unchanged) for kinds without one.
+    // flags. Falls back to a fully-numerical Hessian for kinds without one.
     let hess = if g_and_dg(kind, 0.5).is_some() {
         let grad_nll = |p: &[f64; 3]| -> Option<[f64; 3]> {
             if p[1] <= 0.0 || p[2] <= 0.0 || p[0] < 0.0 {
                 return None;
             }
-            loglik_grad_with_plan(data, kind, p[0], p[1], p[2], &plan)?
+            loglik_grad_with_plan(data, kind, p[0], p[1], p[2], plan)?
                 .ok()
                 .map(|(_, g)| [-g[0], -g[1], -g[2]]) // gradient of the NLL
         };
@@ -1689,72 +1774,164 @@ pub fn vecchia_param_se<const D: usize>(
         None
     };
 
-    let hess = match hess {
-        Some(h) => h,
-        None => {
-            // Negative log-likelihood at a parameter vector (reusing the plan).
-            let nll = |p: &[f64; 3]| -> f64 {
-                if p[1] <= 0.0 || p[2] <= 0.0 || p[0] < 0.0 {
-                    return f64::INFINITY;
-                }
-                let model = VariogramModel {
-                    nugget: p[0],
-                    structures: vec![Structure::new(kind, p[1], p[2])],
-                };
-                match loglik_with_plan(data, &model, &plan) {
-                    Ok(ll) if ll.is_finite() => -ll,
-                    _ => f64::INFINITY,
-                }
-            };
-            let f0 = nll(&theta);
-            let mut hess = [[0.0; 3]; 3];
-            for i in 0..3 {
-                let mut tp = theta;
-                let mut tm = theta;
-                tp[i] += h[i];
-                tm[i] -= h[i];
-                hess[i][i] = (nll(&tp) - 2.0 * f0 + nll(&tm)) / (h[i] * h[i]);
-                for j in (i + 1)..3 {
-                    let mut tpp = theta;
-                    let mut tpm = theta;
-                    let mut tmp = theta;
-                    let mut tmm = theta;
-                    tpp[i] += h[i];
-                    tpp[j] += h[j];
-                    tpm[i] += h[i];
-                    tpm[j] -= h[j];
-                    tmp[i] -= h[i];
-                    tmp[j] += h[j];
-                    tmm[i] -= h[i];
-                    tmm[j] -= h[j];
-                    let v = (nll(&tpp) - nll(&tpm) - nll(&tmp) + nll(&tmm)) / (4.0 * h[i] * h[j]);
-                    hess[i][j] = v;
-                    hess[j][i] = v;
-                }
+    hess.unwrap_or_else(|| {
+        // Negative log-likelihood at a parameter vector (reusing the plan).
+        let nll = |p: &[f64; 3]| -> f64 {
+            if p[1] <= 0.0 || p[2] <= 0.0 || p[0] < 0.0 {
+                return f64::INFINITY;
             }
-            hess
+            let model = VariogramModel {
+                nugget: p[0],
+                structures: vec![Structure::new(kind, p[1], p[2])],
+            };
+            match loglik_with_plan(data, &model, plan) {
+                Ok(ll) if ll.is_finite() => -ll,
+                _ => f64::INFINITY,
+            }
+        };
+        let f0 = nll(&theta);
+        let mut hess = [[0.0; 3]; 3];
+        for i in 0..3 {
+            let mut tp = theta;
+            let mut tm = theta;
+            tp[i] += h[i];
+            tm[i] -= h[i];
+            hess[i][i] = (nll(&tp) - 2.0 * f0 + nll(&tm)) / (h[i] * h[i]);
+            for j in (i + 1)..3 {
+                let mut tpp = theta;
+                let mut tpm = theta;
+                let mut tmp = theta;
+                let mut tmm = theta;
+                tpp[i] += h[i];
+                tpp[j] += h[j];
+                tpm[i] += h[i];
+                tpm[j] -= h[j];
+                tmp[i] -= h[i];
+                tmp[j] += h[j];
+                tmm[i] -= h[i];
+                tmm[j] -= h[j];
+                let v = (nll(&tpp) - nll(&tpm) - nll(&tmp) + nll(&tmm)) / (4.0 * h[i] * h[j]);
+                hess[i][j] = v;
+                hess[j][i] = v;
+            }
         }
+        hess
+    })
+}
+
+/// SEs for `(sill, range)` alone, holding `theta[0]` (nugget) fixed --
+/// used when the nugget sits at the `>= 0` boundary, where its own
+/// Hessian row is meaningless (see `vecchia_param_se`). Central differences
+/// in `sill`/`range` are always safe: both are validated `> 0` well away
+/// from any finite-difference step by construction.
+fn restricted_sill_range_se<const D: usize>(
+    data: &PointSet<D>,
+    kind: ModelKind,
+    theta: [f64; 3],
+    plan: &VecchiaPlan,
+) -> [f64; 2] {
+    let nugget = theta[0];
+    let params = [theta[1], theta[2]];
+    let h: [f64; 2] = std::array::from_fn(|i| (params[i].abs() * 1e-3).max(1e-5));
+
+    let hess = if g_and_dg(kind, 0.5).is_some() {
+        let grad_nll = |sill: f64, range: f64| -> Option<[f64; 2]> {
+            if sill <= 0.0 || range <= 0.0 {
+                return None;
+            }
+            loglik_grad_with_plan(data, kind, nugget, sill, range, plan)?
+                .ok()
+                .map(|(_, g)| [-g[1], -g[2]])
+        };
+        let mut hess = [[0.0; 2]; 2];
+        let mut ok = true;
+        for i in 0..2 {
+            let mut tp = params;
+            let mut tm = params;
+            tp[i] += h[i];
+            tm[i] -= h[i];
+            match (grad_nll(tp[0], tp[1]), grad_nll(tm[0], tm[1])) {
+                (Some(gp), Some(gm)) => {
+                    for j in 0..2 {
+                        hess[i][j] = (gp[j] - gm[j]) / (2.0 * h[i]);
+                    }
+                }
+                _ => ok = false,
+            }
+        }
+        if ok {
+            let avg = 0.5 * (hess[0][1] + hess[1][0]);
+            hess[0][1] = avg;
+            hess[1][0] = avg;
+            Some(hess)
+        } else {
+            None
+        }
+    } else {
+        None
     };
 
-    // Invert the 3x3 information matrix; SE_i = sqrt((H^{-1})_ii).
-    let flat: Vec<f64> = hess.iter().flatten().copied().collect();
-    let arr = Array2::from_shape_vec((3, 3), flat).expect("3x3");
+    let hess = hess.unwrap_or_else(|| {
+        let nll = |sill: f64, range: f64| -> f64 {
+            if sill <= 0.0 || range <= 0.0 {
+                return f64::INFINITY;
+            }
+            let model = VariogramModel {
+                nugget,
+                structures: vec![Structure::new(kind, sill, range)],
+            };
+            match loglik_with_plan(data, &model, plan) {
+                Ok(ll) if ll.is_finite() => -ll,
+                _ => f64::INFINITY,
+            }
+        };
+        let f0 = nll(params[0], params[1]);
+        let mut hess = [[0.0; 2]; 2];
+        for i in 0..2 {
+            let mut tp = params;
+            let mut tm = params;
+            tp[i] += h[i];
+            tm[i] -= h[i];
+            hess[i][i] = (nll(tp[0], tp[1]) - 2.0 * f0 + nll(tm[0], tm[1])) / (h[i] * h[i]);
+        }
+        let (mut tpp, mut tpm, mut tmp, mut tmm) = (params, params, params, params);
+        tpp[0] += h[0];
+        tpp[1] += h[1];
+        tpm[0] += h[0];
+        tpm[1] -= h[1];
+        tmp[0] -= h[0];
+        tmp[1] += h[1];
+        tmm[0] -= h[0];
+        tmm[1] -= h[1];
+        let v = (nll(tpp[0], tpp[1]) - nll(tpm[0], tpm[1]) - nll(tmp[0], tmp[1])
+            + nll(tmm[0], tmm[1]))
+            / (4.0 * h[0] * h[1]);
+        hess[0][1] = v;
+        hess[1][0] = v;
+        hess
+    });
+
+    let se = se_from_hessian(hess.iter().flatten().copied(), 2);
+    [se[0], se[1]]
+}
+
+/// Inverts an `n x n` information matrix (given flattened, row-major) and
+/// returns `sqrt` of its diagonal -- `NaN` for a singular matrix or a
+/// non-positive diagonal entry (the asymptotic theory doesn't apply there).
+fn se_from_hessian(hess_flat: impl Iterator<Item = f64>, n: usize) -> Vec<f64> {
+    let arr = Array2::from_shape_vec((n, n), hess_flat.collect()).expect("square");
     let lu = match lu_factor(arr) {
         Ok(lu) => lu,
-        Err(_) => return Ok([f64::NAN; 3]), // singular information
+        Err(_) => return vec![f64::NAN; n],
     };
-    let mut se = [f64::NAN; 3];
-    for i in 0..3 {
-        let mut e = vec![0.0; 3];
-        e[i] = 1.0;
-        let col = lu.solve(e);
-        se[i] = if col[i] > 0.0 {
-            col[i].sqrt()
-        } else {
-            f64::NAN
-        };
-    }
-    Ok(se)
+    (0..n)
+        .map(|i| {
+            let mut e = vec![0.0; n];
+            e[i] = 1.0;
+            let col = lu.solve(e);
+            if col[i] > 0.0 { col[i].sqrt() } else { f64::NAN }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2186,6 +2363,32 @@ mod tests {
     }
 
     #[test]
+    fn mle_fit_errors_when_every_start_is_singular_instead_of_returning_a_fit() {
+        // AUDIT-2026-07-v3.md §1.9: force every objective evaluation across
+        // every multistart attempt to hit a singular K_SS -- two of a
+        // conditioning set's neighbours share the exact same location
+        // (indices 1 and 2, both neighbours of point 3), so `gamma_dh(0)==0`
+        // makes their row/column in K_SS identical (rank-deficient) for
+        // *any* (nugget, psill, range). Before this fix, `mle_fit_with_plan`
+        // silently built a "fit" from whichever starting point the
+        // optimizer never managed to move away from.
+        let data: PointSet<2> = PointSet::new(
+            vec![[0.0, 0.0], [5.0, 0.0], [5.0, 0.0], [10.0, 0.0]],
+            vec![0.1, 0.2, -0.3, 0.4],
+        )
+        .unwrap();
+        let plan = VecchiaPlan {
+            order: vec![0, 1, 2, 3],
+            neighbours: vec![vec![], vec![0], vec![0, 1], vec![1, 2]],
+        };
+        let err = mle_fit_with_plan(&data, ModelKind::Spherical, &plan, 1).unwrap_err();
+        assert!(
+            matches!(err, GeostatError::SingularSystem(_)),
+            "expected SingularSystem, got {err:?}"
+        );
+    }
+
+    #[test]
     fn vecchia_mle_matern_matches_or_beats_a_fixed_nu_fit() {
         let data = field(30, 9);
         let m = 8;
@@ -2481,6 +2684,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn param_se_stays_finite_for_sill_and_range_when_nugget_is_at_the_zero_boundary() {
+        // AUDIT-2026-07-v3.md §1.8: a model with nugget == 0 (a common fit
+        // for a smooth field) used to make the semi-analytical Hessian bail
+        // out entirely -- the backward finite-difference step along the
+        // nugget axis went negative -- and fall through to a fully-numerical
+        // Hessian with the same problem, ultimately returning `[NaN; 3]`
+        // including for sill/range, which are perfectly identified and have
+        // nothing to do with the boundary.
+        //
+        // SE theory is only meaningful evaluated at (or very near) the MLE,
+        // not at an arbitrary parameter triple -- so this draws data from
+        // the *exact* nugget-free model under test (same technique as
+        // `param_se_are_finite_and_informative`), which keeps the observed
+        // information well-conditioned for sill/range.
+        let mut rng = Rng::new(51);
+        let n = 140;
+        let coords: Vec<[f64; 2]> = (0..n)
+            .map(|_| [rng.uniform() * 60.0, rng.uniform() * 60.0])
+            .collect();
+        let truth =
+            VariogramModel::new(0.0, vec![Structure::new(ModelKind::Exponential, 1.0, 12.0)])
+                .unwrap();
+        let mut sig = vec![0.0; n * n];
+        for a in 0..n {
+            for b in 0..n {
+                sig[a * n + b] = truth.covariance_dh(sep(&coords[a], &coords[b]));
+            }
+        }
+        let l = cholesky(n, &sig);
+        let eps: Vec<f64> = (0..n).map(|_| rng.normal()).collect();
+        let values: Vec<f64> = (0..n)
+            .map(|i| (0..=i).map(|k| l[i * n + k] * eps[k]).sum())
+            .collect();
+        let data = PointSet::new(coords, values).unwrap();
+
+        let se = vecchia_param_se(&data, &truth, 12, None).unwrap();
+        assert!(se[0].is_nan(), "nugget SE should be NaN at the boundary, got {}", se[0]);
+        assert!(se[1].is_finite() && se[1] > 0.0, "sill SE {}", se[1]);
+        assert!(se[2].is_finite() && se[2] > 0.0, "range SE {}", se[2]);
+    }
+
     /// Reference implementation of the *previous* `vecchia_param_se`: a
     /// fully numerical Hessian (double-differencing the raw log-likelihood),
     /// kept only in this test to validate the new semi-analytical path
@@ -2688,6 +2933,59 @@ mod tests {
                 grad[2]
             );
         }
+    }
+
+    #[test]
+    fn gradient_zeroes_the_variance_term_when_the_kriging_variance_is_clamped() {
+        // AUDIT-2026-07-v3.md §1.7: force the variance clamp by conditioning
+        // a point on a near-duplicate (separation 1e-13, well short of the
+        // exact-bitwise-equality `vecchia_plan` rejects) with zero nugget --
+        // the true kriging variance collapses to ~3e-14, well under the
+        // `1e-12` floor both the objective (`loglik_with_plan`) and the
+        // gradient apply.
+        //
+        // A plain finite-difference check is numerically unusable *here*:
+        // the clamped point's own `r^2/var` term is ~1e12, so the ~1e-16
+        // floating-point noise between two nearby evaluations of the
+        // Cholesky-based pipeline gets amplified into ~1e-4-sized garbage --
+        // larger than the derivative being measured. So instead this uses a
+        // configuration solvable in closed form: with `nugget = 0` and a
+        // single neighbour, `w = k_i/K_SS = (1-g)` is *exactly* independent
+        // of `psill` (both scale it away), so `dmu/dpsill` is exactly 0 and
+        // the clamped point must contribute exactly 0 to `d(loglik)/dpsill`
+        // -- the total must equal the first (unconditioned, unclamped)
+        // point's plain marginal-Gaussian derivative, computable by hand.
+        // Before this fix, the clamped point's un-zeroed `dvar` (~2g, tiny
+        // but nonzero) got divided by `var^2` (~1e-24), blowing this
+        // contribution up to ~1e10 instead of 0.
+        let data: PointSet<2> =
+            PointSet::new(vec![[0.0, 0.0], [1e-13, 0.0]], vec![0.3, -0.7]).unwrap();
+        let plan = VecchiaPlan {
+            order: vec![0, 1],
+            neighbours: vec![vec![], vec![0]],
+        };
+        let (nugget, psill, range) = (0.0, 1.0, 10.0);
+        let kind = ModelKind::Spherical;
+
+        let (ll, grad) = loglik_grad_inner(&data, kind, nugget, psill, range, &plan).unwrap();
+
+        let model = VariogramModel::new(nugget, vec![Structure::new(kind, psill, range)]).unwrap();
+        assert!(
+            (ll - loglik_with_plan(&data, &model, &plan).unwrap()).abs() < 1e-9,
+            "loglik value mismatch"
+        );
+
+        // z[0] = data.values()[0] - data.mean() = 0.3 - (-0.2) = 0.5; the
+        // marginal term (point 0, no neighbours) is an exact Gaussian
+        // log-density in `sill = nugget + psill`, independent of the clamp.
+        let z0 = 0.5_f64;
+        let expected = -0.5 / (nugget + psill) + 0.5 * z0 * z0 / (nugget + psill).powi(2);
+        assert!(
+            (grad[1] - expected).abs() < 1e-9,
+            "d/dpsill under the clamp: {} vs the clamped point's exact-zero contribution \
+             implying {expected}",
+            grad[1]
+        );
     }
 
     #[test]

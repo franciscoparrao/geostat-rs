@@ -166,6 +166,57 @@ fn block_cv_and_kfold_cv_print_their_own_method_label() {
 }
 
 #[test]
+fn krige_rejects_targets_in_plain_2d_mode_and_raster_with_a_non_gpkg_output() {
+    // AUDIT-2026-07-v3.md §1.14: plain 2-D `krige` used to silently ignore
+    // `--targets` (kriging the default grid instead of the requested
+    // points) and `--raster` with a non-.gpkg output (writing a point CSV
+    // instead of the requested raster), with no indication either flag was
+    // dropped.
+    let data = temp_path("fixture_targets_raster.csv");
+    let model = temp_path("model_targets_raster.json");
+    let targets = temp_path("targets.csv");
+    write_fixture(&data);
+    std::fs::write(&targets, "x,y\n10.0,10.0\n20.0,20.0\n").unwrap();
+
+    let out = run(geostat()
+        .args(["variogram", "-i"])
+        .arg(&data)
+        .args(["--value-col", "z", "--fit", "best", "--model-out"])
+        .arg(&model));
+    assert_success(&out, "variogram (for targets/raster fixture)");
+
+    let out = run(geostat()
+        .args(["krige", "-i"])
+        .arg(&data)
+        .args(["--value-col", "z", "-m"])
+        .arg(&model)
+        .args(["--targets"])
+        .arg(&targets)
+        .args(["-o"])
+        .arg(temp_path("should_not_be_written.csv")));
+    assert!(
+        !out.status.success(),
+        "--targets in plain 2-D mode should be rejected, not silently ignored"
+    );
+
+    let out = run(geostat()
+        .args(["krige", "-i"])
+        .arg(&data)
+        .args(["--value-col", "z", "-m"])
+        .arg(&model)
+        .args(["--raster", "--nx", "5", "--ny", "5", "-o"])
+        .arg(temp_path("should_not_be_written.csv")));
+    assert!(
+        !out.status.success(),
+        "--raster with a non-.gpkg output should be rejected, not silently dropped"
+    );
+
+    for p in [&data, &model, &targets] {
+        std::fs::remove_file(p).ok();
+    }
+}
+
+#[test]
 fn robust_estimator_flag_changes_the_reported_gamma() {
     // AUDIT-2026-07-v2.md §4/§7 Fase 6 item #16: robust estimators
     // (Cressie-Hawkins/Dowd/madogram) previously had no CLI surface at all.
@@ -204,6 +255,46 @@ fn robust_estimator_flag_changes_the_reported_gamma() {
         "bogus",
     ]));
     assert!(!bad.status.success());
+
+    std::fs::remove_file(&data).ok();
+}
+
+#[test]
+fn madogram_with_fit_is_rejected_but_madogram_alone_and_matheron_fit_still_work() {
+    // AUDIT-2026-07-v3.md §1.11: the madogram is on a different (non-
+    // quadratic) scale than gamma -- fitting it directly used to silently
+    // distort the kriging model's sill/nugget/shape with no warning.
+    let data = temp_path("fixture_madogram.csv");
+    write_fixture(&data);
+
+    let madogram_fit = run(geostat().args(["variogram", "-i"]).arg(&data).args([
+        "--value-col",
+        "z",
+        "--estimator",
+        "madogram",
+        "--fit",
+        "best",
+    ]));
+    assert!(
+        !madogram_fit.status.success(),
+        "--estimator madogram --fit best should be rejected"
+    );
+
+    let madogram_alone = run(geostat().args(["variogram", "-i"]).arg(&data).args([
+        "--value-col",
+        "z",
+        "--estimator",
+        "madogram",
+    ]));
+    assert_success(&madogram_alone, "variogram --estimator madogram (no --fit)");
+
+    let matheron_fit = run(geostat().args(["variogram", "-i"]).arg(&data).args([
+        "--value-col",
+        "z",
+        "--fit",
+        "spherical",
+    ]));
+    assert_success(&matheron_fit, "variogram --fit spherical (default estimator)");
 
     std::fs::remove_file(&data).ok();
 }

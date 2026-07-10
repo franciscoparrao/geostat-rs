@@ -128,19 +128,60 @@ pub(crate) struct BucketGrid<const D: usize = 2> {
 impl<const D: usize> BucketGrid<D> {
     /// Grid covering `[min, max]`, sized for ~1 point per bucket at
     /// `expected` total insertions.
+    ///
+    /// Dimensions with ~zero extent (all points share that coordinate —
+    /// e.g. a transect, or 3-D data from a single bench) are excluded from
+    /// the cell-size computation and get exactly one bucket along that
+    /// axis. Including them would force `cell` to be tiny (derived from an
+    /// ~zero volume), blowing up the bucket count in the *other*
+    /// dimensions to an unallocatable size.
     pub fn new(min: [f64; D], max: [f64; D], expected: usize) -> Self {
+        let extents: [f64; D] = std::array::from_fn(|d| max[d] - min[d]);
+        let max_extent = extents.iter().copied().fold(0.0_f64, f64::max);
+        let tol = max_extent * 1e-9;
+        let active: [bool; D] = std::array::from_fn(|d| extents[d] > tol);
+        let n_active = active.iter().filter(|&&a| a).count().max(1);
+
         let mut volume = 1.0_f64;
         for d in 0..D {
-            volume *= (max[d] - min[d]).max(f64::MIN_POSITIVE);
+            if active[d] {
+                volume *= extents[d];
+            }
         }
-        let cell = volume.powf(1.0 / D as f64).max(1e-12)
-            * (1.0 / (expected.max(1) as f64).powf(1.0 / D as f64));
+        let mut cell = volume.powf(1.0 / n_active as f64).max(1e-12)
+            * (1.0 / (expected.max(1) as f64).powf(1.0 / n_active as f64));
+
+        // Defensive cap: however `cell` was derived, never materialize more
+        // than a small multiple of the expected point count worth of
+        // buckets — double `cell` until the (possibly overflow-checked)
+        // total fits.
+        let cap = expected.max(1).saturating_mul(4).max(64);
         let mut n = [1usize; D];
+        loop {
+            let mut total = 1usize;
+            let mut overflowed = false;
+            for d in 0..D {
+                n[d] = if active[d] {
+                    ((extents[d] / cell).ceil() as usize).max(1)
+                } else {
+                    1
+                };
+                total = match total.checked_mul(n[d]) {
+                    Some(t) => t,
+                    None => {
+                        overflowed = true;
+                        break;
+                    }
+                };
+            }
+            if !overflowed && total <= cap {
+                break;
+            }
+            cell *= 2.0;
+        }
+
         let mut strides = [1usize; D];
         let mut total = 1usize;
-        for d in 0..D {
-            n[d] = (((max[d] - min[d]) / cell).ceil() as usize).max(1);
-        }
         for d in 0..D {
             strides[d] = total;
             total *= n[d];
@@ -363,5 +404,43 @@ mod tests {
         let tree = KdTree::build(&[[1.0, 1.0]]);
         assert_eq!(tree.k_nearest([0.0, 0.0], 5, None), vec![0]);
         assert!(tree.k_nearest([0.0, 0.0], 5, Some(0.5)).is_empty());
+    }
+
+    /// Regression: a collinear point set (zero extent on one axis) used to
+    /// force `cell` to ~1e-160 and blow up the bucket count to an
+    /// unallocatable size (OOM abort). See AUDIT-2026-07-v3.md §1.1.
+    #[test]
+    fn collinear_points_do_not_blow_up_bucket_count() {
+        let grid = BucketGrid::new([0.0, 5.0], [500.0, 5.0], 50);
+        assert_eq!(grid.n, [50, 1]);
+
+        let mut inserted: Vec<[f64; 2]> = Vec::new();
+        let mut rng = Rng::new(1);
+        let mut grid = grid;
+        for i in 0..50u32 {
+            let p = [i as f64 * 10.0, 5.0];
+            grid.insert(p);
+            inserted.push(p);
+        }
+        let t = [rng.uniform() * 500.0, 5.0];
+        let a = grid.k_nearest(t, 5, None);
+        let b = k_nearest_brute(&inserted, t, 5, None);
+        assert_eq!(a, b);
+    }
+
+    /// Same failure mode in 3-D: a single-bench dataset with constant z.
+    #[test]
+    fn collinear_points_3d_do_not_blow_up_bucket_count() {
+        let grid = BucketGrid::<3>::new([0.0, 0.0, 5.0], [500.0, 500.0, 5.0], 100);
+        assert_eq!(grid.n[2], 1);
+        assert!(grid.n[0] * grid.n[1] * grid.n[2] <= 4 * 100);
+    }
+
+    /// An all-coincident point set (every axis degenerate) must still
+    /// produce a valid single-bucket grid, not a division that blows up.
+    #[test]
+    fn all_coincident_points_single_bucket() {
+        let grid = BucketGrid::new([3.0, 3.0], [3.0, 3.0], 10);
+        assert_eq!(grid.n, [1, 1]);
     }
 }

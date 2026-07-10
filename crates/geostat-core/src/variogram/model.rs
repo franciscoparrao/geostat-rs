@@ -8,13 +8,17 @@ use super::bessel;
 use crate::error::{GeostatError, Result};
 
 /// Upper bound accepted for [`ModelKind::Matern`]'s `nu` (see
-/// [`VariogramModel::new`]'s validation and AUDIT-2026-07-v2.md §1.8):
-/// `bessel::gamma` overflows to `inf` around `nu ~ 171.6`, past which the
-/// correlation silently evaluates to NaN. This cap keeps a wide safety
-/// margin below that, comfortably inside the quadrature's well-validated
-/// range and well past the point where Matern becomes indistinguishable
-/// from Gaussian in f64.
-pub const MATERN_NU_MAX: f64 = 50.0;
+/// [`VariogramModel::new`]'s validation, AUDIT-2026-07-v2.md §1.8 and
+/// AUDIT-2026-07-v3.md §1.3): `bessel::gamma` overflows to `inf` around
+/// `nu ~ 171.6`, past which the correlation silently evaluates to NaN — but
+/// the binding constraint is tighter than that. `bessel::bessel_k`'s
+/// quadrature is only validated against R's `besselK` for `nu <= 15`; past
+/// that, the correlation can exceed 1 at short lags (observed `gamma < 0`,
+/// i.e. `C(h) > C(0)`, for `nu` as low as ~20-40 depending on `h/range`),
+/// which is a non-PD covariance silently fed to Cholesky. The cap is set to
+/// the quadrature's validated range itself, not a margin below the Gamma
+/// overflow point.
+pub const MATERN_NU_MAX: f64 = 15.0;
 
 /// Supported variogram model families.
 ///
@@ -143,7 +147,13 @@ impl ModelKind {
                     let corr = 2f64.powf(1.0 - nu) / bessel::gamma(nu)
                         * s.powf(nu)
                         * bessel::bessel_k(nu, s);
-                    1.0 - corr
+                    // The Bessel-K quadrature (AUDIT-2026-07-v3.md §1.3) has
+                    // ~2e-8 relative error; a true Matern correlation is
+                    // always in (0, 1], so clamping absorbs that error
+                    // instead of letting `corr` drift past 1 and turn
+                    // `gamma` negative (a non-PD covariance fed silently to
+                    // Cholesky elsewhere).
+                    1.0 - corr.clamp(0.0, 1.0)
                 }
             }
             ModelKind::Circular => {
@@ -356,6 +366,39 @@ impl Anisotropy {
         out
     }
 
+    /// Rejects non-finite or non-positive `ratio`/`ratio_z`, and non-finite
+    /// angles -- the same guard [`VariogramModel::new`] applies to every
+    /// structure's anisotropy, needed wherever an `Anisotropy` is accepted
+    /// standalone (e.g. [`KrigingConfig::anisotropic_search`]): with
+    /// `ratio == 0`, `transform_vector` divides by zero, turning the search
+    /// neighborhood into whatever the numerator's sign happens to select
+    /// instead of an actual distance (AUDIT-2026-07-v3.md §1.10).
+    pub(crate) fn validate(&self) -> Result<()> {
+        if !(self.ratio_z > 0.0) || !self.ratio_z.is_finite() {
+            return Err(GeostatError::InvalidParameter(format!(
+                "anisotropy ratio_z must be finite and > 0, got {}",
+                self.ratio_z
+            )));
+        }
+        if !(self.ratio > 0.0) || !self.ratio.is_finite() {
+            return Err(GeostatError::InvalidParameter(format!(
+                "anisotropy ratio must be finite and > 0, got {}",
+                self.ratio
+            )));
+        }
+        if !self.azimuth_deg.is_finite() {
+            return Err(GeostatError::InvalidParameter(
+                "anisotropy azimuth must be finite".into(),
+            ));
+        }
+        if !self.dip_deg.is_finite() || !self.rake_deg.is_finite() {
+            return Err(GeostatError::InvalidParameter(
+                "anisotropy dip/rake must be finite".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// GSLIB `setrot`-equivalent rotation+scaling matrix: applying it to a
     /// separation vector and taking the Euclidean norm of the result gives
     /// the isotropic-equivalent effective distance (before dividing by the
@@ -557,32 +600,11 @@ impl VariogramModel {
                     "Power theta must be in (0, 2), got {theta}"
                 )));
             }
+            // ratio > 1 is valid (zonal anisotropy: the orthogonal axis is
+            // longer than the labeled one; see `Anisotropy` docs) -- only
+            // non-finite/non-positive values are rejected, see `validate`.
             if let Some(a) = s.anis {
-                // ratio > 1 is valid (zonal anisotropy: the orthogonal axis
-                // is longer than the labeled one; see `Anisotropy` docs) --
-                // only non-finite/non-positive values are rejected.
-                if !(a.ratio_z > 0.0) || !a.ratio_z.is_finite() {
-                    return Err(GeostatError::InvalidParameter(format!(
-                        "anisotropy ratio_z must be finite and > 0, got {}",
-                        a.ratio_z
-                    )));
-                }
-                if !(a.ratio > 0.0) || !a.ratio.is_finite() {
-                    return Err(GeostatError::InvalidParameter(format!(
-                        "anisotropy ratio must be finite and > 0, got {}",
-                        a.ratio
-                    )));
-                }
-                if !a.azimuth_deg.is_finite() {
-                    return Err(GeostatError::InvalidParameter(
-                        "anisotropy azimuth must be finite".into(),
-                    ));
-                }
-                if !a.dip_deg.is_finite() || !a.rake_deg.is_finite() {
-                    return Err(GeostatError::InvalidParameter(
-                        "anisotropy dip/rake must be finite".into(),
-                    ));
-                }
+                a.validate()?;
             }
         }
         let model = Self { nugget, structures };
@@ -1233,7 +1255,9 @@ mod tests {
         /// The bounded, monotone kinds (matches [`ModelKind::ALL`] plus the
         /// closed-form Materns) -- the ones expected to plateau at the sill
         /// and never exceed it, unlike Power (unbounded) or Hole/Wave
-        /// (deliberately oscillating).
+        /// (deliberately oscillating). Includes continuous-`nu` Matern
+        /// across its full validated range: AUDIT-2026-07-v3.md §1.3 found
+        /// `gamma < 0` here that this exact strategy would have caught.
         fn bounded_kind() -> impl Strategy<Value = ModelKind> {
             prop_oneof![
                 Just(ModelKind::Spherical),
@@ -1242,6 +1266,7 @@ mod tests {
                 Just(ModelKind::Matern15),
                 Just(ModelKind::Matern25),
                 Just(ModelKind::Circular),
+                (0.05f64..=MATERN_NU_MAX).prop_map(ModelKind::Matern),
             ]
         }
 

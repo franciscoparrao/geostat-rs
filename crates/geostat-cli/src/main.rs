@@ -768,6 +768,11 @@ fn write_grid_result(
                 &[("prediction", values), ("variance", variances)],
             )
         }
+    } else if raster {
+        // AUDIT-2026-07-v3.md §1.14: `--raster` only means anything for a
+        // `.gpkg` output (a gridded coverage); silently falling back to a
+        // point CSV here used to drop the flag without any indication.
+        bail!("--raster requires a .gpkg output path (got {})", path.display());
     } else {
         io_utils::write_grid_csv(path, grid, values, variances)
     }
@@ -1348,6 +1353,21 @@ fn variogram_report<const D: usize>(data: &PointSet<D>, cmd: &VariogramCmd) -> R
             println!("Model written to {}", path.display());
         }
     } else if let Some(spec) = &cmd.fit {
+        // AUDIT-2026-07-v3.md §1.11: the madogram estimates `gamma_M(h) =
+        // 0.5*E|z_i-z_j|`, not `gamma(h)`; under Gaussian differences
+        // `gamma = pi * gamma_M^2` (a *nonlinear* relation -- the madogram
+        // of a spherical variogram isn't itself spherical). GSLIB reserves
+        // the madogram for range/anisotropy diagnosis, never for fitting a
+        // kriging model directly; doing so here would silently distort
+        // sill, nugget and shape.
+        if estimator == EstimatorKind::Madogram {
+            bail!(
+                "--fit cannot use --estimator madogram directly: the madogram is on a \
+                 different (non-quadratic) scale than gamma, so fitting it produces a distorted \
+                 kriging model. Use it for range/anisotropy diagnosis only, and fit with \
+                 --estimator matheron/cressie-hawkins/dowd instead"
+            );
+        }
         let kinds = parse_kinds(spec)?;
         let fit = fit_best(&ev, &kinds)?;
         println!("\nFitted model: {}", fit.model);
@@ -1442,6 +1462,19 @@ fn run_krige(cmd: KrigeCmd) -> Result<()> {
         write_estimates_result(&cmd.output, &coords, &ests, cmd.srs)?;
         println!("Output written to {}", cmd.output.display());
         return Ok(());
+    }
+
+    // AUDIT-2026-07-v3.md §1.14: `--targets` is only ever consumed by the
+    // 3-D (`--z-col`) and external-drift (`--drift-cols`) branches above.
+    // Every path below this point krieges the default (or `--nx`/`--ny`/
+    // `--res`-sized) grid instead -- so a plain `--targets pts.csv` here
+    // used to be silently ignored, producing a grid the user never asked
+    // for instead of predictions at their points.
+    if cmd.targets.is_some() {
+        bail!(
+            "--targets is only supported with --z-col (3-D kriging) or --drift-cols (external \
+             drift); plain 2-D point/block kriging always predicts on the --nx/--ny/--res grid"
+        );
     }
 
     let (data, errors) = if let Some(col) = &cmd.error_col {
@@ -1759,6 +1792,9 @@ fn run_cv(cmd: CvCmd) -> Result<()> {
         let data = cmd.input.read()?;
         println!("Loaded {} points; model: {model}", data.len());
         let config = cmd.neighbors.config(cmd.method.build(&data));
+        // Note: `--blocks`/`--folds` ambiguity is already rejected by clap
+        // itself (`conflicts_with` on the `blocks` arg, AUDIT-2026-07-v3.md
+        // §1.14) before this function ever runs.
         let (cv, method_label) = match (&cmd.blocks, cmd.folds) {
             (Some(spec), _) => (
                 block_cv(&data, &model, &config, parse_blocks_2d(spec)?)?,

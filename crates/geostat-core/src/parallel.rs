@@ -47,9 +47,19 @@ where
 }
 
 /// Number of work chunks to split pair-accumulation loops into.
+///
+/// Fixed, independent of the runtime thread count. Chunk boundaries fix the
+/// order in which partial sums are merged, and floating-point addition is
+/// not associative — deriving this from `rayon::current_num_threads()` made
+/// the experimental variogram (and anything that auto-fits from it) differ
+/// at the ulp level between machines with different core counts, breaking
+/// the bit-for-bit reproducibility claim. Rayon still spreads these chunks
+/// across however many threads are actually available; only the partition
+/// itself needs to be stable. 256 comfortably covers real-world core
+/// counts; excess chunks on small inputs are empty ranges, not overhead.
 #[cfg(feature = "parallel")]
 pub(crate) fn n_chunks() -> usize {
-    rayon::current_num_threads().max(1) * 4
+    256
 }
 
 /// Sequential fallback: a single chunk.

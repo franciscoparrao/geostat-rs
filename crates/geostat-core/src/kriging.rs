@@ -295,6 +295,15 @@ impl<'a, const D: usize, M: Covariance<D>> Kriging<'a, D, M> {
                 "search radius must be positive, got {r}"
             )));
         }
+        // AUDIT-2026-07-v3.md §1.10: unlike a structure's own anisotropy
+        // (validated by `VariogramModel::new`), `anisotropic_search` never
+        // went through the same check -- `ratio == 0` (or non-finite)
+        // divides by zero in `transform_vector`, turning the neighborhood
+        // into whatever the numerator's sign selects instead of an actual
+        // rotated-ellipsoid distance, silently.
+        if let Some(a) = config.anisotropic_search {
+            a.validate()?;
+        }
         if config.max_neighbors == Some(0) {
             return Err(GeostatError::InvalidParameter(
                 "max_neighbors must be at least 1".into(),
@@ -1607,6 +1616,59 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn rejects_invalid_anisotropic_search() {
+        // AUDIT-2026-07-v3.md §1.10: `ratio == 0` (or non-finite) divides by
+        // zero in `Anisotropy::transform_vector`, turning the search
+        // neighborhood into whatever the numerator's sign selects instead
+        // of an actual distance -- silently, before this guard.
+        let data = sample_data();
+        let m = model();
+        for bad in [
+            Anisotropy {
+                azimuth_deg: 30.0,
+                ratio: 0.0,
+                ratio_z: 1.0,
+                dip_deg: 0.0,
+                rake_deg: 0.0,
+            },
+            Anisotropy {
+                azimuth_deg: 30.0,
+                ratio: f64::NAN,
+                ratio_z: 1.0,
+                dip_deg: 0.0,
+                rake_deg: 0.0,
+            },
+            Anisotropy {
+                azimuth_deg: f64::INFINITY,
+                ratio: 0.5,
+                ratio_z: 1.0,
+                dip_deg: 0.0,
+                rake_deg: 0.0,
+            },
+            Anisotropy {
+                azimuth_deg: 30.0,
+                ratio: 0.5,
+                ratio_z: -1.0,
+                dip_deg: 0.0,
+                rake_deg: 0.0,
+            },
+        ] {
+            assert!(
+                Kriging::new(
+                    &data,
+                    &m,
+                    KrigingConfig {
+                        anisotropic_search: Some(bad),
+                        ..Default::default()
+                    }
+                )
+                .is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
     }
 
     mod proptests {

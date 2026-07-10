@@ -4,6 +4,11 @@ use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
 use crate::parallel::{n_chunks, par_map};
 
+/// `[Phi^-1(0.75)]^2`, the third-quartile point of the standard normal
+/// distribution, squared — the bias-correction divisor for
+/// [`EstimatorKind::Dowd`] (see its docs).
+const DOWD_Q75_SQ: f64 = 0.674_489_750_196_082 * 0.674_489_750_196_082;
+
 /// Directional tolerance for anisotropic variograms.
 ///
 /// Azimuth follows the gstat/GSLIB convention: degrees clockwise from north
@@ -297,9 +302,12 @@ pub enum EstimatorKind {
     /// constants (Cressie 1993, eq. 2.4.12) undo the transform in
     /// expectation under Gaussian differences.
     CressieHawkins,
-    /// Dowd (1984): `gamma(h) = median(|z_i-z_j|)^2 / (2*0.4529)`. The most
-    /// outlier-resistant of the three -- only the rank-median pair matters,
-    /// so a single wild value cannot move the estimate at all.
+    /// Dowd (1984): `gamma(h) = median(|z_i-z_j|)^2 / (2*[Phi^-1(0.75)]^2)`,
+    /// i.e. dividing by `2*0.454936...` (the third-quartile point of the
+    /// standard normal squared) so the median is unbiased for `gamma` under
+    /// Gaussian differences. The most outlier-resistant of the three --
+    /// only the rank-median pair matters, so a single wild value cannot move
+    /// the estimate at all.
     Dowd,
     /// Madogram (first-order variogram): `gamma(h) = 0.5*mean(|z_i-z_j|)`.
     /// Bounded growth rate under heavy-tailed/fractal fields where the
@@ -427,7 +435,11 @@ fn robust_bins<const D: usize>(
                         let mut v = acc.s[b].clone();
                         v.sort_by(f64::total_cmp);
                         let med = median_of_sorted(&v);
-                        med * med / (2.0 * 0.4529)
+                        // AUDIT-2026-07-v3.md §1.5: the divisor is
+                        // `2*[Phi^-1(0.75)]^2`, not `2*0.4529` (a ~0.5%
+                        // systematic bias, verified analytically and by
+                        // Monte Carlo against the correct constant).
+                        med * med / (2.0 * DOWD_Q75_SQ)
                     }
                     EstimatorKind::Madogram => 0.5 * acc.s[b].iter().sum::<f64>() / n_f,
                     EstimatorKind::Matheron => unreachable!("handled by experimental_variogram"),
@@ -665,8 +677,8 @@ mod tests {
         assert!((ch.bins[3].gamma - 4.0 / 1.902).abs() < 1e-9);
 
         let dowd = experimental_variogram_robust(&line_data(), &cfg, EstimatorKind::Dowd).unwrap();
-        // median(|diff|)=2 (only one pair) -> 2^2/(2*0.4529)
-        assert!((dowd.bins[3].gamma - 4.0 / 0.9058).abs() < 1e-9);
+        // median(|diff|)=2 (only one pair) -> 2^2/(2*[Phi^-1(0.75)]^2)
+        assert!((dowd.bins[3].gamma - 4.0 / (2.0 * DOWD_Q75_SQ)).abs() < 1e-9);
 
         // `Matheron` must delegate to `experimental_variogram` exactly.
         let matheron =
@@ -712,7 +724,7 @@ mod tests {
         // Hand-computed: diffs [1, 1, 1, 97].
         assert!((matheron - 1176.5).abs() < 1e-9);
         assert!((madogram - 12.5).abs() < 1e-9);
-        assert!((dowd - 1.0 / 0.9058).abs() < 1e-9);
+        assert!((dowd - 1.0 / (2.0 * DOWD_Q75_SQ)).abs() < 1e-9);
         // Cressie-Hawkins: mean(sqrt(diff)) = (1+1+1+sqrt(97))/4.
         let mean_sqrt = (3.0 + 97.0_f64.sqrt()) / 4.0;
         let expected_ch = mean_sqrt.powi(4) / (2.0 * (0.457 + 0.494 / 4.0));

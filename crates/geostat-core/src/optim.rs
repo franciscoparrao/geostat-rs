@@ -213,6 +213,15 @@ where
     let mut h = identity_flat(n);
     let mut g = grad(&x);
     let mut fx = f(&x);
+    // AUDIT-2026-07-v3.md §1.9: the line search below accepts a candidate
+    // once `alpha` underflows even if it isn't an improvement (`f_cand >
+    // fx`) -- rare, but it happens right where the search is already in
+    // trouble (e.g. near a curvature update that made the Hessian
+    // approximation a poor descent direction). Returning the *last*
+    // iterate unconditionally could hand back something worse than an
+    // earlier one; tracking the best `(x, fx)` actually visited never does.
+    let mut best_x = x.clone();
+    let mut best_fx = fx;
 
     for _ in 0..max_iter {
         let gnorm = dot(&g, &g).sqrt();
@@ -248,11 +257,15 @@ where
         x = x_new;
         g = g_new;
         fx = f_new;
+        if fx < best_fx {
+            best_fx = fx;
+            best_x = x.clone();
+        }
         if stalled {
             break;
         }
     }
-    (x, fx)
+    (best_x, best_fx)
 }
 
 /// Runs [`bfgs`] from each of `starts` and keeps the best optimum found
@@ -363,6 +376,27 @@ mod tests {
         let (x, fx) = bfgs_multistart(f, grad, &starts, 100);
         assert!((x[0] - 3.0).abs() < 1e-3, "x0 = {}", x[0]);
         assert!(fx < -2.9, "fx = {fx}");
+    }
+
+    #[test]
+    fn bfgs_never_returns_worse_than_the_best_point_visited() {
+        // AUDIT-2026-07-v3.md §1.9: a deliberately wrong-signed gradient
+        // makes the "descent" direction actually ascend for every real `f`
+        // evaluation, so the Armijo line search never accepts on merit and
+        // falls through to the `alpha < 1e-12` bailout each iteration --
+        // each of which nudges `x` slightly further from (and `fx`
+        // slightly above) the starting point. Before tracking the best
+        // point visited, `bfgs` returned that degraded final iterate;
+        // now it must return (very close to) the true starting value.
+        let f = |x: &[f64]| x[0] * x[0];
+        let bad_grad = |x: &[f64]| vec![-2.0 * x[0]]; // wrong sign: true grad is 2x
+        let x0 = [1.0_f64];
+        let f0 = f(&x0);
+        let (x, fx) = bfgs(f, bad_grad, &x0, 50);
+        assert!(
+            fx <= f0 + 1e-13,
+            "bfgs returned a worse point: f(x)={fx} vs f(x0)={f0}, x={x:?}"
+        );
     }
 
     #[test]
