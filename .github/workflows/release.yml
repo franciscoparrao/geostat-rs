@@ -29,8 +29,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          manifest-path: crates/geostat-python/Cargo.toml
-          args: --release --out dist
+          args: --release --out dist --manifest-path crates/geostat-python/Cargo.toml
           manylinux: auto
       - name: Upload wheels
         uses: actions/upload-artifact@v4
@@ -51,8 +50,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          manifest-path: crates/geostat-python/Cargo.toml
-          args: --release --out dist
+          args: --release --out dist --manifest-path crates/geostat-python/Cargo.toml
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -68,8 +66,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: x64
-          manifest-path: crates/geostat-python/Cargo.toml
-          args: --release --out dist
+          args: --release --out dist --manifest-path crates/geostat-python/Cargo.toml
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -85,8 +82,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
-          manifest-path: crates/geostat-python/Cargo.toml
-          args: --out dist
+          args: --out dist --manifest-path crates/geostat-python/Cargo.toml
       - name: Upload sdist
         uses: actions/upload-artifact@v4
         with:
