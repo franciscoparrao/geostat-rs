@@ -407,7 +407,7 @@ dependencies = [
 
 [[package]]
 name = "geostat-cli"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "geostat-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "criterion",
  "ndarray",
@@ -432,7 +432,7 @@ dependencies = [
 
 [[package]]
 name = "geostat-python"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "geostat-core",
  "numpy",
@@ -442,7 +442,7 @@ dependencies = [
 
 [[package]]
 name = "geostat-wasm"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "geostat-core",
  "serde_json",

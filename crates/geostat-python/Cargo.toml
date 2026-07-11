@@ -16,7 +16,7 @@ name = "geostat_rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-geostat-core = { path = "../geostat-core", version = "0.7.0" }
+geostat-core = { path = "../geostat-core", version = "0.8.0" }
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
 numpy = "0.23"
 serde_json = { workspace = true }

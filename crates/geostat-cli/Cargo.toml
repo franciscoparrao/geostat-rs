@@ -20,7 +20,7 @@ name = "geostat"
 path = "src/main.rs"
 
 [dependencies]
-geostat-core = { path = "../geostat-core", version = "0.7.0" }
+geostat-core = { path = "../geostat-core", version = "0.8.0" }
 anyhow = { workspace = true }
 clap = { workspace = true }
 csv = { workspace = true }

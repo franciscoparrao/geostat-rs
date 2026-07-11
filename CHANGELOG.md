@@ -6,7 +6,13 @@ before 0.7.0 predate this file and are reconstructed from commit history.
 
 ## [Unreleased]
 
-Fase 6 operational-gap closing (`docs/AUDIT-2026-07-v2.md` §7).
+## [0.8.0] — 2026-07-10
+
+Fase 6 operational-gap closing (`docs/AUDIT-2026-07-v2.md` §7) plus Fase 7,
+the third audit pass (`docs/AUDIT-2026-07-v3.md`): 2 HIGH + 12 MEDIUM findings,
+each with a dedicated regression test. No functional regressions; gstat
+parity on Meuse re-confirmed after every fix (gamma 2.07e-15, kriging
+1.5e-12, CV 9.7e-13).
 
 ### Added
 - Anisotropic (rotated-ellipsoid) search neighborhoods for kriging (GSLIB
@@ -76,6 +82,66 @@ Fase 6 operational-gap closing (`docs/AUDIT-2026-07-v2.md` §7).
 ### Changed
 - `KrigingConfig` is now `#[non_exhaustive]` (was already the case for
   `SgsConfig`/`SisConfig`/etc.).
+
+### Fixed
+- `BucketGrid::new` aborted the process (OOM, not a catchable `Err`) when
+  all points were collinear along one axis (e.g. a single-bench drillhole
+  with constant `z`) — reachable from `vecchia_plan`/`vecchia_predict`/
+  `sgs_at`/`sis_at`. Degenerate axes now get `n[d]=1` instead of an
+  astronomically small cell size, plus a defensive cap on total cell count.
+- The experimental variogram — and any auto-fit pipeline built on it
+  (`sgs`/`sis`/`krige --fit`) — was not bit-reproducible across machines
+  with different thread counts: the pair-accumulation chunk count scaled
+  with `rayon::current_num_threads()`, so floating-point summation order
+  (and therefore `gamma`) changed with the CPU. Chunk count is now
+  independent of thread count.
+- `MATERN_NU_MAX` (50) exceeded the Bessel quadrature's validated domain
+  (ν ≤ 15), silently producing negative `gamma` (a non-PD covariance) for
+  ν between 15 and 50; lowered to 15.
+- Collocated cokriging's system could be silently non-PSD when the sample
+  secondary/primary variance didn't match the fitted model's sill (the v2
+  fix only corrected the cross-covariance, not the primary block); the
+  primary block is now standardized to the correlogram, guaranteeing PSD
+  by construction (ρ² ≤ 1).
+- Dowd's robust variogram estimator used the wrong normalizing constant
+  (0.4529 instead of 1/Φ⁻¹(0.75)² = 0.454936), a systematic +0.5% bias
+  confirmed both analytically and by Monte Carlo.
+- The 3-D `Circular` dimensional guard from the v2 audit didn't reach
+  `sgs_at_with_levels`, `Lmc::new`, or the per-kind Vecchia MLE/REML entry
+  points; now rejected consistently everywhere `ModelKind` is
+  dimension-sensitive.
+- Vecchia's analytical gradient kept propagating a nonzero `d(var)` even
+  when the variance clamp (near-singular neighborhoods) made the
+  likelihood locally constant in `var`, corrupting BFGS curvature and the
+  semi-analytical Hessian used by `vecchia_param_se`; the gradient is now
+  zeroed when the clamp is active.
+- `vecchia_param_se` returned `[NaN; 3]` for all three parameters
+  (including the well-identified sill/range) whenever nugget < 1e-5,
+  because the two-sided finite-difference step could go negative; it now
+  falls back to a one-sided difference in that case.
+- `bfgs` could silently return the starting point as the "optimum" with no
+  convergence signal (e.g. on the Vecchia penalty plateau, where the
+  gradient is exactly zero); the optimizer now tracks the best point
+  visited, and Vecchia's MLE fit errors explicitly if `neg_ll >= 1e12` for
+  every multistart instead of returning it unmarked.
+- Anisotropic kriging search parameters (`--search-ratio`, azimuth/dip/
+  rake) accepted zero/negative/non-finite values, silently producing
+  neighborhoods keyed on the sign of a divide-by-zero numerator rather
+  than distance; now validated finite and `> 0` in `Kriging::build`.
+- CLI: `--estimator madogram` combined with `--fit` fit a variogram model
+  in madogram scale — a nonlinear transform of gamma under Gaussianity —
+  and wrote it out for kriging with no warning; now rejected.
+- GeoPackage raster reads (`read_raster`) could panic or OOM on a corrupt
+  or malicious tile matrix (unchecked `i64 -> usize` casts, unchecked
+  multiplication); dimensions are now validated and multiplication is
+  checked.
+- `decode_point` didn't skip the embedded SRID in EWKB-flavored geometries,
+  silently reading garbage coordinates (SRID bytes interpreted as part of
+  the coordinate); the SRID flag is now recognized and skipped.
+- CLI `krige --targets` was silently ignored in plain 2-D kriging (only
+  consumed by the 3-D/external-drift branches); now rejected with a clear
+  error, along with `--raster` on non-`.gpkg` output and `--blocks`+
+  `--folds` both being passed to `cv`.
 
 ## [0.7.0] — 2026-07-04
 
