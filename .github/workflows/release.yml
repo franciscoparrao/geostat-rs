@@ -15,6 +15,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   linux:
     name: wheels (linux ${{ matrix.target }})
@@ -129,6 +132,8 @@ jobs:
     name: create GitHub release
     runs-on: ubuntu-latest
     needs: [linux, macos, windows, sdist]
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
