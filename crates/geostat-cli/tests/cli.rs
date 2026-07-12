@@ -588,3 +588,102 @@ fn collocated_cokrige_auto_stats_stats_and_mm2_all_agree_and_reject_bad_input() 
         std::fs::remove_file(p).ok();
     }
 }
+
+#[test]
+fn tgs_pipeline_end_to_end() {
+    let data = temp_path("tgs-facies.csv");
+    let model = temp_path("tgs-model.json");
+    let out = temp_path("tgs-out.csv");
+    std::fs::write(
+        &data,
+        "x,y,facies\n\
+         5,5,0\n\
+         95,5,2\n\
+         5,95,0\n\
+         95,95,2\n\
+         50,50,1\n\
+         30,70,1\n\
+         70,30,1\n\
+         20,20,0\n\
+         80,80,2\n\
+         15,60,0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &model,
+        r#"{"nugget":0.05,"structures":[{"kind":"spherical","sill":0.95,"range":30.0}]}"#,
+    )
+    .unwrap();
+
+    let result = run(geostat().args([
+        "tgs",
+        "-i",
+        data.to_str().unwrap(),
+        "--value-col",
+        "facies",
+        "-m",
+        model.to_str().unwrap(),
+        "--nx",
+        "10",
+        "--ny",
+        "10",
+        "-n",
+        "5",
+        "--seed",
+        "7",
+        "-o",
+        out.to_str().unwrap(),
+    ]));
+    assert_success(&result, "tgs");
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        stdout.contains("3 categories") && stdout.contains("Category proportions"),
+        "unexpected stdout: {stdout}"
+    );
+
+    let csv = std::fs::read_to_string(&out).unwrap();
+    let mut lines = csv.lines();
+    assert_eq!(lines.next().unwrap(), "x,y,sim1,sim2,sim3,sim4,sim5");
+    let mut n_rows = 0;
+    for line in lines {
+        n_rows += 1;
+        let fields: Vec<&str> = line.split(',').collect();
+        assert_eq!(fields.len(), 7, "row: {line}");
+        for &f in &fields[2..] {
+            let cat: usize = f
+                .parse()
+                .unwrap_or_else(|_| panic!("non-integer category id: {f}"));
+            assert!(cat < 3, "category id out of range: {f}");
+        }
+    }
+    assert_eq!(n_rows, 100, "expected a 10x10 grid");
+
+    // Error path: non-integer category column.
+    let bad = temp_path("tgs-bad.csv");
+    std::fs::write(&bad, "x,y,facies\n0,0,0.5\n1,1,1\n").unwrap();
+    let result = run(geostat().args([
+        "tgs",
+        "-i",
+        bad.to_str().unwrap(),
+        "--value-col",
+        "facies",
+        "-m",
+        model.to_str().unwrap(),
+        "--nx",
+        "5",
+        "--ny",
+        "5",
+        "-o",
+        out.to_str().unwrap(),
+    ]));
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("non-negative integer category"),
+        "unexpected stderr: {stderr}"
+    );
+
+    for p in [&data, &model, &out, &bad] {
+        std::fs::remove_file(p).ok();
+    }
+}

@@ -21,6 +21,28 @@ before 0.7.0 predate this file and are reconstructed from commit history.
   in the core (parallel batch prediction, NaN on a per-target failure
   instead of aborting, matching `Kriging::predict_many`'s convention) backs
   both surfaces.
+- Truncated Gaussian simulation (TGS) for ordered categorical/facies data
+  (`crates/geostat-core/src/tgs.rs`; `geostat tgs` in the CLI, `tgs()` in
+  Python) — one underlying Gaussian field, simulated via the same
+  sequential-conditioning engine as SGS (now shared through a new
+  transform-agnostic `simulate_gaussian_path` extracted from
+  `simulation.rs`'s per-realization loop), truncated into ordered
+  categories at thresholds derived from global proportions via the inverse
+  normal CDF (`tgs_thresholds`/`tgs_classify`; hard categorical data is
+  converted to a pseudo-Gaussian conditioning value via
+  `category_to_pseudo_gaussian`). `TgsConfig`/`CategoricalData` follow this
+  project's established `#[non_exhaustive]`-config and dimension-generic
+  (`const D: usize`) conventions. The underlying-field variogram is always
+  caller-supplied (never auto-fitted: TGS conditions on only a handful of
+  discrete pseudo-Gaussian levels, too few for a direct experimental fit —
+  GSLIB practice calibrates it against target facies indicator variograms
+  instead, an external step not automated here). Validated by
+  self-consistency (no gstat/GSLIB TGS to cross-check against): ensemble
+  category proportions track the input proportions, hard data is honored
+  exactly at conditioning locations, thresholds match `inv_norm_cdf` by
+  hand. Full plurigaussian simulation (2+ correlated fields, a flexible
+  2-D truncation rule for non-ordered facies) is explicitly out of scope
+  for this pass — see the module docs.
 
 ## [0.8.0] — 2026-07-10
 

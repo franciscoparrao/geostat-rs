@@ -7,15 +7,16 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use geostat_core::{
-    Anisotropy, CoKriging, CoKrigingConfig, CollocatedCokriging, CollocatedConfig, DirectionConfig,
-    EstimatorKind, Grid2D, IkConfig, Kriging, KrigingConfig, KrigingMethod, MarkovModel, ModelKind,
-    PointSet, SgsConfig, SisConfig, Tails, VariogramConfig, VariogramModel, block_cv,
-    cell_declustering_weights, decluster_scan, default_lag_width, detrend_external,
-    detrend_polynomial, estimate_collocated_stats, experimental_variogram,
-    experimental_variogram_robust, fit_anisotropic, fit_best, fit_indicator_models,
-    fit_lmc_collocated, fit_median_indicator_model, indicator_kriging, k_fold, leave_one_out,
-    leave_one_out_with_drift, sequential_gaussian_simulation, sequential_indicator_simulation,
-    variogram_map, vecchia_mle, vecchia_predict, vecchia_reml,
+    Anisotropy, CategoricalData, CoKriging, CoKrigingConfig, CollocatedCokriging, CollocatedConfig,
+    DirectionConfig, EstimatorKind, Grid2D, IkConfig, Kriging, KrigingConfig, KrigingMethod,
+    MarkovModel, ModelKind, PointSet, SgsConfig, SisConfig, Tails, TgsConfig, VariogramConfig,
+    VariogramModel, block_cv, category_proportions, cell_declustering_weights, decluster_scan,
+    default_lag_width, detrend_external, detrend_polynomial, estimate_collocated_stats,
+    experimental_variogram, experimental_variogram_robust, fit_anisotropic, fit_best,
+    fit_indicator_models, fit_lmc_collocated, fit_median_indicator_model, indicator_kriging,
+    k_fold, leave_one_out, leave_one_out_with_drift, sequential_gaussian_simulation,
+    sequential_indicator_simulation, truncated_gaussian_simulation, variogram_map, vecchia_mle,
+    vecchia_predict, vecchia_reml,
 };
 
 #[derive(Parser)]
@@ -48,6 +49,10 @@ enum Command {
     Cv(CvCmd),
     /// Conditional sequential Gaussian simulation
     Sgs(SgsCmd),
+    /// Truncated Gaussian simulation (TGS): one underlying Gaussian field
+    /// truncated into ordered categories/facies at thresholds derived from
+    /// global proportions
+    Tgs(TgsCmd),
     /// Cell-declustering weights (GSLIB declus): scan cell sizes and export
     /// weights for preferentially sampled data
     Declus(DeclusCmd),
@@ -615,6 +620,56 @@ struct SgsCmd {
 }
 
 #[derive(Args)]
+struct TgsCmd {
+    #[command(flatten)]
+    input: InputOpts,
+    #[command(flatten)]
+    grid: GridOpts,
+    /// Number of ordered categories (default: inferred as max(--value-col) + 1)
+    #[arg(long)]
+    n_categories: Option<usize>,
+    /// Global category proportions, ascending category order, comma
+    /// separated, summing to 1 (default: estimated from --value-col
+    /// frequency)
+    #[arg(long)]
+    proportions: Option<String>,
+    /// Variogram model of the underlying standard-Gaussian field (JSON,
+    /// sill ~ 1). Not auto-fitted: TGS conditions on only a handful of
+    /// discrete pseudo-Gaussian levels (one per category), too few for a
+    /// direct experimental-variogram fit -- GSLIB practice calibrates this
+    /// model against target facies indicator variograms instead (an
+    /// external, iterative step, not automated here)
+    #[arg(short, long)]
+    model: PathBuf,
+    /// Number of realizations
+    #[arg(short = 'n', long, default_value_t = 10)]
+    realizations: usize,
+    /// Random seed
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+    /// Maximum conditioning points per node
+    #[arg(long, default_value_t = 16)]
+    max_neighbors: usize,
+    /// Search radius for conditioning points
+    #[arg(long)]
+    radius: Option<f64>,
+    /// Cell-declustering cell size: estimate global proportions with
+    /// declustering weights instead of raw frequency (ignored when
+    /// --proportions is given)
+    #[arg(long)]
+    declus: Option<f64>,
+    /// Separate quota for previously simulated nodes (GSLIB nodmax)
+    #[arg(long)]
+    nodmax: Option<usize>,
+    /// Multiple-grid simulation levels (GSLIB nmult)
+    #[arg(long, default_value_t = 0)]
+    multigrid: u8,
+    /// Output CSV file (x,y,facies1..faciesN)
+    #[arg(short, long)]
+    output: PathBuf,
+}
+
+#[derive(Args)]
 struct DeclusCmd {
     #[command(flatten)]
     input: InputOpts,
@@ -777,6 +832,7 @@ fn main() -> Result<()> {
         Command::CollocatedCokrige(cmd) => run_collocated_cokrige(cmd),
         Command::Cv(cmd) => run_cv(cmd),
         Command::Sgs(cmd) => run_sgs(cmd),
+        Command::Tgs(cmd) => run_tgs(cmd),
         Command::Declus(cmd) => run_declus(cmd),
         Command::Sis(cmd) => run_sis(cmd),
         Command::Ik(cmd) => run_ik(cmd),
@@ -2035,6 +2091,83 @@ fn run_sgs(cmd: SgsCmd) -> Result<()> {
         cfg.seed
     );
     io_utils::write_sims_csv(&cmd.output, &grid, &res.realizations)?;
+    println!("Output written to {}", cmd.output.display());
+    Ok(())
+}
+
+fn run_tgs(cmd: TgsCmd) -> Result<()> {
+    let raw = cmd.input.read()?;
+    let mut categories = Vec::with_capacity(raw.len());
+    for &v in raw.values() {
+        if v < 0.0 || (v.round() - v).abs() > 1e-6 {
+            bail!("--value-col must hold non-negative integer category codes, got {v}");
+        }
+        categories.push(v.round() as usize);
+    }
+    let n_categories = cmd
+        .n_categories
+        .unwrap_or_else(|| categories.iter().max().map_or(0, |m| m + 1));
+    let data = CategoricalData::new(
+        raw.coords().to_vec(),
+        categories.clone(),
+        Some(n_categories),
+    )?;
+    println!(
+        "Loaded {} points ({} categories) from {}",
+        data.len(),
+        n_categories,
+        cmd.input.input.display()
+    );
+
+    let decluster_weights = cmd
+        .declus
+        .map(|size| cell_declustering_weights(&raw, size, 4))
+        .transpose()?;
+
+    let proportions: Vec<f64> = match &cmd.proportions {
+        Some(spec) => parse_floats(spec)?,
+        None => category_proportions(&categories, n_categories, decluster_weights.as_deref())?,
+    };
+    println!(
+        "Category proportions: {}",
+        proportions
+            .iter()
+            .map(|p| format!("{p:.4}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let model = io_utils::read_model(&cmd.model)?;
+    println!("Underlying Gaussian model: {model}");
+
+    let grid = cmd.grid.build(&raw)?;
+    // `TgsConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields.
+    let mut cfg = TgsConfig::default();
+    cfg.n_realizations = cmd.realizations;
+    cfg.seed = cmd.seed;
+    cfg.max_neighbors = cmd.max_neighbors;
+    cfg.search_radius = cmd.radius;
+    cfg.proportions = proportions;
+    cfg.decluster_weights = decluster_weights;
+    cfg.max_node_neighbors = cmd.nodmax;
+    cfg.multigrid = cmd.multigrid;
+    let res = truncated_gaussian_simulation(&data, &model, &grid, &cfg)?;
+
+    println!(
+        "Simulated {} realizations on {} cells ({} x {}), seed {}",
+        cfg.n_realizations,
+        grid.n_cells(),
+        grid.nx,
+        grid.ny,
+        cfg.seed
+    );
+    let realizations_f64: Vec<Vec<f64>> = res
+        .realizations
+        .iter()
+        .map(|r| r.iter().map(|&c| c as f64).collect())
+        .collect();
+    io_utils::write_sims_csv(&cmd.output, &grid, &realizations_f64)?;
     println!("Output written to {}", cmd.output.display());
     Ok(())
 }

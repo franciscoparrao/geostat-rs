@@ -1419,6 +1419,84 @@ fn sgs(
     arr2(py, realizations)
 }
 
+/// Truncated Gaussian simulation (TGS) for ordered categorical/facies
+/// data: one underlying Gaussian field truncated at thresholds derived
+/// from global category proportions (0-based ascending order, e.g. a
+/// depositional/grading sequence). `categories` are integer category
+/// codes parallel to `x`/`y`. `proportions`, if given, must have
+/// `n_categories` entries summing to 1 (estimated from `categories`'
+/// frequency otherwise, optionally declustering-weighted via
+/// `decluster_cell`). `model` must already be a variogram of the
+/// underlying standard-Gaussian field (sill ~ 1) — there is no automatic
+/// TGS variogram calibration (see the crate docs: GSLIB practice
+/// calibrates it against target facies indicator variograms instead, an
+/// external step not automated here). Returns one array per realization
+/// (category ids as floats), in grid storage order.
+#[pyfunction]
+#[pyo3(signature = (x, y, categories, model, bbox, nx, ny, n_categories = None,
+    proportions = None, n_realizations = 10, seed = 42, max_neighbors = 16,
+    radius = None, decluster_cell = None, max_node_neighbors = None, multigrid = 0))]
+#[allow(clippy::too_many_arguments)]
+fn tgs(
+    py: Python<'_>,
+    x: Vec<f64>,
+    y: Vec<f64>,
+    categories: Vec<usize>,
+    model: &VariogramModel,
+    bbox: (f64, f64, f64, f64),
+    nx: usize,
+    ny: usize,
+    n_categories: Option<usize>,
+    proportions: Option<Vec<f64>>,
+    n_realizations: usize,
+    seed: u64,
+    max_neighbors: usize,
+    radius: Option<f64>,
+    decluster_cell: Option<f64>,
+    max_node_neighbors: Option<usize>,
+    multigrid: u8,
+) -> PyResult<Py<PyArray2<f64>>> {
+    if x.len() != y.len() || x.len() != categories.len() {
+        return Err(PyValueError::new_err(
+            "x, y and categories must have the same length",
+        ));
+    }
+    let coords: Vec<[f64; 2]> = x.iter().zip(&y).map(|(&xi, &yi)| [xi, yi]).collect();
+    let n_cat =
+        n_categories.unwrap_or_else(|| categories.iter().copied().max().map_or(0, |m| m + 1));
+    let data = core::CategoricalData::new(coords, categories.clone(), Some(n_cat)).map_err(err)?;
+    let grid = Grid2D::from_bbox([bbox.0, bbox.1], [bbox.2, bbox.3], nx, ny).map_err(err)?;
+    let decluster_weights = match decluster_cell {
+        Some(size) => {
+            let cat_f64: Vec<f64> = categories.iter().map(|&c| c as f64).collect();
+            let raw = point_set(x, y, cat_f64)?;
+            Some(core::cell_declustering_weights(&raw, size, 4).map_err(err)?)
+        }
+        None => None,
+    };
+    // `TgsConfig` is `#[non_exhaustive]`: build from `Default::default()`
+    // and assign fields.
+    let mut cfg = core::TgsConfig::default();
+    cfg.n_realizations = n_realizations;
+    cfg.seed = seed;
+    cfg.max_neighbors = max_neighbors;
+    cfg.search_radius = radius;
+    cfg.proportions = proportions.unwrap_or_default();
+    cfg.decluster_weights = decluster_weights;
+    cfg.max_node_neighbors = max_node_neighbors;
+    cfg.multigrid = multigrid;
+    let realizations = py.allow_threads(|| {
+        core::truncated_gaussian_simulation(&data, &model.inner, &grid, &cfg)
+            .map_err(err)
+            .map(|res| res.realizations)
+    })?;
+    let rows: Vec<Vec<f64>> = realizations
+        .into_iter()
+        .map(|r| r.into_iter().map(|c| c as f64).collect())
+        .collect();
+    arr2(py, rows)
+}
+
 /// Conditional sequential indicator simulation. Indicator variogram models
 /// are fitted automatically at each cutoff, or a single shared model at the
 /// median cutoff when `mik=True` (GSLIB `mik=1` median IK — amortizes one
@@ -1737,6 +1815,7 @@ fn geostat_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tune_knn_k, m)?)?;
     m.add_function(wrap_pyfunction!(tune_kriging_neighbors, m)?)?;
     m.add_function(wrap_pyfunction!(sgs, m)?)?;
+    m.add_function(wrap_pyfunction!(tgs, m)?)?;
     m.add_function(wrap_pyfunction!(decluster_weights, m)?)?;
     m.add_function(wrap_pyfunction!(sis, m)?)?;
     m.add_function(wrap_pyfunction!(experimental_variogram_3d, m)?)?;

@@ -62,6 +62,7 @@ mod search;
 pub mod simulation;
 pub mod sis;
 pub mod tails;
+pub mod tgs;
 pub mod trans;
 pub mod transform;
 pub mod tuning;
@@ -91,6 +92,11 @@ pub use sis::{
     sequential_indicator_simulation_3d, sis_at,
 };
 pub use tails::TailModel;
+pub use tgs::{
+    CategoricalData, TgsConfig, TgsResult, category_proportions, category_to_pseudo_gaussian,
+    tgs_at, tgs_classify, tgs_thresholds, truncated_gaussian_simulation,
+    truncated_gaussian_simulation_3d,
+};
 pub use trans::{LognormalEstimate, lognormal_kriging};
 pub use transform::{NormalScore, Tails, norm_cdf};
 pub use tuning::{TuneResult, tune_idw_power, tune_knn_k, tune_kriging_neighbors};

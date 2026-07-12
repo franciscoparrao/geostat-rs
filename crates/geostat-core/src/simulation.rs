@@ -244,22 +244,33 @@ fn sgs_at_with_levels<const D: usize>(
     })
 }
 
+/// Raw conditional Gaussian-field simulation for one realization: random
+/// path (optionally multigrid-ordered via `levels`), moving-neighborhood
+/// simple kriging in the caller's value units (already-Gaussian or
+/// pseudo-Gaussian — no normal-score transform happens here), sequential
+/// conditioning. Returns one value per `centers[i]`, in the same units as
+/// `data_scores` (untransformed).
+///
+/// `pub(crate)`: shared by [`simulate_one`] (SGS, which wraps this with a
+/// `NormalScore` fit/back-transform) and [`crate::tgs`] (which wraps this
+/// with proportions-derived thresholds instead of a back-transform).
 #[allow(clippy::too_many_arguments)]
-fn simulate_one<const D: usize>(
-    data: &PointSet<D>,
+pub(crate) fn simulate_gaussian_path<const D: usize>(
+    data_coords: &[[f64; D]],
     data_scores: &[f64],
     data_grid: &BucketGrid<D>,
-    ns: &NormalScore,
     model: &VariogramModel,
     centers: &[[f64; D]],
     levels: Option<&[u8]>,
     extents: ([f64; D], [f64; D]),
-    cfg: &SgsConfig,
+    max_neighbors: usize,
+    search_radius: Option<f64>,
+    max_node_neighbors: Option<usize>,
     seed: u64,
 ) -> Result<Vec<f64>> {
     let mut rng = Rng::new(seed);
     let n_cells = centers.len();
-    let n_data = data.len();
+    let n_data = data_coords.len();
     let c0 = model.covariance_dh([0.0; D]);
     // Tiny diagonal stabilizer: previously simulated nodes can sit arbitrarily
     // close to data points, which makes exact systems near-singular.
@@ -276,15 +287,15 @@ fn simulate_one<const D: usize>(
     // Simulated nodes get their own store; the data store is shared.
     let (min, max) = extents;
     let mut node_grid = BucketGrid::new(min, max, n_cells);
-    let mut cond_coords: Vec<[f64; D]> = data.coords().to_vec();
+    let mut cond_coords: Vec<[f64; D]> = data_coords.to_vec();
     let mut cond_vals: Vec<f64> = data_scores.to_vec();
 
     // Quotas: `max_neighbors` original data plus `nodmax` simulated nodes
     // (GSLIB ndmax/nodmax). Without an explicit nodmax the two candidate
     // lists are merged by distance and truncated to `max_neighbors`,
     // reproducing the previous single-pool behavior.
-    let nodmax = cfg.max_node_neighbors.unwrap_or(cfg.max_neighbors);
-    let single_pool = cfg.max_node_neighbors.is_none();
+    let nodmax = max_node_neighbors.unwrap_or(max_neighbors);
+    let single_pool = max_node_neighbors.is_none();
 
     let mut sim_ns = vec![0.0_f64; n_cells];
     // Workspaces reused across the whole realization: this is the engine's
@@ -303,8 +314,8 @@ fn simulate_one<const D: usize>(
 
     for &cell in &path {
         let target = centers[cell];
-        let nd = data_grid.k_nearest(target, cfg.max_neighbors, cfg.search_radius);
-        let nn = node_grid.k_nearest(target, nodmax, cfg.search_radius);
+        let nd = data_grid.k_nearest(target, max_neighbors, search_radius);
+        let nn = node_grid.k_nearest(target, nodmax, search_radius);
 
         // Merge the two distance-ascending lists (node indices offset by
         // n_data into the conditioning arrays).
@@ -327,7 +338,7 @@ fn simulate_one<const D: usize>(
             }
         }
         if single_pool {
-            nb.truncate(cfg.max_neighbors);
+            nb.truncate(max_neighbors);
         }
 
         let (mean, var) = if nb.is_empty() {
@@ -352,6 +363,35 @@ fn simulate_one<const D: usize>(
         cond_vals.push(z);
     }
 
+    Ok(sim_ns)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn simulate_one<const D: usize>(
+    data: &PointSet<D>,
+    data_scores: &[f64],
+    data_grid: &BucketGrid<D>,
+    ns: &NormalScore,
+    model: &VariogramModel,
+    centers: &[[f64; D]],
+    levels: Option<&[u8]>,
+    extents: ([f64; D], [f64; D]),
+    cfg: &SgsConfig,
+    seed: u64,
+) -> Result<Vec<f64>> {
+    let sim_ns = simulate_gaussian_path(
+        data.coords(),
+        data_scores,
+        data_grid,
+        model,
+        centers,
+        levels,
+        extents,
+        cfg.max_neighbors,
+        cfg.search_radius,
+        cfg.max_node_neighbors,
+        seed,
+    )?;
     Ok(sim_ns.iter().map(|&s| ns.back_transform(s)).collect())
 }
 
@@ -591,5 +631,128 @@ mod tests {
                 .unwrap();
         let cfg = SgsConfig::default();
         assert!(sequential_gaussian_simulation(&data, &power_model, &grid, &cfg).is_err());
+    }
+
+    #[test]
+    fn sgs_refactor_matches_pre_refactor_snapshot() {
+        // Golden values captured from `sequential_gaussian_simulation` before
+        // `simulate_one` was split into a thin NormalScore wrapper around the
+        // new transform-agnostic `simulate_gaussian_path` (shared with
+        // `crate::tgs`) -- proves the refactor is a pure code move, not a
+        // behavior change, the same "snapshot before refactor" discipline
+        // this project used for the median/full-IK split.
+        let (data, model, grid) = setup();
+        let cfg = SgsConfig {
+            n_realizations: 2,
+            seed: 123,
+            ..Default::default()
+        };
+        let res = sequential_gaussian_simulation(&data, &model, &grid, &cfg).unwrap();
+        let expected: Vec<f64> = vec![
+            1.609420096732717,
+            1.0,
+            1.0515346005203996,
+            2.778411439103282,
+            4.282795501942834,
+            2.986262247251089,
+            3.5585944410421164,
+            5.811724913756676,
+            7.119203135431646,
+            8.0,
+            2.5925959550776896,
+            1.0,
+            1.0,
+            1.6591486366170949,
+            4.372894004001342,
+            2.4371800456403356,
+            1.3158665392812854,
+            3.524203973462011,
+            3.824105715519657,
+            6.127456848991475,
+            4.1849385816072555,
+            2.044573638149189,
+            2.958049790302484,
+            2.1122222064394576,
+            6.083656710257774,
+            5.708714375082879,
+            3.398078964972221,
+            5.301482740803119,
+            5.982805284959382,
+            6.521200258044789,
+            3.501632661837138,
+            2.2660851445575223,
+            5.084109560065783,
+            3.8678474756306365,
+            5.205436846611172,
+            5.424285390110229,
+            3.0688701373988354,
+            4.946915315783958,
+            5.13451519955948,
+            5.8628058448608,
+            1.986017360997654,
+            2.2818732657988643,
+            2.471338999348178,
+            5.1859137009052265,
+            6.576441633841625,
+            4.687728078492773,
+            1.5334374469590868,
+            6.504324595308734,
+            5.350529158393245,
+            5.321600138398312,
+            3.181025193259936,
+            2.8949132472461723,
+            5.857362598104042,
+            7.822404869323578,
+            5.666883982110092,
+            4.657268856373125,
+            4.439022623375225,
+            5.8090284460950565,
+            5.195894098813175,
+            5.459835190507572,
+            1.705803819054489,
+            3.424635324501761,
+            4.4074358046316435,
+            2.2417134662697946,
+            5.82994325167567,
+            6.4627681414523845,
+            6.273030754638173,
+            5.289524111052564,
+            8.0,
+            7.024141677273456,
+            2.4846333217546444,
+            3.182374701416424,
+            3.324547601895643,
+            1.8933211231369014,
+            5.111392384469608,
+            7.268378917765277,
+            7.12778324860589,
+            8.0,
+            7.755186799502751,
+            8.0,
+            2.2596148878177535,
+            2.741045637627748,
+            2.1452266429270956,
+            1.8973160441753687,
+            5.426669141193214,
+            5.45992168176052,
+            5.855586250305649,
+            8.0,
+            7.325284504780275,
+            8.0,
+            2.3865470360086274,
+            2.4009628888743553,
+            5.761686742216664,
+            6.427873276616176,
+            6.689714935440602,
+            4.749073730225176,
+            5.31632515753265,
+            6.612751973575912,
+            5.700912341666603,
+            7.139726497966095,
+        ];
+        assert_eq!(res.realizations[0].len(), expected.len());
+        for (a, b) in res.realizations[0].iter().zip(&expected) {
+            assert!((a - b).abs() < 1e-12, "{a} vs {b}");
+        }
     }
 }

@@ -431,6 +431,31 @@ def sgs(
     """Conditional sequential Gaussian simulation. Returns an
     ``n_realizations x n_cells`` array, one row per realization."""
 
+def tgs(
+    x: Sequence[float],
+    y: Sequence[float],
+    categories: Sequence[int],
+    model: VariogramModel,
+    bbox: tuple[float, float, float, float],
+    nx: int,
+    ny: int,
+    n_categories: Optional[int] = None,
+    proportions: Optional[Sequence[float]] = None,
+    n_realizations: int = 10,
+    seed: int = 42,
+    max_neighbors: int = 16,
+    radius: Optional[float] = None,
+    decluster_cell: Optional[float] = None,
+    max_node_neighbors: Optional[int] = None,
+    multigrid: int = 0,
+) -> FloatArray:
+    """Truncated Gaussian simulation (TGS) for ordered categorical/facies
+    data: one underlying Gaussian field truncated at thresholds derived
+    from global category proportions. ``model`` must already be a
+    variogram of the underlying standard-Gaussian field (sill ~ 1) -- not
+    auto-fitted. Returns an ``n_realizations x n_cells`` array of category
+    ids (as floats), one row per realization."""
+
 def sis(
     x: Sequence[float],
     y: Sequence[float],

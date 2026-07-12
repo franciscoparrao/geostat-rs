@@ -64,8 +64,12 @@ Not yet published to crates.io/PyPI — build from source (see below).
 - **Simulation** — conditional sequential **Gaussian** simulation
   (normal-score transform, GSLIB-style tail extrapolation, cell
   declustering + weighted normal scores, multiple-grid path, separate
-  data/simulated-node neighbor quotas) and sequential **indicator**
-  simulation (ccdf with order-relation corrections), both with a
+  data/simulated-node neighbor quotas), sequential **indicator** simulation
+  (ccdf with order-relation corrections), and **truncated Gaussian
+  simulation** (TGS) for ordered categorical/facies data (thresholds from
+  global category proportions via the inverse-normal CDF; GSLIB `tgsim`-
+  equivalent — full plurigaussian simulation, with a flexible 2-D
+  truncation rule for non-ordered facies, is not implemented), all with a
   deterministic, platform-independent RNG (xoshiro256++) and incremental
   bucket-grid neighbor search: same seed, same realizations, anywhere.
 - **Mathematical interpolators** — inverse-distance weighting and
@@ -187,6 +191,12 @@ geostat cv -i meuse.csv --value-col zinc -m model.json --blocks 4,4 --accuracy
 geostat collocated-cokrige -i meuse.csv --value-col lzinc --secondary-col llead \
     -m model.json --targets grid_with_secondary.csv --target-secondary-col llead \
     -o collocated.csv
+
+# 18. Truncated Gaussian simulation: ordered facies from global proportions
+#     (--value-col holds integer category codes; model is of the
+#     underlying standard-Gaussian field, not auto-fitted)
+geostat tgs -i drillholes.csv --value-col facies -m facies_model.json \
+    --nx 100 --ny 100 -n 50 --seed 42 -o facies_sims.csv
 ```
 
 Other useful flags: `--azimuth/--dip/--tolerance` (directional variograms,
@@ -294,6 +304,12 @@ pred, var = gs.krige_grid(x, y, vals, model, bbox=(0, 0, 100, 100),
                           nx=50, ny=50, max_neighbors=32)
 sims = gs.sgs(x, y, vals, model_ns, bbox=(0, 0, 100, 100), nx=50, ny=50,
               n_realizations=100, seed=42)
+
+# Truncated Gaussian simulation: ordered facies from global proportions
+# (facies_model is of the underlying standard-Gaussian field, sill ~ 1,
+# not auto-fitted; proportions estimated from `facies` frequency if omitted)
+facies_sims = gs.tgs(x, y, facies, facies_model, bbox=(0, 0, 100, 100),
+                      nx=50, ny=50, n_realizations=50, seed=42)
 
 # 3-D (drillhole-style data)
 m3 = gs.fit_variogram_3d(x, y, z, grade, n_lags=12, max_dist=200.0)
