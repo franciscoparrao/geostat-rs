@@ -268,7 +268,35 @@ impl<'a, const D: usize> CollocatedCokriging<'a, D> {
             lagrange: None,
         })
     }
+
+    /// Predictions at many targets, in parallel. `secondary[i]` is the
+    /// secondary value collocated with `targets[i]`. A target that fails
+    /// (e.g. a near-singular local system) gets a NaN estimate rather than
+    /// aborting the whole batch, matching [`crate::kriging::Kriging::predict_many`].
+    pub fn predict_many(
+        &self,
+        targets: &[[f64; D]],
+        secondary: &[f64],
+    ) -> Result<Vec<KrigingEstimate>> {
+        if targets.len() != secondary.len() {
+            return Err(GeostatError::DimensionMismatch(format!(
+                "{} targets vs {} secondary values",
+                targets.len(),
+                secondary.len()
+            )));
+        }
+        Ok(crate::parallel::par_map(targets.len(), |i| {
+            self.predict(targets[i], secondary[i])
+                .unwrap_or(NAN_ESTIMATE)
+        }))
+    }
 }
+
+const NAN_ESTIMATE: KrigingEstimate = KrigingEstimate {
+    value: f64::NAN,
+    variance: f64::NAN,
+    lagrange: None,
+};
 
 fn sep<const D: usize>(a: [f64; D], b: [f64; D]) -> [f64; D] {
     let mut dh = [0.0; D];
@@ -386,6 +414,37 @@ mod tests {
                 exact.variance
             );
         }
+    }
+
+    #[test]
+    fn predict_many_matches_looped_predict() {
+        let data = primary();
+        let m = model1();
+        let cck = CollocatedCokriging::new(
+            &data,
+            &m,
+            data.mean(),
+            1.0,
+            0.6,
+            1.0,
+            2.0,
+            MarkovModel::Mm1,
+            CollocatedConfig::default(),
+        )
+        .unwrap();
+
+        let targets = [[3.0, 4.0], [7.0, 2.0], [5.0, 5.0], [-1.0, -1.0]];
+        let secondary = [10.0, -3.0, 4.2, 0.0];
+        let batch = cck.predict_many(&targets, &secondary).unwrap();
+        assert_eq!(batch.len(), targets.len());
+        for (i, &t) in targets.iter().enumerate() {
+            let single = cck.predict(t, secondary[i]).unwrap();
+            assert!((batch[i].value - single.value).abs() < 1e-12);
+            assert!((batch[i].variance - single.variance).abs() < 1e-12);
+        }
+
+        let err = cck.predict_many(&targets, &secondary[..2]).unwrap_err();
+        assert!(matches!(err, GeostatError::DimensionMismatch(_)));
     }
 
     #[test]

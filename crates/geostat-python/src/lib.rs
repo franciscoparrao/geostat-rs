@@ -932,6 +932,108 @@ fn co_kriging(
     Ok((arr1(gil, values), arr1(gil, variances)))
 }
 
+/// Estimates `(rho12, sigma1, sigma2)` from collocated sample pairs
+/// (Pearson correlation and sample standard deviations) -- the usual
+/// inputs to `collocated_cokriging` when no external population estimate
+/// of these statistics is available.
+#[pyfunction]
+fn collocated_stats(primary: Vec<f64>, secondary: Vec<f64>) -> PyResult<(f64, f64, f64)> {
+    core::estimate_collocated_stats(&primary, &secondary).map_err(err)
+}
+
+/// Collocated cokriging (MM1/MM2, Journel 1999): predicts the primary
+/// variable from its own moving neighborhood plus a *single* secondary
+/// value collocated with each target, deriving the cross-covariance from a
+/// Markov screening hypothesis instead of a fitted cross-variogram -- the
+/// practical choice when the secondary is exhaustively sampled (a raster/
+/// seismic grid) and only one value is available at each prediction point.
+/// `mean1`/`mean2` are the (population) means of the primary/secondary;
+/// `rho12` is their zero-separation correlation; `sigma1`/`sigma2` their
+/// marginal standard deviations -- see `collocated_stats` to estimate the
+/// three from collocated sample pairs. `markov` is `"mm1"` (default, needs
+/// only `model`) or `"mm2"` (needs `secondary_model`, the secondary's own
+/// variogram). Simple-kriging form only (known means): the ordinary/
+/// unknown-mean system for collocated cokriging is well known to be
+/// unstable (GSLIB/SGeMS default to simple kriging here too). Returns
+/// `(predictions, variances)` of the primary at the targets; a target that
+/// fails (e.g. a near-singular local system) gets NaN rather than aborting
+/// the whole batch.
+#[pyfunction]
+#[pyo3(signature = (x, y, values, model, target_x, target_y, target_secondary,
+    mean1, mean2, rho12, sigma1, sigma2, markov = "mm1", secondary_model = None,
+    max_neighbors = None, radius = None, ridge = 0.0))]
+#[allow(clippy::too_many_arguments)]
+fn collocated_cokriging(
+    py: Python<'_>,
+    x: Vec<f64>,
+    y: Vec<f64>,
+    values: Vec<f64>,
+    model: &VariogramModel,
+    target_x: Vec<f64>,
+    target_y: Vec<f64>,
+    target_secondary: Vec<f64>,
+    mean1: f64,
+    mean2: f64,
+    rho12: f64,
+    sigma1: f64,
+    sigma2: f64,
+    markov: &str,
+    secondary_model: Option<&VariogramModel>,
+    max_neighbors: Option<usize>,
+    radius: Option<f64>,
+    ridge: f64,
+) -> PyResult<ArrayPair> {
+    if target_x.len() != target_y.len() || target_x.len() != target_secondary.len() {
+        return Err(PyValueError::new_err(
+            "target_x, target_y and target_secondary must have the same length",
+        ));
+    }
+    let data = point_set(x, y, values)?;
+    let markov_model = match markov.trim().to_lowercase().as_str() {
+        "mm1" => core::MarkovModel::Mm1,
+        "mm2" => {
+            let secondary_model = secondary_model
+                .ok_or_else(|| PyValueError::new_err("markov='mm2' requires secondary_model"))?;
+            core::MarkovModel::Mm2 {
+                secondary_model: secondary_model.inner.clone(),
+            }
+        }
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown markov '{other}' (expected 'mm1' or 'mm2')"
+            )));
+        }
+    };
+    let targets: Vec<[f64; 2]> = target_x
+        .into_iter()
+        .zip(target_y)
+        .map(|(tx, ty)| [tx, ty])
+        .collect();
+    // `CollocatedConfig` is `#[non_exhaustive]`: build from
+    // `Default::default()` and assign fields.
+    let mut config = core::CollocatedConfig::default();
+    config.max_neighbors = max_neighbors;
+    config.search_radius = radius;
+    config.ridge = ridge;
+    let (values, variances) = py.allow_threads(|| {
+        let ck = core::CollocatedCokriging::new(
+            &data,
+            &model.inner,
+            mean1,
+            mean2,
+            rho12,
+            sigma1,
+            sigma2,
+            markov_model,
+            config,
+        )
+        .map_err(err)?;
+        let ests = ck.predict_many(&targets, &target_secondary).map_err(err)?;
+        Ok::<_, PyErr>(ests.into_iter().map(|e| (e.value, e.variance)).unzip())
+    })?;
+    Ok((arr1(py, values), arr1(py, variances)))
+}
+
 /// Inverse-distance weighting at the targets. `power` controls locality
 /// (2 is typical); exact at the data. Returns a list of predictions.
 #[pyfunction]
@@ -1628,6 +1730,8 @@ fn geostat_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(idw, m)?)?;
     m.add_function(wrap_pyfunction!(knn, m)?)?;
     m.add_function(wrap_pyfunction!(co_kriging, m)?)?;
+    m.add_function(wrap_pyfunction!(collocated_cokriging, m)?)?;
+    m.add_function(wrap_pyfunction!(collocated_stats, m)?)?;
     m.add_function(wrap_pyfunction!(compare_methods, m)?)?;
     m.add_function(wrap_pyfunction!(tune_idw_power, m)?)?;
     m.add_function(wrap_pyfunction!(tune_knn_k, m)?)?;

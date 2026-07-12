@@ -7,10 +7,11 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use geostat_core::{
-    Anisotropy, CoKriging, CoKrigingConfig, DirectionConfig, EstimatorKind, Grid2D, IkConfig,
-    Kriging, KrigingConfig, KrigingMethod, ModelKind, PointSet, SgsConfig, SisConfig, Tails,
-    VariogramConfig, VariogramModel, block_cv, cell_declustering_weights, decluster_scan,
-    default_lag_width, detrend_external, detrend_polynomial, experimental_variogram,
+    Anisotropy, CoKriging, CoKrigingConfig, CollocatedCokriging, CollocatedConfig, DirectionConfig,
+    EstimatorKind, Grid2D, IkConfig, Kriging, KrigingConfig, KrigingMethod, MarkovModel, ModelKind,
+    PointSet, SgsConfig, SisConfig, Tails, VariogramConfig, VariogramModel, block_cv,
+    cell_declustering_weights, decluster_scan, default_lag_width, detrend_external,
+    detrend_polynomial, estimate_collocated_stats, experimental_variogram,
     experimental_variogram_robust, fit_anisotropic, fit_best, fit_indicator_models,
     fit_lmc_collocated, fit_median_indicator_model, indicator_kriging, k_fold, leave_one_out,
     leave_one_out_with_drift, sequential_gaussian_simulation, sequential_indicator_simulation,
@@ -38,6 +39,11 @@ enum Command {
     Krige(KrigeCmd),
     /// Ordinary co-kriging with a secondary variable (LMC)
     Cokrige(CokrigeCmd),
+    /// Collocated co-kriging (MM1/MM2): a moving primary neighborhood plus
+    /// one secondary value collocated with each target -- for an
+    /// exhaustively sampled secondary (raster/seismic) where fitting a full
+    /// cross-variogram isn't practical
+    CollocatedCokrige(CollocatedCokrigeCmd),
     /// Leave-one-out cross-validation of a variogram model
     Cv(CvCmd),
     /// Conditional sequential Gaussian simulation
@@ -461,6 +467,54 @@ struct CokrigeCmd {
 }
 
 #[derive(Args)]
+struct CollocatedCokrigeCmd {
+    #[command(flatten)]
+    input: InputOpts,
+    /// Column with the secondary variable, collocated at primary locations
+    /// -- used only to auto-estimate mean1/mean2/rho12/sigma1/sigma2 (via
+    /// their sample statistics); pass --stats instead to skip this and
+    /// supply population values directly
+    #[arg(long)]
+    secondary_col: Option<String>,
+    /// Explicit "mean1,mean2,rho12,sigma1,sigma2" (skips auto-estimation
+    /// from --secondary-col; one of the two is required)
+    #[arg(long, value_name = "M1,M2,RHO,S1,S2")]
+    stats: Option<String>,
+    /// Fitted variogram model for the primary (JSON)
+    #[arg(short, long)]
+    model: PathBuf,
+    /// Markov screening hypothesis: mm1 (default, needs only the primary's
+    /// variogram) or mm2 (needs --secondary-model, the secondary's own
+    /// variogram)
+    #[arg(long, default_value = "mm1")]
+    markov: String,
+    /// Secondary's own variogram model (JSON); required with --markov mm2
+    #[arg(long)]
+    secondary_model: Option<PathBuf>,
+    /// Targets CSV: x, y and a column with the secondary value collocated
+    /// with each target -- the defining requirement of collocated
+    /// cokriging (one secondary value per prediction location, e.g.
+    /// sampled from an exhaustive raster with `gpkg-sample`)
+    #[arg(long)]
+    targets: PathBuf,
+    /// Column in --targets with the secondary value at each target
+    #[arg(long, default_value = "secondary")]
+    target_secondary_col: String,
+    #[command(flatten)]
+    neighbors: NeighborOpts,
+    /// Diagonal inflation of the collocated system (0 = exact system)
+    #[arg(long, default_value_t = 0.0)]
+    ridge: f64,
+    /// Output file (x,y,prediction,variance). A .gpkg extension writes a
+    /// GeoPackage point layer instead of CSV
+    #[arg(short, long)]
+    output: PathBuf,
+    /// CRS (EPSG/srs_id) recorded when writing a GeoPackage output
+    #[arg(long, default_value_t = 0)]
+    srs: i32,
+}
+
+#[derive(Args)]
 struct CvCmd {
     #[command(flatten)]
     input: InputOpts,
@@ -720,6 +774,7 @@ fn main() -> Result<()> {
         Command::Vmap(cmd) => run_vmap(cmd),
         Command::Krige(cmd) => run_krige(cmd),
         Command::Cokrige(cmd) => run_cokrige(cmd),
+        Command::CollocatedCokrige(cmd) => run_collocated_cokrige(cmd),
         Command::Cv(cmd) => run_cv(cmd),
         Command::Sgs(cmd) => run_sgs(cmd),
         Command::Declus(cmd) => run_declus(cmd),
@@ -1672,6 +1727,90 @@ fn run_cokrige(cmd: CokrigeCmd) -> Result<()> {
         n_nan
     );
     io_utils::write_grid_csv(&cmd.output, &grid, &values, &variances)?;
+    println!("Output written to {}", cmd.output.display());
+    Ok(())
+}
+
+fn run_collocated_cokrige(cmd: CollocatedCokrigeCmd) -> Result<()> {
+    if cmd.neighbors.min_neighbors.is_some()
+        || cmd.neighbors.octant.is_some()
+        || cmd.neighbors.search_azimuth.is_some()
+    {
+        bail!("--min-neighbors/--octant/--search-azimuth are not supported by this command yet");
+    }
+    let model = io_utils::read_model(&cmd.model)?;
+
+    let (primary, mean1, mean2, rho12, sigma1, sigma2) = match (&cmd.stats, &cmd.secondary_col) {
+        (Some(spec), _) => {
+            let v = parse_floats(spec)?;
+            if v.len() != 5 {
+                bail!("--stats takes 5 comma-separated values: mean1,mean2,rho12,sigma1,sigma2");
+            }
+            (cmd.input.read()?, v[0], v[1], v[2], v[3], v[4])
+        }
+        (None, Some(col)) => {
+            let (primary, extras) = cmd.input.read_with_extras(std::slice::from_ref(col))?;
+            let secondary_vals: Vec<f64> = extras.iter().map(|r| r[0]).collect();
+            let primary_vals: Vec<f64> = (0..primary.len()).map(|i| primary.value(i)).collect();
+            let (rho12, sigma1, sigma2) =
+                estimate_collocated_stats(&primary_vals, &secondary_vals)?;
+            let mean1 = primary_vals.iter().sum::<f64>() / primary_vals.len() as f64;
+            let mean2 = secondary_vals.iter().sum::<f64>() / secondary_vals.len() as f64;
+            println!(
+                "Auto-estimated from {} collocated pairs: mean1={mean1:.4} mean2={mean2:.4} \
+                 rho12={rho12:.4} sigma1={sigma1:.4} sigma2={sigma2:.4}",
+                primary.len()
+            );
+            (primary, mean1, mean2, rho12, sigma1, sigma2)
+        }
+        (None, None) => bail!(
+            "collocated cokriging needs either --stats or --secondary-col (to auto-estimate \
+             from collocated pairs)"
+        ),
+    };
+    println!("Loaded {} primary points; model: {model}", primary.len());
+
+    let secondary_model = cmd
+        .secondary_model
+        .as_ref()
+        .map(|path| io_utils::read_model(path))
+        .transpose()?;
+    let markov = match cmd.markov.trim().to_lowercase().as_str() {
+        "mm1" => {
+            if secondary_model.is_some() {
+                bail!("--secondary-model is only used with --markov mm2");
+            }
+            MarkovModel::Mm1
+        }
+        "mm2" => MarkovModel::Mm2 {
+            secondary_model: secondary_model.context("--markov mm2 requires --secondary-model")?,
+        },
+        other => bail!("unknown --markov '{other}' (expected mm1 or mm2)"),
+    };
+
+    let mut config = CollocatedConfig::default();
+    config.max_neighbors = cmd.neighbors.max_neighbors;
+    config.search_radius = cmd.neighbors.radius;
+    config.ridge = cmd.ridge;
+    let ck = CollocatedCokriging::new(
+        &primary, &model, mean1, mean2, rho12, sigma1, sigma2, markov, config,
+    )?;
+
+    let (coords, extras) = io_utils::read_targets(
+        &cmd.targets,
+        &cmd.input.x_col,
+        &cmd.input.y_col,
+        std::slice::from_ref(&cmd.target_secondary_col),
+    )?;
+    let secondary_at_targets: Vec<f64> = extras.into_iter().map(|r| r[0]).collect();
+    let ests = ck.predict_many(&coords, &secondary_at_targets)?;
+    let n_nan = ests.iter().filter(|e| e.value.is_nan()).count();
+    println!(
+        "Collocated co-kriged {} targets; {} empty (no neighbors)",
+        coords.len(),
+        n_nan
+    );
+    write_estimates_result(&cmd.output, &coords, &ests, cmd.srs)?;
     println!("Output written to {}", cmd.output.display());
     Ok(())
 }

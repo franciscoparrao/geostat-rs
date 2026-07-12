@@ -6,6 +6,22 @@ before 0.7.0 predate this file and are reconstructed from commit history.
 
 ## [Unreleased]
 
+### Added
+- Collocated cokriging (MM1/MM2, Journel 1999) exposed in the CLI
+  (`geostat collocated-cokrige`) and Python (`collocated_cokriging`,
+  `collocated_stats`) — the core (`crates/geostat-core/src/collocated.rs`)
+  has had this since the Fase 6 #17 session, but it was never wired up to
+  either surface. Takes an explicit primary variogram model (and, for MM2,
+  the secondary's own model) plus `mean1/mean2/rho12/sigma1/sigma2` (either
+  supplied directly or auto-estimated from collocated sample pairs via the
+  new `estimate_collocated_stats` exposure); predicts at explicit targets
+  carrying one secondary value each (e.g. sampled from an exhaustive raster
+  with `gpkg-sample`), since that per-target secondary value is the whole
+  point of collocated cokriging. New `CollocatedCokriging::predict_many`
+  in the core (parallel batch prediction, NaN on a per-target failure
+  instead of aborting, matching `Kriging::predict_many`'s convention) backs
+  both surfaces.
+
 ## [0.8.0] — 2026-07-10
 
 Fase 6 operational-gap closing (`docs/AUDIT-2026-07-v2.md` §7) plus Fase 7,

@@ -286,6 +286,44 @@ def co_kriging(
     secondary (linear model of coregionalization, fitted automatically).
     Returns ``(predictions, variances)`` of the primary."""
 
+def collocated_stats(
+    primary: Sequence[float],
+    secondary: Sequence[float],
+) -> tuple[float, float, float]:
+    """Estimates ``(rho12, sigma1, sigma2)`` from collocated sample pairs
+    (Pearson correlation and sample standard deviations) -- the usual
+    inputs to ``collocated_cokriging`` when no external population
+    estimate of these statistics is available."""
+
+def collocated_cokriging(
+    x: Sequence[float],
+    y: Sequence[float],
+    values: Sequence[float],
+    model: VariogramModel,
+    target_x: Sequence[float],
+    target_y: Sequence[float],
+    target_secondary: Sequence[float],
+    mean1: float,
+    mean2: float,
+    rho12: float,
+    sigma1: float,
+    sigma2: float,
+    markov: str = "mm1",
+    secondary_model: Optional[VariogramModel] = None,
+    max_neighbors: Optional[int] = None,
+    radius: Optional[float] = None,
+    ridge: float = 0.0,
+) -> tuple[FloatArray, FloatArray]:
+    """Collocated cokriging (MM1/MM2, Journel 1999): predicts the primary
+    from its own moving neighborhood plus a single secondary value
+    collocated with each target, via a Markov screening hypothesis instead
+    of a fitted cross-variogram -- the practical choice for an
+    exhaustively sampled secondary (raster/seismic). ``markov`` is
+    ``"mm1"`` (default, needs only ``model``) or ``"mm2"`` (needs
+    ``secondary_model``). Simple-kriging form only (known means: ``mean1``/
+    ``mean2``). Returns ``(predictions, variances)`` of the primary at the
+    targets; a target that fails yields NaN rather than aborting the batch."""
+
 def idw(
     x: Sequence[float],
     y: Sequence[float],

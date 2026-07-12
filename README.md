@@ -42,13 +42,13 @@ Not yet published to crates.io/PyPI — build from source (see below).
   prediction (2-variable iterated Goulard–Voltz fit) with PSD projection.
 - **Kriging** — simple, ordinary, universal (polynomial drift) and
   **external drift** (KED); **ordinary co-kriging** (collocated or
-  **heterotopic**) and **collocated cokriging** (MM1/MM2, Journel 1999,
-  core-only for now) under a linear model of coregionalization; **block
-  kriging** and **block co-kriging** with explicit discretization;
-  **lognormal kriging** (unbiased back-transform); **median/ordinary
-  indicator kriging** (local ccdf, E-type estimate, conditional variance),
-  with **Markov-Bayes** calibration of soft secondary data (core-only);
-  **regression kriging** (a trend fitted separately — built-in OLS or any
+  **heterotopic**) and **collocated cokriging** (MM1/MM2, Journel 1999)
+  under a linear model of coregionalization; **block kriging** and **block
+  co-kriging** with explicit discretization; **lognormal kriging**
+  (unbiased back-transform); **median/ordinary indicator kriging** (local
+  ccdf, E-type estimate, conditional variance), with **Markov-Bayes**
+  calibration of soft secondary data (core-only); **regression kriging** (a
+  trend fitted separately — built-in OLS or any
   external/ML model — plus kriging of its residuals); per-datum
   **measurement error** (gstat `Err`); octant search (GSLIB `noct`) and
   `min_neighbors` (`ndmin`); **anisotropic (rotated-ellipsoid) search**
@@ -181,6 +181,12 @@ geostat krige -i drillholes.csv --value-col grade -m model_ml.json \
 
 # 16. Spatial block CV + Deutsch accuracy plot (honest error under autocorrelation)
 geostat cv -i meuse.csv --value-col zinc -m model.json --blocks 4,4 --accuracy
+
+# 17. Collocated cokriging (MM1): one secondary value per target (e.g. a
+#     raster sampled with gpkg-sample), no cross-variogram needed
+geostat collocated-cokrige -i meuse.csv --value-col lzinc --secondary-col llead \
+    -m model.json --targets grid_with_secondary.csv --target-secondary-col llead \
+    -o collocated.csv
 ```
 
 Other useful flags: `--azimuth/--dip/--tolerance` (directional variograms,
@@ -305,6 +311,16 @@ rk["prediction"], rk["variance"], rk["trend_coef"]
 # Ordinary co-kriging with a correlated secondary (auto-fitted LMC;
 # collocated or heterotopic; `ridge` stabilizes the system).
 pred, var = gs.co_kriging(px, py, pv, sx, sy, sv, tx, ty)
+
+# Collocated cokriging (MM1/MM2): one secondary value per target instead
+# of a fitted cross-variogram -- the practical fit for an exhaustively
+# sampled secondary (raster/seismic). `collocated_stats` estimates
+# rho12/sigma1/sigma2 from collocated sample pairs when you don't already
+# know the population values.
+rho12, sigma1, sigma2 = gs.collocated_stats(pv, sv_at_primary)
+pred, var = gs.collocated_cokriging(px, py, pv, model, tx, ty, secondary_at_targets,
+                                     mean1=pv.mean(), mean2=sv_at_primary.mean(),
+                                     rho12=rho12, sigma1=sigma1, sigma2=sigma2)
 
 # Baselines + method comparison by leave-one-out VEcv.
 idw_pred = gs.idw(x, y, vals, tx, ty, power=2.0, max_neighbors=16)

@@ -395,3 +395,196 @@ fn gpkg_input_fails_clearly_instead_of_falling_through_to_the_csv_parser() {
         std::fs::remove_file(p).ok();
     }
 }
+
+#[test]
+fn collocated_cokrige_auto_stats_stats_and_mm2_all_agree_and_reject_bad_input() {
+    let primary = temp_path("cck-primary.csv");
+    let targets = temp_path("cck-targets.csv");
+    let model = temp_path("cck-model.json");
+    let secondary_model = temp_path("cck-secondary-model.json");
+    let out_auto = temp_path("cck-out-auto.csv");
+    let out_stats = temp_path("cck-out-stats.csv");
+    let out_mm2 = temp_path("cck-out-mm2.csv");
+
+    std::fs::write(
+        &primary,
+        "x,y,z,secondary\n\
+         0,0,1.0,2.1\n\
+         10,0,2.0,3.9\n\
+         0,10,1.5,3.0\n\
+         10,10,2.5,5.2\n\
+         5,5,1.8,3.6\n\
+         2,8,1.2,2.5\n\
+         8,2,2.2,4.4\n",
+    )
+    .unwrap();
+    std::fs::write(&targets, "x,y,secondary\n3,4,2.8\n7,7,4.5\n1,1,2.0\n").unwrap();
+    std::fs::write(
+        &model,
+        r#"{"nugget":0.0,"structures":[{"kind":"spherical","sill":0.5,"range":12.0}]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &secondary_model,
+        r#"{"nugget":0.0,"structures":[{"kind":"spherical","sill":1.0,"range":12.0}]}"#,
+    )
+    .unwrap();
+
+    // Auto-estimated stats from --secondary-col.
+    let out = run(geostat().args([
+        "collocated-cokrige",
+        "-i",
+        primary.to_str().unwrap(),
+        "--value-col",
+        "z",
+        "--secondary-col",
+        "secondary",
+        "-m",
+        model.to_str().unwrap(),
+        "--targets",
+        targets.to_str().unwrap(),
+        "--target-secondary-col",
+        "secondary",
+        "-o",
+        out_auto.to_str().unwrap(),
+    ]));
+    assert_success(&out, "collocated-cokrige (auto stats)");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Auto-estimated from 7 collocated pairs"),
+        "unexpected stdout: {stdout}"
+    );
+    let csv_auto = std::fs::read_to_string(&out_auto).unwrap();
+    assert_eq!(csv_auto.lines().next().unwrap(), "x,y,prediction,variance");
+    assert_eq!(csv_auto.lines().count(), 1 + 3, "header plus 3 targets");
+
+    // Explicit --stats should agree closely with the auto-estimated run
+    // (same underlying sample, just supplied by hand instead of computed).
+    let out = run(geostat().args([
+        "collocated-cokrige",
+        "-i",
+        primary.to_str().unwrap(),
+        "--value-col",
+        "z",
+        "--stats",
+        "1.7428571428571427,3.5285714285714285,0.9959533685290869,\
+         0.5010193690500052,1.005292119186239",
+        "-m",
+        model.to_str().unwrap(),
+        "--targets",
+        targets.to_str().unwrap(),
+        "--target-secondary-col",
+        "secondary",
+        "-o",
+        out_stats.to_str().unwrap(),
+    ]));
+    assert_success(&out, "collocated-cokrige (explicit stats)");
+    let csv_stats = std::fs::read_to_string(&out_stats).unwrap();
+    // Not exact-string-equal: the hand-copied --stats literal is a rounded
+    // decimal render of the auto-estimated f64s, so results agree only to
+    // that rounding, not bit-for-bit.
+    for (auto_line, stats_line) in csv_auto.lines().skip(1).zip(csv_stats.lines().skip(1)) {
+        let auto_vals: Vec<f64> = auto_line.split(',').map(|s| s.parse().unwrap()).collect();
+        let stats_vals: Vec<f64> = stats_line.split(',').map(|s| s.parse().unwrap()).collect();
+        for (a, b) in auto_vals.iter().zip(&stats_vals) {
+            assert!(
+                (a - b).abs() < 1e-9,
+                "auto vs explicit stats mismatch: {a} vs {b}"
+            );
+        }
+    }
+
+    // MM2 with a proportional secondary model: per
+    // `mm1_and_mm2_agree_when_secondary_covariance_is_proportional_to_primary`
+    // in geostat-core, MM1 and MM2 should agree when sigma2^2 = k * sigma1^2
+    // with the secondary model's sill = k * primary model's sill -- not
+    // exactly that relationship here, but the command should still run
+    // end-to-end and produce the right shape.
+    let out = run(geostat().args([
+        "collocated-cokrige",
+        "-i",
+        primary.to_str().unwrap(),
+        "--value-col",
+        "z",
+        "--secondary-col",
+        "secondary",
+        "-m",
+        model.to_str().unwrap(),
+        "--markov",
+        "mm2",
+        "--secondary-model",
+        secondary_model.to_str().unwrap(),
+        "--targets",
+        targets.to_str().unwrap(),
+        "--target-secondary-col",
+        "secondary",
+        "-o",
+        out_mm2.to_str().unwrap(),
+    ]));
+    assert_success(&out, "collocated-cokrige (mm2)");
+    let csv_mm2 = std::fs::read_to_string(&out_mm2).unwrap();
+    assert_eq!(csv_mm2.lines().next().unwrap(), "x,y,prediction,variance");
+    assert_eq!(csv_mm2.lines().count(), 1 + 3);
+
+    // Error path: neither --stats nor --secondary-col.
+    let out = run(geostat().args([
+        "collocated-cokrige",
+        "-i",
+        primary.to_str().unwrap(),
+        "--value-col",
+        "z",
+        "-m",
+        model.to_str().unwrap(),
+        "--targets",
+        targets.to_str().unwrap(),
+        "--target-secondary-col",
+        "secondary",
+        "-o",
+        out_auto.to_str().unwrap(),
+    ]));
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--stats") && stderr.contains("--secondary-col"),
+        "unexpected stderr: {stderr}"
+    );
+
+    // Error path: --markov mm2 without --secondary-model.
+    let out = run(geostat().args([
+        "collocated-cokrige",
+        "-i",
+        primary.to_str().unwrap(),
+        "--value-col",
+        "z",
+        "--secondary-col",
+        "secondary",
+        "-m",
+        model.to_str().unwrap(),
+        "--markov",
+        "mm2",
+        "--targets",
+        targets.to_str().unwrap(),
+        "--target-secondary-col",
+        "secondary",
+        "-o",
+        out_auto.to_str().unwrap(),
+    ]));
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--secondary-model"),
+        "unexpected stderr: {stderr}"
+    );
+
+    for p in [
+        &primary,
+        &targets,
+        &model,
+        &secondary_model,
+        &out_auto,
+        &out_stats,
+        &out_mm2,
+    ] {
+        std::fs::remove_file(p).ok();
+    }
+}
