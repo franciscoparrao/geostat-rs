@@ -85,7 +85,9 @@ pub use kriging::{Kriging, KrigingConfig, KrigingEstimate, KrigingMethod, block_
 pub use regression::{OlsTrend, RegressionKriging, detrend_external, detrend_polynomial};
 pub use rng::Rng;
 pub use simulation::{
-    SgsConfig, SgsResult, sequential_gaussian_simulation, sequential_gaussian_simulation_3d, sgs_at,
+    SgsConfig, SgsResult, sequential_gaussian_simulation, sequential_gaussian_simulation_3d,
+    sequential_gaussian_simulation_vecchia, sgs_at, sgs_at_vecchia,
+    unconditional_gaussian_simulation,
 };
 pub use sis::{
     MarkovBayesCalibration, SisConfig, calibrate_markov_bayes, sequential_indicator_simulation,

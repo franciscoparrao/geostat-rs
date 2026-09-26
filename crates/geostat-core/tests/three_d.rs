@@ -5,8 +5,8 @@ use geostat_core::{
     CoKriging, CoKrigingConfig, CollocatedCokriging, CollocatedConfig, Grid3D, IkConfig, Kriging,
     KrigingConfig, KrigingMethod, Lmc, LmcStructure, MarkovModel, ModelKind, PointSet, Rng,
     SgsConfig, SisConfig, Structure, VariogramConfig, VariogramModel, experimental_variogram,
-    fit_best, indicator_kriging, leave_one_out, sequential_indicator_simulation_3d, sgs_at,
-    sis_at, vecchia_loglik, vecchia_mle, vecchia_mle_grouped, vecchia_predict, vecchia_reml,
+    fit_best, indicator_kriging, leave_one_out, sequential_indicator_simulation_3d, sgs_at, sis_at,
+    vecchia_loglik, vecchia_mle, vecchia_mle_grouped, vecchia_predict, vecchia_reml,
 };
 
 fn synthetic_3d(n: usize, seed: u64) -> PointSet<3> {
@@ -403,7 +403,9 @@ fn cokriging_3d_rejects_circular_model() {
         }],
     )
     .unwrap();
-    assert!(CoKriging::<3>::new(vec![&primary, &secondary], &lmc, CoKrigingConfig::default()).is_err());
+    assert!(
+        CoKriging::<3>::new(vec![&primary, &secondary], &lmc, CoKrigingConfig::default()).is_err()
+    );
 }
 
 #[test]
@@ -422,7 +424,9 @@ fn cokriging_3d_accepts_spherical_lmc() {
         }],
     )
     .unwrap();
-    assert!(CoKriging::<3>::new(vec![&primary, &secondary], &lmc, CoKrigingConfig::default()).is_ok());
+    assert!(
+        CoKriging::<3>::new(vec![&primary, &secondary], &lmc, CoKrigingConfig::default()).is_ok()
+    );
 }
 
 #[test]

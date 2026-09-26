@@ -549,11 +549,7 @@ fn loglik_grad_inner<const D: usize>(
                     .zip(dki_dp)
                     .map(|(&wj, &dkj)| wj * dkj)
                     .sum::<f64>();
-            let dvar = if clamped {
-                0.0
-            } else {
-                dsill_dp - dreduction
-            };
+            let dvar = if clamped { 0.0 } else { dsill_dp - dreduction };
             -0.5 * dvar / var + r * dmu / var + 0.5 * r * r / (var * var) * dvar
         };
 
@@ -1929,7 +1925,11 @@ fn se_from_hessian(hess_flat: impl Iterator<Item = f64>, n: usize) -> Vec<f64> {
             let mut e = vec![0.0; n];
             e[i] = 1.0;
             let col = lu.solve(e);
-            if col[i] > 0.0 { col[i].sqrt() } else { f64::NAN }
+            if col[i] > 0.0 {
+                col[i].sqrt()
+            } else {
+                f64::NAN
+            }
         })
         .collect()
 }
@@ -2721,7 +2721,11 @@ mod tests {
         let data = PointSet::new(coords, values).unwrap();
 
         let se = vecchia_param_se(&data, &truth, 12, None).unwrap();
-        assert!(se[0].is_nan(), "nugget SE should be NaN at the boundary, got {}", se[0]);
+        assert!(
+            se[0].is_nan(),
+            "nugget SE should be NaN at the boundary, got {}",
+            se[0]
+        );
         assert!(se[1].is_finite() && se[1] > 0.0, "sill SE {}", se[1]);
         assert!(se[2].is_finite() && se[2] > 0.0, "range SE {}", se[2]);
     }

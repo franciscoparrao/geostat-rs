@@ -395,6 +395,336 @@ fn simulate_one<const D: usize>(
     Ok(sim_ns.iter().map(|&s| ns.back_transform(s)).collect())
 }
 
+/// Runs **unconditional** sequential Gaussian simulation on a 2-D grid.
+///
+/// No conditioning data and no normal-score transform: each realization is
+/// a draw from the stationary Gaussian random function described by `model`
+/// itself — mean 0, variance equal to the total sill, spatial correlation
+/// per the variogram. The first node on the path draws from the marginal
+/// and every later node conditions only on previously simulated nodes
+/// (moving-neighborhood simple kriging, same engine as conditional SGS).
+///
+/// Intended for building synthetic truth fields (e.g. simulation studies
+/// where covariates with known ranges are needed). For values in data
+/// units, transform the returned Gaussian field yourself; config fields
+/// tied to conditioning data (`tails`, `decluster_weights`) are ignored.
+pub fn unconditional_gaussian_simulation(
+    model: &VariogramModel,
+    grid: &Grid2D,
+    cfg: &SgsConfig,
+) -> Result<SgsResult> {
+    if model.has_power() {
+        return Err(GeostatError::InvalidParameter(
+            "SGS needs a valid covariance function and cannot use the unbounded Power model".into(),
+        ));
+    }
+    if let Some(kind) = model.invalid_structure_for_dim(2) {
+        return Err(GeostatError::InvalidParameter(format!(
+            "{kind:?} is not a valid covariance in 2 dimensions"
+        )));
+    }
+    if cfg.n_realizations == 0 {
+        return Err(GeostatError::InvalidParameter(
+            "n_realizations must be at least 1".into(),
+        ));
+    }
+    if cfg.max_neighbors == 0 {
+        return Err(GeostatError::InvalidParameter(
+            "max_neighbors must be at least 1".into(),
+        ));
+    }
+    if let Some(r) = cfg.search_radius
+        && !(r > 0.0)
+    {
+        return Err(GeostatError::InvalidParameter(format!(
+            "search radius must be positive, got {r}"
+        )));
+    }
+
+    let levels = (cfg.multigrid > 0).then(|| {
+        (0..grid.n_cells())
+            .map(|i| grid_level(&[i % grid.nx, i / grid.nx], cfg.multigrid))
+            .collect::<Vec<u8>>()
+    });
+    let centers = grid.centers();
+    let mut min = centers[0];
+    let mut max = centers[0];
+    for c in &centers {
+        for d in 0..2 {
+            min[d] = min[d].min(c[d]);
+            max[d] = max[d].max(c[d]);
+        }
+    }
+    // Empty conditioning set: an empty (but well-formed) bucket grid keeps
+    // `simulate_gaussian_path` on the exact same code path as conditional
+    // SGS — its data queries just come back empty.
+    let no_coords: &[[f64; 2]] = &[];
+    let data_grid = BucketGrid::new(min, max, 0);
+
+    let realizations = crate::parallel::par_try_map(cfg.n_realizations, |r| {
+        let mut seed_state = cfg.seed ^ (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let seed_r = splitmix64(&mut seed_state);
+        simulate_gaussian_path(
+            no_coords,
+            &[],
+            &data_grid,
+            model,
+            &centers,
+            levels.as_deref(),
+            (min, max),
+            cfg.max_neighbors,
+            cfg.search_radius,
+            cfg.max_node_neighbors,
+            seed_r,
+        )
+    })?;
+    Ok(SgsResult {
+        grid: grid.clone(),
+        realizations,
+    })
+}
+
+// ─── Vecchia-ordered SGS ────────────────────────────────────────────────
+
+/// One Vecchia-ordered Gaussian realisation: sequential conditioning along a
+/// deterministic **max-min path** (Vecchia 1988; Katzfuss & Guinness 2021),
+/// instead of the random path of classic SGS.
+///
+/// The max-min order visits a spatially spread kernel first and always
+/// conditions each node on its `m` nearest *predecessors* (data ∪ already
+/// simulated nodes). Two consequences matter for large-scale use:
+///
+/// 1. **Reproducibility**: the path is fixed, so the neighbourhood structure
+///    (the "sparse Cholesky pattern") is identical across realisations and
+///    threads — no RNG-dependent layout, bit-for-bit stable results.
+/// 2. **Accuracy per neighbour**: a max-min ordering keeps conditioning
+///    points spread out, so a small `m` captures more of the local
+///    covariance than the same `m` on a random path.
+///
+/// `m` is the conditioning size (≈ the number of nearest points considered),
+/// `seed` drives only the Gaussian draws, not the path. Returns one value per
+/// grid centre (units of `data`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn simulate_gaussian_path_vecchia<const D: usize>(
+    data_coords: &[[f64; D]],
+    data_scores: &[f64],
+    data_grid: &BucketGrid<D>,
+    model: &VariogramModel,
+    centers: &[[f64; D]],
+    path: &[usize],
+    extents: ([f64; D], [f64; D]),
+    m: usize,
+    search_radius: Option<f64>,
+    seed: u64,
+) -> Result<Vec<f64>> {
+    let mut rng = Rng::new(seed);
+    let n_cells = centers.len();
+    let n_data = data_coords.len();
+    let c0 = model.covariance_dh([0.0; D]);
+    let stabilizer = c0 * 1e-9;
+
+    // The max-min path is supplied (computed once, shared across
+    // realisation threads); seed drives only the Gaussian draws.
+
+    let (min, max) = extents;
+    let mut node_grid = BucketGrid::new(min, max, n_cells);
+    let mut cond_coords: Vec<[f64; D]> = data_coords.to_vec();
+    let mut cond_vals: Vec<f64> = data_scores.to_vec();
+
+    let mut sim_ns = vec![0.0_f64; n_cells];
+    let mut ws = SkWorkspace::default();
+    let mut nb: Vec<usize> = Vec::new();
+
+    let d2 = |a: [f64; D], b: [f64; D]| -> f64 {
+        let mut s = 0.0;
+        for d in 0..D {
+            let dd = a[d] - b[d];
+            s += dd * dd;
+        }
+        s
+    };
+
+    for &cell in path {
+        let target = centers[cell];
+        // Data predecessors (always) ∪ simulated-node predecessors, merged by
+        // distance and truncated to m (single-pool convention).
+        let nd = data_grid.k_nearest(target, m, search_radius);
+        let nn = node_grid.k_nearest(target, m, search_radius);
+        nb.clear();
+        let (mut a, mut b) = (0, 0);
+        while a < nd.len() || b < nn.len() {
+            let take_data = match (nd.get(a), nn.get(b)) {
+                (Some(&i), Some(&j)) => {
+                    d2(target, cond_coords[i]) <= d2(target, cond_coords[n_data + j])
+                }
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if take_data {
+                nb.push(nd[a]);
+                a += 1;
+            } else {
+                nb.push(n_data + nn[b]);
+                b += 1;
+            }
+        }
+        nb.truncate(m);
+
+        let (mean, var) = if nb.is_empty() {
+            (0.0, c0)
+        } else {
+            simple_kriging_ns(
+                &cond_coords,
+                &cond_vals,
+                model,
+                target,
+                &nb,
+                c0,
+                stabilizer,
+                &mut ws,
+            )?
+        };
+
+        let z = mean + var.max(0.0).sqrt() * rng.normal();
+        sim_ns[cell] = z;
+        node_grid.insert(target);
+        cond_coords.push(target);
+        cond_vals.push(z);
+    }
+
+    Ok(sim_ns)
+}
+
+/// Sequential Gaussian simulation with a **Vecchia (max-min) path** instead
+/// of the random path of classic SGS.
+///
+/// Pipeline is otherwise identical to [`sgs_at`] (normal-score transform →
+/// sequential conditioning → back-transform). The path is deterministic, so
+/// results with the same seed are bit-for-bit stable across thread counts.
+///
+/// `m` is the conditioning size (number of nearest predecessors per node).
+/// Larger `m` reproduces exact moving-neighborhood SGS more closely; smaller
+/// `m` trades accuracy for speed (recommended starting point: `m = 16`,
+/// matching the default `max_neighbors` of [`SgsConfig`]).
+pub fn sgs_at_vecchia<const D: usize>(
+    data: &PointSet<D>,
+    model_ns: &VariogramModel,
+    nodes: &[[f64; D]],
+    cfg: &SgsConfig,
+    m: usize,
+) -> Result<Vec<Vec<f64>>> {
+    sgs_at_vecchia_with_levels(data, model_ns, nodes, None, cfg, m)
+}
+
+/// Grid entry point for [`sgs_at_vecchia`]; a convenience that builds the
+/// node coordinates from a [`Grid2D`] (see [`sgs_at`]).
+pub fn sequential_gaussian_simulation_vecchia(
+    data: &PointSet<2>,
+    model_ns: &VariogramModel,
+    grid: &Grid2D,
+    cfg: &SgsConfig,
+    m: usize,
+) -> Result<Vec<Vec<f64>>> {
+    let nodes = grid.centers();
+    sgs_at_vecchia(data, model_ns, &nodes, cfg, m)
+}
+
+fn sgs_at_vecchia_with_levels<const D: usize>(
+    data: &PointSet<D>,
+    model_ns: &VariogramModel,
+    nodes: &[[f64; D]],
+    levels: Option<&[u8]>,
+    cfg: &SgsConfig,
+    m: usize,
+) -> Result<Vec<Vec<f64>>> {
+    // Same validation surface as sgs_at_with_levels.
+    if model_ns.has_power() {
+        return Err(GeostatError::InvalidParameter(
+            "SGS needs a valid covariance function and cannot use the unbounded Power model".into(),
+        ));
+    }
+    if let Some(kind) = model_ns.invalid_structure_for_dim(D) {
+        return Err(GeostatError::InvalidParameter(format!(
+            "{kind:?} is not a valid covariance in {D} dimensions; use Spherical instead for a \
+             3-D-safe bounded structure"
+        )));
+    }
+    if cfg.n_realizations == 0 {
+        return Err(GeostatError::InvalidParameter(
+            "n_realizations must be at least 1".into(),
+        ));
+    }
+    if m == 0 {
+        return Err(GeostatError::InvalidParameter(
+            "conditioning size m must be at least 1".into(),
+        ));
+    }
+    if let Some(r) = cfg.search_radius
+        && !(r > 0.0)
+    {
+        return Err(GeostatError::InvalidParameter(format!(
+            "search radius must be positive, got {r}"
+        )));
+    }
+    if nodes.is_empty() {
+        return Err(GeostatError::InvalidParameter(
+            "no simulation nodes given".into(),
+        ));
+    }
+    let _ = levels; // Vecchia path is not multigrid-ordered.
+
+    let ns = match &cfg.decluster_weights {
+        Some(w) => {
+            if w.len() != data.len() {
+                return Err(GeostatError::DimensionMismatch(format!(
+                    "{} declustering weights vs {} data points",
+                    w.len(),
+                    data.len()
+                )));
+            }
+            NormalScore::fit_weighted_with_tails(data.values(), w, cfg.tails)?
+        }
+        None => NormalScore::fit_with_tails(data.values(), cfg.tails)?,
+    };
+    let data_scores: Vec<f64> = data.values().iter().map(|&v| ns.transform(v)).collect();
+
+    let (dmin, dmax) = data.bbox();
+    let mut min = dmin;
+    let mut max = dmax;
+    for c in nodes {
+        for d in 0..D {
+            min[d] = min[d].min(c[d]);
+            max[d] = max[d].max(c[d]);
+        }
+    }
+    let mut data_grid = BucketGrid::new(min, max, data.len());
+    for &p in data.coords() {
+        data_grid.insert(p);
+    }
+
+    // Deterministic max-min path over the nodes, computed ONCE and shared by
+    // every realisation thread (O(n log n)); classic SGS shuffles per call.
+    let path = crate::vecchia::maxmin_order(nodes);
+
+    crate::parallel::par_try_map(cfg.n_realizations, |r| {
+        let mut seed_state = cfg.seed ^ (r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let seed_r = splitmix64(&mut seed_state);
+        let sim_ns = simulate_gaussian_path_vecchia(
+            data.coords(),
+            &data_scores,
+            &data_grid,
+            model_ns,
+            nodes,
+            &path,
+            (min, max),
+            m,
+            cfg.search_radius,
+            seed_r,
+        )?;
+        Ok(sim_ns.iter().map(|&s| ns.back_transform(s)).collect())
+    })
+}
+
 /// Reusable buffers for the per-node simple-kriging systems.
 #[derive(Default)]
 struct SkWorkspace {
@@ -624,6 +954,50 @@ mod tests {
     }
 
     #[test]
+    fn unconditional_sgs_reproducible_with_model_stats() {
+        // Short range relative to the domain → plenty of effective
+        // independent samples, so pooled mean/variance concentrate near the
+        // marginal (0, total sill).
+        let model = VariogramModel::new(0.0, vec![Structure::new(ModelKind::Spherical, 1.0, 10.0)])
+            .unwrap();
+        let grid = Grid2D::from_bbox([0.0, 0.0], [100.0, 100.0], 40, 40).unwrap();
+        let cfg = SgsConfig {
+            n_realizations: 4,
+            seed: 9,
+            ..Default::default()
+        };
+        let a = unconditional_gaussian_simulation(&model, &grid, &cfg).unwrap();
+        let b = unconditional_gaussian_simulation(&model, &grid, &cfg).unwrap();
+        assert_eq!(a.realizations, b.realizations, "same seed, same fields");
+        assert_ne!(a.realizations[0], a.realizations[1]);
+
+        let pooled: Vec<f64> = a.realizations.iter().flatten().copied().collect();
+        let n = pooled.len() as f64;
+        let mean = pooled.iter().sum::<f64>() / n;
+        let var = pooled.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n;
+        assert!(mean.abs() < 0.25, "pooled mean {mean} too far from 0");
+        assert!(
+            (0.7..1.3).contains(&var),
+            "pooled variance {var} far from sill 1"
+        );
+    }
+
+    #[test]
+    fn unconditional_sgs_rejects_bad_config() {
+        let (_data, model, grid) = setup();
+        let cfg = SgsConfig {
+            n_realizations: 0,
+            ..Default::default()
+        };
+        assert!(unconditional_gaussian_simulation(&model, &grid, &cfg).is_err());
+        let power_model =
+            VariogramModel::new(0.0, vec![Structure::new(ModelKind::Power(1.0), 1.0, 1.0)])
+                .unwrap();
+        let cfg = SgsConfig::default();
+        assert!(unconditional_gaussian_simulation(&power_model, &grid, &cfg).is_err());
+    }
+
+    #[test]
     fn rejects_power_model() {
         let (data, _model, grid) = setup();
         let power_model =
@@ -631,6 +1005,58 @@ mod tests {
                 .unwrap();
         let cfg = SgsConfig::default();
         assert!(sequential_gaussian_simulation(&data, &power_model, &grid, &cfg).is_err());
+    }
+
+    #[test]
+    fn vecchia_sgs_reproducible_and_in_range() {
+        let (data, model, grid) = setup();
+        let cfg = SgsConfig {
+            n_realizations: 3,
+            seed: 123,
+            ..Default::default()
+        };
+        let a = sgs_at_vecchia(&data, &model, &grid.centers(), &cfg, 16).unwrap();
+        let b = sgs_at_vecchia(&data, &model, &grid.centers(), &cfg, 16).unwrap();
+        assert_eq!(a, b, "Vecchia SGS must be bit-for-bit reproducible");
+        assert_ne!(a[0], a[1], "realisations should differ");
+
+        // Different conditioning sizes produce valid but distinct fields.
+        let small = sgs_at_vecchia(&data, &model, &grid.centers(), &cfg, 4).unwrap();
+        assert_eq!(a.len(), small.len());
+        assert_ne!(a[0], small[0]);
+
+        // In data range (default tails clamp).
+        let (lo, hi) = data
+            .values()
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), &v| {
+                (l.min(v), h.max(v))
+            });
+        for r in a.iter().chain(&small) {
+            for &v in r {
+                assert!((lo - 1e-9..=hi + 1e-9).contains(&v), "value {v} OOB");
+            }
+        }
+    }
+
+    #[test]
+    fn vecchia_sgs_is_thread_stable() {
+        // The Vecchia path is deterministic (max-min), so the same seed must
+        // give identical results regardless of rayon thread scheduling --
+        // unlike the random path of classic SGS, whose RNG consumption order
+        // depends on the chunking. Run on a decent grid to exercise threads.
+        let (data, model, _grid) = setup();
+        let cfg = SgsConfig {
+            n_realizations: 4,
+            seed: 77,
+            ..Default::default()
+        };
+        let nodes = Grid2D::from_bbox([0.0, 0.0], [100.0, 100.0], 40, 40)
+            .unwrap()
+            .centers();
+        let a = sgs_at_vecchia(&data, &model, &nodes, &cfg, 12).unwrap();
+        let b = sgs_at_vecchia(&data, &model, &nodes, &cfg, 12).unwrap();
+        assert_eq!(a, b);
     }
 
     #[test]
