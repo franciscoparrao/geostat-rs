@@ -14,14 +14,14 @@ figures/*.png
 figures/data/
 
 # LaTeX build artifacts
-paper/*.aux
-paper/*.log
-paper/*.bbl
-paper/*.blg
-paper/*.out
-paper/*.pdf
-paper/*.png
-paper/*.spl
+paper/**/*.aux
+paper/**/*.log
+paper/**/*.bbl
+paper/**/*.blg
+paper/**/*.out
+paper/**/*.pdf
+paper/**/*.png
+paper/**/*.spl
 
 # Python bytecode
 __pycache__/

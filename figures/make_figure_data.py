@@ -74,8 +74,63 @@ def fig_parity():
     write_csv(OUT / "parity.csv", ["method", "gstat", "rust"], rows)
 
 
+def _loo_idw(x, y, v, power, max_neighbors):
+    """Manual leave-one-out IDW predictions (per-point, for the bootstrap --
+    `compare_methods` only returns the aggregate VEcv/RMSE, not per-point
+    arrays)."""
+    n = len(x)
+    preds = []
+    for i in range(n):
+        xs = x[:i] + x[i + 1 :]
+        ys = y[:i] + y[i + 1 :]
+        vs = v[:i] + v[i + 1 :]
+        p = gs.idw(xs, ys, vs, [x[i]], [y[i]], power=power, max_neighbors=max_neighbors)
+        preds.append(float(p[0]))
+    return preds
+
+
+def _loo_knn(x, y, v, k, max_neighbors):
+    """Manual leave-one-out k-NN predictions (see `_loo_idw`)."""
+    n = len(x)
+    preds = []
+    for i in range(n):
+        xs = x[:i] + x[i + 1 :]
+        ys = y[:i] + y[i + 1 :]
+        vs = v[:i] + v[i + 1 :]
+        p = gs.knn(xs, ys, vs, [x[i]], [y[i]], k=k)
+        preds.append(float(p[0]))
+    return preds
+
+
+def bootstrap_vecv_ci(obs, preds_by_method, n_boot=2000, seed=42):
+    """95% CI for VEcv per method via a nonparametric bootstrap: resample
+    point indices with replacement (the SAME resample for every method each
+    iteration, for a fair paired comparison), recompute VEcv on the
+    resampled observed/predicted pairs, and take the 2.5/97.5 percentiles
+    of the resulting distribution."""
+    rng = random.Random(seed)
+    n = len(obs)
+    obs = list(obs)
+    boot = {m: [] for m in preds_by_method}
+    for _ in range(n_boot):
+        idx = [rng.randrange(n) for _ in range(n)]
+        o = [obs[i] for i in idx]
+        for m, preds in preds_by_method.items():
+            p = [preds[i] for i in idx]
+            boot[m].append(vecv(o, p))
+    out = {}
+    for m, vals in boot.items():
+        vals.sort()
+        lo = vals[int(0.025 * n_boot)]
+        hi = vals[min(int(0.975 * n_boot), n_boot - 1)]
+        out[m] = (lo, hi)
+    return out
+
+
 def fig_compare():
-    """Leave-one-out VEcv by method on Meuse log-zinc."""
+    """Leave-one-out VEcv by method on Meuse log-zinc, with a bootstrap 95%
+    CI (AUDIT/review follow-up: point-estimate rankings alone do not show
+    whether e.g. IDW and k-NN's near-tied VEcv exceeds LOO sampling noise)."""
     x, y, v = meuse()
     cmp = gs.compare_methods(x, y, v, max_neighbors=32, knn_k=8)
     label = {
@@ -84,9 +139,26 @@ def fig_compare():
         "knn": "k-NN",
         "nearest_neighbor": "nearest neighbour",
     }
-    rows = [(label[k], m["vecv"], m["rmse"]) for k, m in cmp.items()]
+
+    # Per-point LOO predictions for the bootstrap, matching compare_methods'
+    # internal configuration exactly (max_neighbors=32, IDW power 2, k=8/1).
+    model = gs.fit_variogram(x, y, v, n_lags=15)
+    ok_cv = gs.loo_cv(x, y, v, model, method="ordinary", max_neighbors=32)
+    preds_by_method = {
+        "ordinary kriging": [float(p) for p in ok_cv["predicted"]],
+        "IDW": _loo_idw(x, y, v, power=2.0, max_neighbors=32),
+        "k-NN": _loo_knn(x, y, v, k=8, max_neighbors=32),
+        "nearest neighbour": _loo_knn(x, y, v, k=1, max_neighbors=32),
+    }
+    ci = bootstrap_vecv_ci(v, preds_by_method)
+
+    rows = [(label[k], m["vecv"], m["rmse"], *ci[label[k]]) for k, m in cmp.items()]
     rows.sort(key=lambda r: -r[1])
-    write_csv(OUT / "compare_vecv.csv", ["method", "vecv", "rmse"], rows)
+    write_csv(
+        OUT / "compare_vecv.csv",
+        ["method", "vecv", "rmse", "vecv_lo", "vecv_hi"],
+        rows,
+    )
 
 
 def fig_idw_tune():

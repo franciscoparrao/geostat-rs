@@ -49,11 +49,13 @@ cmp <- read.csv(file.path(data_dir, "compare_vecv.csv"))
 cmp$method <- factor(cmp$method, levels = cmp$method[order(cmp$vecv)])
 p2 <- ggplot(cmp, aes(method, vecv, fill = method)) +
   geom_col(width = 0.7, show.legend = FALSE) +
-  geom_text(aes(label = sprintf("%.1f", vecv)), hjust = -0.15, size = 3.3) +
+  geom_errorbar(aes(ymin = vecv_lo, ymax = vecv_hi), width = 0.15, linewidth = 0.4) +
+  geom_text(aes(y = vecv_hi, label = sprintf("%.1f", vecv)), hjust = -0.15, size = 3.3) +
   coord_flip(clip = "off") +
   scale_fill_brewer(palette = "Blues") +
-  expand_limits(y = max(cmp$vecv) * 1.12) +
+  expand_limits(y = max(cmp$vecv_hi) * 1.12) +
   labs(title = "Method comparison by leave-one-out VEcv (Meuse log-zinc)",
+       subtitle = "Error bars: 95% bootstrap CI (2000 resamples)",
        x = NULL, y = "VEcv (%)") +
   theme_paper
 save_fig(p2, "fig_compare.pdf", w = 6, h = 3.2)

@@ -5,8 +5,11 @@
   <title>geostat-rs — WASM demo</title>
   <style>
     body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; }
-    canvas { border: 1px solid #999; image-rendering: pixelated; width: 480px; height: 480px; }
+    canvas#map { border: 1px solid #999; image-rendering: pixelated; width: 480px; height: 480px; }
+    canvas#legend { border: 1px solid #999; width: 300px; height: 20px; display: block; }
     pre { background: #f4f4f4; padding: .5rem; overflow-x: auto; }
+    .legend-row { display: flex; align-items: center; gap: .5rem; margin: .5rem 0 1rem; font-size: .9rem; }
+    .legend-labels { display: flex; justify-content: space-between; width: 300px; font-size: .8rem; color: #444; }
   </style>
 </head>
 <body>
@@ -20,6 +23,11 @@
      <code>/examples/wasm-demo/</code>.</p>
   <pre id="log">loading…</pre>
   <canvas id="map" width="60" height="60"></canvas>
+  <div class="legend-row">
+    <strong>predicted value:</strong>
+    <canvas id="legend" width="300" height="20"></canvas>
+  </div>
+  <div class="legend-labels"><span id="legend-lo"></span><span id="legend-hi"></span></div>
 
   <script type="module">
     import init, { fit_variogram_json, krige_grid }
@@ -73,6 +81,19 @@
     }
     ctx.putImageData(img, 0, 0);
     log(`prediction range: [${lo.toFixed(3)}, ${hi.toFixed(3)}]`);
+
+    // Colour-scale legend: the same R/G/B ramp used for the prediction
+    // raster above, so a reader can map colour to predicted value.
+    const legendCanvas = document.getElementById("legend");
+    const legendCtx = legendCanvas.getContext("2d");
+    const lw = legendCanvas.width;
+    for (let px = 0; px < lw; px++) {
+      const t = px / (lw - 1);
+      legendCtx.fillStyle = `rgb(${255 * t}, 64, ${255 * (1 - t)})`;
+      legendCtx.fillRect(px, 0, 1, legendCanvas.height);
+    }
+    document.getElementById("legend-lo").textContent = lo.toFixed(3);
+    document.getElementById("legend-hi").textContent = hi.toFixed(3);
   </script>
 </body>
 </html>

@@ -16,8 +16,8 @@
 
 \begin{frontmatter}
 
-\title{geostat-rs: a single-binary Rust engine for geostatistics, validated
-against gstat and bridged to machine learning}
+\title{geostat-rs: unifying native, Python and WebAssembly geostatistics from
+a single const-generic Rust core}
 
 \author[a]{Francisco Parra-O.\corref{cor1}}
 \ead{}
@@ -27,29 +27,32 @@ against gstat and bridged to machine learning}
             country={Chile}}
 
 \begin{abstract}
-Spatially continuous predictions from point samples underpin work across the
-geosciences, yet the practical toolchain is split between \texttt{gstat}
-(\textsf{R} --- feature-rich but slow and tied to the \textsf{R} runtime) and
-GSLIB (Fortran --- fast but archaic, with no modern bindings). We present
-\textbf{geostat-rs}, a geostatistics engine written in Rust that is
-single-binary, dependency-light and reproducible across platforms, with
-first-class Python and WebAssembly bindings. The core is generic over spatial
-dimension (2-D and 3-D from one const-generic code path) and covers
+Geostatistical methods are implemented independently across at least six
+actively maintained tools --- \texttt{gstat} (\textsf{R}), GSLIB (Fortran),
+GSTools, SciKit-GStat and PyKrige (\textsf{Python}), and GeoStats.jl (Julia)
+--- each tied to a single language runtime and deployment target, with no core
+shared between server, desktop and in-browser execution. We present
+\textbf{geostat-rs}, architected to close this fragmentation: a single Rust
+core, generic over spatial dimension (2-D and 3-D from one const-generic code
+path, with no per-dimension code duplication), compiles unchanged to three
+deployment targets --- a dependency-light native binary, a Python extension
+module (PyO3, zero-copy NumPy arrays) and WebAssembly for in-browser execution
+with no server --- and uses a deterministic random-number generator so
+stochastic simulation is bit-identical across all three. The engine covers
 experimental and theoretical variography; the kriging family
 (simple/ordinary/universal/external-drift, co-kriging, indicator and block
 kriging); inverse-distance and $k$-nearest-neighbour baselines; regression
-kriging; and conditional sequential Gaussian and indicator simulation with a
-deterministic, platform-independent random-number generator. Every
-deterministic method is cross-checked against gstat on the Meuse and Walker
-Lake benchmarks at machine precision; simulation is validated distributionally.
-Following \citet{li2021}, accuracy is assessed by VEcv (variance explained by
-cross-validation), method comparison and hyperparameter tuning are driven by
-predictive accuracy, and regression kriging accepts an externally supplied
+kriging; and conditional sequential Gaussian and indicator simulation. We show
+this architecture costs no numerical fidelity: every deterministic method is
+cross-checked against gstat on the Meuse and Walker Lake benchmarks at machine
+precision, and simulation is validated distributionally. Following
+\citet{li2021}, accuracy is assessed by VEcv (variance explained by
+cross-validation), and regression kriging accepts an externally supplied
 trend --- letting a machine-learning model provide the mean while geostat-rs
-kriges the residuals. We demonstrate the engine on a national mine-tailings
-geochemistry dataset, predicting rare-earth grades from cheap host-mineral
-proxies. The engine reads and writes OGC GeoPackage (vector points and
-single-band raster) without GDAL, for native interchange with GIS tools.
+kriges the residuals. We demonstrate the engine on a Chilean national
+mine-tailings geochemistry dataset, predicting rare-earth grades from
+host-mineral proxies. The engine reads and writes OGC GeoPackage without GDAL,
+for native interchange with GIS tools.
 \end{abstract}
 
 \begin{keyword}
@@ -76,27 +79,39 @@ growing body of work couples it with machine learning for the trend component
 whole workflow, validates against an accepted reference, and deploys without a
 heavy runtime.
 
-Two implementations anchor the field. \texttt{gstat} \citep{pebesma2004} is
-comprehensive and the de-facto reference, but is bound to the \textsf{R}
-runtime, single-threaded in its hot paths, and offers no single-binary or
-in-browser deployment; GSLIB \citep{deutsch1998} is fast, canonical Fortran but
-arcane and without modern packaging, bindings or a Python/WebAssembly interface.
-The Python geostatistics ecosystem --- for example GSTools \citep{mueller2022}
-and SciKit-GStat \citep{maelicke2022} --- is convenient and scriptable but
-pure-Python in performance and likewise without a single-binary or client-side
-target. No engine combines dependency-light single-binary deployment,
-cross-platform reproducibility, a unified 2-D/3-D core, Python and WebAssembly
-bindings, and numerical fidelity to gstat.
+The consequence is that the same methods are implemented independently at
+least six times over. \texttt{gstat} \citep{pebesma2004} is comprehensive and
+the de-facto reference, but is bound to the \textsf{R} runtime, single-threaded
+in its hot paths, and offers no single-binary or in-browser deployment; GSLIB
+\citep{deutsch1998} is fast, canonical Fortran but arcane and without modern
+packaging, bindings or a Python/WebAssembly interface. The Python
+geostatistics ecosystem --- GSTools \citep{mueller2022}, SciKit-GStat
+\citep{maelicke2022} and PyKrige \citep{pykrige} --- is convenient and
+scriptable but pure-Python in performance and tied to the Python runtime;
+GeoStats.jl \citep{hoffimann2018} closes much of the performance gap with a
+compiled, high-performance core in Julia, but offers neither single-binary
+deployment nor Python or WebAssembly bindings. No shared numerical core spans
+server, desktop and in-browser execution: each of these six tools re-derives
+and re-validates the same variogram models and kriging systems independently,
+in a different language, for a different single deployment target.
 
-We present geostat-rs to fill that gap. Its design goals are: (i) a single
-binary with no heavy runtime or GDAL chain; (ii) reproducible results across
-platforms via a deterministic random-number generator; (iii) one code path for
-2-D and 3-D; (iv) Python and WebAssembly bindings; (v) numerical parity with
-gstat; and (vi) a predictive-accuracy-first evaluation methodology with a bridge
-to machine learning, following \citet{li2021}. Our contributions are the engine
-itself, its validation against gstat at machine precision, predictive-accuracy
-tooling (VEcv-based comparison and tuning), an ML+geostatistics hybrid through
-regression kriging, GeoPackage input/output, and a real rare-earth application.
+We present geostat-rs to close that fragmentation architecturally, rather than
+add a seventh independent implementation. Its design goals are: (i) one
+numerical core, generic over spatial dimension via Rust's const generics, so
+2-D and 3-D share a single code path with no per-dimension duplication;
+(ii) that same core compiled unchanged to three deployment targets --- a
+dependency-light native binary, a Python extension module, and WebAssembly for
+client-side execution with no server; (iii) a deterministic random-number
+generator so stochastic simulation is bit-identical across all three targets;
+(iv) numerical parity with gstat, to show the architecture costs no fidelity
+relative to the field's reference implementation; and (v) a
+predictive-accuracy-first evaluation methodology with a bridge to machine
+learning, following \citet{li2021}. Our contributions are this const-generic,
+multi-target architecture itself; its validation against gstat at machine
+precision as evidence that unifying the core does not trade away numerical
+fidelity; predictive-accuracy tooling (VEcv-based comparison and tuning); an
+ML+geostatistics hybrid through regression kriging; GeoPackage input/output;
+and a real rare-earth application.
 
 \section{Design and implementation}
 \label{sec:design}
@@ -120,7 +135,7 @@ the same engine in the browser with no server (Figure~\ref{fig:wasm}).
 \includegraphics[width=0.7\linewidth]{fig_wasm.png}
 \caption{The WebAssembly build running entirely client-side in a browser: it
 fits a variogram and ordinary-kriges a $60\times60$ grid of a synthetic field,
-rendering the prediction surface on a canvas.}
+rendering the prediction surface on a canvas with a colour-scale legend.}
 \label{fig:wasm}
 \end{figure}
 
@@ -151,10 +166,11 @@ has the longer range; the minor axis reaches the sill within ${\sim}900$\,m.}
 \end{figure}
 
 \textbf{Kriging.} Simple, ordinary, universal (polynomial drift) and
-external-drift kriging; ordinary co-kriging (collocated and heterotopic) under a
-linear model of coregionalization; block kriging and block co-kriging; indicator
-kriging (local ccdf, E-type estimate, conditional variance); and lognormal
-kriging.
+external-drift kriging, following the classical formulations of
+\citet{journel1978} and \citet{chiles2012}; ordinary co-kriging (collocated and
+heterotopic) under a linear model of coregionalization \citep{chiles2012};
+block kriging and block co-kriging; indicator kriging (local ccdf, E-type
+estimate, conditional variance); and lognormal kriging.
 
 \textbf{Mathematical interpolators.} Inverse-distance weighting and
 $k$-nearest-neighbour averaging ($k=1$ is nearest-neighbour / Voronoi) as
@@ -266,16 +282,22 @@ LOO cross-validation (155 pts) & 1368 & 8.9 & 5.2 & $263\times$ \\
 \label{sec:accuracy}
 
 On Meuse log-zinc, leave-one-out VEcv ranks ordinary kriging
-($\approx 71$) above IDW and $k$-NN ($\approx 54$) and nearest-neighbour
-($\approx 38$) (Figure~\ref{fig:compare}); no method dominates universally, so
-the comparison is by measured predictive accuracy rather than assumption.
+($\approx 71$, 95\% bootstrap CI $[60, 79]$) above IDW ($\approx 55$, CI
+$[44, 63]$), $k$-NN ($\approx 54$, CI $[41, 65]$) and nearest-neighbour
+($\approx 38$, CI $[15, 57]$) (Figure~\ref{fig:compare}; CIs from 2000
+resamples of the leave-one-out pairs). Ordinary kriging's advantage over IDW
+and $k$-NN is robust to this resampling, but IDW and $k$-NN's own CIs overlap
+almost entirely --- their point estimates are close enough that this dataset
+cannot distinguish between them. No method dominates universally, so the
+comparison is by measured predictive accuracy rather than assumption.
 Hyperparameters are tuned the same way: Figure~\ref{fig:idwtune} shows IDW power
 selected by VEcv, with an optimum near power~3.5 on this dataset.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=0.85\linewidth]{fig_compare.pdf}
-\caption{Leave-one-out VEcv by method on Meuse log-zinc.}
+\caption{Leave-one-out VEcv by method on Meuse log-zinc, with 95\% bootstrap
+confidence intervals.}
 \label{fig:compare}
 \end{figure}
 
@@ -287,12 +309,12 @@ log-zinc.}
 \label{fig:idwtune}
 \end{figure}
 
-\section{Application: rare-earth grade prediction with an ML hybrid}
+\section{Application: rare-earth grade prediction in Chilean mine tailings}
 \label{sec:application}
 
-We predict rare-earth grades on $\sim$1100 mine-tailings deposits, drawn from the
-public geochemical registry of tailings deposits in Chile
-\citep{sernageomin2023}, from non-rare-earth
+We predict rare-earth grades on $\sim$1100 mine-tailings deposits in the
+Coquimbo region, drawn from the public geochemical registry of tailings
+deposits in Chile \citep{sernageomin2023}, from non-rare-earth
 host-mineral proxies (P$_2$O$_5$, Th for phosphates/monazite; TiO$_2$,
 Fe$_2$O$_3$, Zr for Ti--Fe oxides and zircon), deliberately excluding
 neighbouring rare-earth elements, which are co-measured and would constitute
@@ -304,6 +326,11 @@ signal). The random-forest-trend plus residual-kriging hybrid is best or tied
 wherever signal exists. The random-forest trend is supplied by a companion Rust
 machine-learning engine and the residual kriging by geostat-rs, giving an
 RFOK-style hybrid \citep{li2021} with no \textsf{R} or scikit-learn dependency.
+These proxy--target relationships are specific to the Coquimbo tailings'
+mineralogy and this single regional dataset; we report them as a demonstration
+of the engine's regression-kriging bridge to machine learning; they are not a
+general claim about rare-earth prediction from host-mineral proxies in other
+geological settings.
 
 \begin{table}[t]
 \centering
@@ -358,7 +385,12 @@ Validation and benchmarking here target the classical datasets (Meuse, Walker
 Lake) and a single regional application; a broader empirical study across data
 types and scales is left for future work, and the predictive-accuracy
 comparison is deliberately confined to the methods in the engine rather than
-surveying the wider machine-learning literature.
+surveying the wider machine-learning literature. The Meuse method comparison
+(Sect.~\ref{sec:accuracy}) reports bootstrap confidence intervals on VEcv; the
+rare-earth application (Sect.~\ref{sec:application}) reports a single
+train/test split, so its element-by-element VEcv values should be read as a
+demonstration of the regression-kriging bridge rather than as
+uncertainty-quantified estimates.
 
 Future directions include GPU and out-of-core execution for larger grids,
 additional input/output formats and full GeoPackage raster support for tighter
@@ -371,17 +403,16 @@ it runs.
 \section{Software availability and reproducibility}
 \label{sec:availability}
 
-geostat-rs is released under MIT or Apache-2.0, with crates for the core, CLI,
-Python and WebAssembly. All validations are reproduced by the R reference
-scripts and Python comparison scripts in the repository, and all figures by the
-provided data-generation and plotting scripts. Results are deterministic and
-platform-independent. The Meuse and Walker Lake benchmark datasets are
-distributed with \textsf{gstat}; the rare-earth application uses the public
-geochemical registry of tailings deposits in Chile \citep{sernageomin2023},
-openly available from the national geology and mining service.
-
-\section*{Acknowledgements}
-%% TODO
+geostat-rs is open-source software, released under a dual MIT/Apache-2.0
+license, with crates for the core, CLI, Python and WebAssembly bindings, at
+\url{https://github.com/franciscoparrao/geostat-rs}. All validations are
+reproduced by the R reference scripts and Python comparison scripts in the
+repository, and all figures by the provided data-generation and plotting
+scripts. Results are deterministic and platform-independent. The Meuse and
+Walker Lake benchmark datasets are distributed with \textsf{gstat}; the
+rare-earth application uses the public geochemical registry of tailings
+deposits in Chile \citep{sernageomin2023}, openly available from the national
+geology and mining service.
 
 %% Bibliography
 \bibliographystyle{elsarticle-harv}

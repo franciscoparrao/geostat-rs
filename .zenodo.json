@@ -1,0 +1,27 @@
+{
+  "title": "geostat-rs: a geostatistics engine in Rust",
+  "description": "Geostatistics engine in pure Rust: variography, kriging, and sequential Gaussian/indicator simulation, plus a scalable Vecchia approximation for large point sets. A modern, single-binary take on the GSLIB / gstat feature set, with deterministic stochastic simulation (seeded) and parallel prediction, validated against gstat at machine precision. Provides a Python binding and a CSV CLI.",
+  "upload_type": "software",
+  "access_right": "open",
+  "license": "MIT",
+  "language": "eng",
+  "version": "0.8.0",
+  "creators": [
+    {"name": "Parra, Francisco",
+     "affiliation": "Departamento de Ingenieria Informatica, Universidad de Santiago de Chile, Santiago, Chile",
+     "orcid": "0009-0006-0435-1854"}
+  ],
+  "keywords": [
+    "geostatistics",
+    "kriging",
+    "variography",
+    "sequential Gaussian simulation",
+    "sequential indicator simulation",
+    "Vecchia approximation",
+    "spatial statistics",
+    "Rust"
+  ],
+  "communities": [],
+  "related_identifiers": [],
+  "notes": "Dual-licensed MIT OR Apache-2.0 (Zenodo license field records MIT; see LICENSE-MIT and LICENSE-APACHE in the repository). Used as the synthetic-world simulation engine in the manuscript 'The validation paradox in single-district spatial learning' (Parra, Gil-Costa, Bonacic & Marin)."
+}
