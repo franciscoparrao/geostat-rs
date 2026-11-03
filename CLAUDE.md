@@ -26,6 +26,15 @@ bindings modernos). No hay un motor geoestadístico Rust con WASM/Python.
 - [x] Kriging simple, ordinario y universal (drift lineal/cuadrático).
 - [x] Cross-validation (LOO) y mapas de varianza de kriging.
 - [x] Simulación secuencial gaussiana (SGS) → realizaciones + incertidumbre.
+- [x] **SGS con camino Vecchia** (`sgs_at_vecchia`,
+      `sequential_gaussian_simulation_vecchia`, 2026-09-02): camino max-min
+      determinista (Vecchia 1988; Katzfuss & Guinness 2021) + vecindarios fijos
+      `m`. Reproducible bit-for-bit a cualquier thread count (el camino no
+      depende del RNG, solo los draws Gaussianos); condicionamiento de
+      predecesores repartidos → mejor precisión por vecino que el camino
+      aleatorio con el mismo `m`. Mismo pipeline (nscore → condicionamiento
+      secuencial → back-transform). Nuevo: demerror levantará el límite de
+      grids condicionales de 100×100 a DEMs completos.
       RNG determinista (xoshiro256++), reproducible cross-platform.
 - [x] (v0.2) Co-kriging ordinario con LMC (+ fit Goulard-style con proyección
       PSD), kriging con deriva externa, SIS (sisim-style), anisotropía

@@ -1419,6 +1419,45 @@ fn sgs(
     arr2(py, realizations)
 }
 
+/// Unconditional sequential Gaussian simulation: draws from the stationary
+/// Gaussian random function `model` itself (mean 0, variance = total sill),
+/// with no conditioning data and no normal-score back-transform. Returns an
+/// `n_realizations x n_cells` array of Gaussian values in grid storage
+/// order; transform them yourself if data units are needed.
+#[pyfunction]
+#[pyo3(signature = (model, bbox, nx, ny, n_realizations = 10, seed = 42,
+    max_neighbors = 16, radius = None, max_node_neighbors = None,
+    multigrid = 0))]
+#[allow(clippy::too_many_arguments)]
+fn sgs_unconditional(
+    py: Python<'_>,
+    model: &VariogramModel,
+    bbox: (f64, f64, f64, f64),
+    nx: usize,
+    ny: usize,
+    n_realizations: usize,
+    seed: u64,
+    max_neighbors: usize,
+    radius: Option<f64>,
+    max_node_neighbors: Option<usize>,
+    multigrid: u8,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let grid = Grid2D::from_bbox([bbox.0, bbox.1], [bbox.2, bbox.3], nx, ny).map_err(err)?;
+    let mut cfg = SgsConfig::default();
+    cfg.n_realizations = n_realizations;
+    cfg.seed = seed;
+    cfg.max_neighbors = max_neighbors;
+    cfg.search_radius = radius;
+    cfg.max_node_neighbors = max_node_neighbors;
+    cfg.multigrid = multigrid;
+    let realizations = py.allow_threads(|| {
+        core::unconditional_gaussian_simulation(&model.inner, &grid, &cfg)
+            .map_err(err)
+            .map(|res| res.realizations)
+    })?;
+    arr2(py, realizations)
+}
+
 /// Truncated Gaussian simulation (TGS) for ordered categorical/facies
 /// data: one underlying Gaussian field truncated at thresholds derived
 /// from global category proportions (0-based ascending order, e.g. a
@@ -1815,6 +1854,7 @@ fn geostat_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(tune_knn_k, m)?)?;
     m.add_function(wrap_pyfunction!(tune_kriging_neighbors, m)?)?;
     m.add_function(wrap_pyfunction!(sgs, m)?)?;
+    m.add_function(wrap_pyfunction!(sgs_unconditional, m)?)?;
     m.add_function(wrap_pyfunction!(tgs, m)?)?;
     m.add_function(wrap_pyfunction!(decluster_weights, m)?)?;
     m.add_function(wrap_pyfunction!(sis, m)?)?;

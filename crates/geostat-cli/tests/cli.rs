@@ -294,7 +294,10 @@ fn madogram_with_fit_is_rejected_but_madogram_alone_and_matheron_fit_still_work(
         "--fit",
         "spherical",
     ]));
-    assert_success(&matheron_fit, "variogram --fit spherical (default estimator)");
+    assert_success(
+        &matheron_fit,
+        "variogram --fit spherical (default estimator)",
+    );
 
     std::fs::remove_file(&data).ok();
 }

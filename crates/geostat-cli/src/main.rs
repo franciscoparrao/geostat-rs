@@ -883,7 +883,10 @@ fn write_grid_result(
         // AUDIT-2026-07-v3.md §1.14: `--raster` only means anything for a
         // `.gpkg` output (a gridded coverage); silently falling back to a
         // point CSV here used to drop the flag without any indication.
-        bail!("--raster requires a .gpkg output path (got {})", path.display());
+        bail!(
+            "--raster requires a .gpkg output path (got {})",
+            path.display()
+        );
     } else {
         io_utils::write_grid_csv(path, grid, values, variances)
     }

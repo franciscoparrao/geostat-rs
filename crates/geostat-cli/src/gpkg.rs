@@ -678,7 +678,9 @@ pub fn read_raster(path: &Path, layer: Option<&str>) -> Result<RasterGrid> {
         ("tile_height", th),
     ] {
         if !(1..=MAX_TILE_DIM).contains(&v) {
-            bail!("coverage '{name}': {label} = {v} is out of the expected range [1, {MAX_TILE_DIM}]");
+            bail!(
+                "coverage '{name}': {label} = {v} is out of the expected range [1, {MAX_TILE_DIM}]"
+            );
         }
     }
     let (mw, mh, tw, th) = (mw as usize, mh as usize, tw as usize, th as usize);

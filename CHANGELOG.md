@@ -7,6 +7,14 @@ before 0.7.0 predate this file and are reconstructed from commit history.
 ## [Unreleased]
 
 ### Added
+- Unconditional sequential Gaussian simulation
+  (`unconditional_gaussian_simulation` in the core, `sgs_unconditional()` in
+  Python): draws from the stationary Gaussian random function itself — no
+  conditioning data, no normal-score transform — via the same
+  `simulate_gaussian_path` engine as conditional SGS (empty conditioning
+  set). Mean 0, variance = total sill, multigrid path supported. Built for
+  simulation studies that need synthetic truth fields with known ranges
+  (the `paradoja-sintetica` validation-paradox factorial).
 - Collocated cokriging (MM1/MM2, Journel 1999) exposed in the CLI
   (`geostat collocated-cokrige`) and Python (`collocated_cokriging`,
   `collocated_stats`) — the core (`crates/geostat-core/src/collocated.rs`)

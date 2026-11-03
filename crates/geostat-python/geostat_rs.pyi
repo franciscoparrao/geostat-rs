@@ -431,6 +431,23 @@ def sgs(
     """Conditional sequential Gaussian simulation. Returns an
     ``n_realizations x n_cells`` array, one row per realization."""
 
+def sgs_unconditional(
+    model: VariogramModel,
+    bbox: tuple[float, float, float, float],
+    nx: int,
+    ny: int,
+    n_realizations: int = 10,
+    seed: int = 42,
+    max_neighbors: int = 16,
+    radius: Optional[float] = None,
+    max_node_neighbors: Optional[int] = None,
+    multigrid: int = 0,
+) -> FloatArray:
+    """Unconditional sequential Gaussian simulation: draws from the
+    stationary Gaussian random function ``model`` itself (mean 0, variance
+    = total sill), no conditioning data and no normal-score transform.
+    Returns an ``n_realizations x n_cells`` array of Gaussian values."""
+
 def tgs(
     x: Sequence[float],
     y: Sequence[float],
