@@ -2,7 +2,7 @@
 //!
 //! Simulates ONE underlying continuous Gaussian random field via the same
 //! sequential conditioning engine as [`crate::simulation`] (shared through
-//! [`crate::simulation::simulate_gaussian_path`]), then truncates it into
+//! the private `simulate_gaussian_path`), then truncates it into
 //! `K` ordered categories at `K - 1` thresholds derived from global
 //! category proportions via the inverse standard-normal CDF
 //! ([`crate::transform::inv_norm_cdf`]). Hard categorical data is converted

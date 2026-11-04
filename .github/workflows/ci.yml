@@ -104,11 +104,13 @@ jobs:
           import geostat_rs as g
           import numpy as np
           assert g.__version__, 'missing __version__'
-          x = [0.0, 1.0, 0.0, 1.0, 0.4]
-          y = [0.0, 0.0, 1.0, 1.0, 0.6]
-          z = [1.0, 2.0, 1.5, 2.5, 1.7]
-          model = g.fit_variogram(x, y, z, n_lags=3, max_dist=1.5)
-          pred, var = g.krige_grid(x, y, z, model, bbox=(0, 0, 1, 1), nx=5, ny=5)
+          # 8x8 grid with a smooth deterministic field: enough pairs for the
+          # >= 4 non-empty lag bins the variogram fit requires.
+          x = [float(i % 8) for i in range(64)]
+          y = [float(i // 8) for i in range(64)]
+          z = [np.sin(a / 3.0) + np.cos(b / 4.0) for a, b in zip(x, y)]
+          model = g.fit_variogram(x, y, z, n_lags=8, max_dist=6.0)
+          pred, var = g.krige_grid(x, y, z, model, bbox=(0, 0, 7, 7), nx=5, ny=5)
           assert isinstance(pred, np.ndarray) and pred.shape == (25,)
           print('geostat_rs', g.__version__, 'import + krige_grid smoke test OK')
           "
