@@ -14,6 +14,11 @@ before 0.7.0 predate this file and are reconstructed from commit history.
   returned NaN. Ranges are now capped at `MAX_RANGE_FACTOR` (10) times the
   largest lag distance, refitting the other parameters at the cap. Interior
   optima are untouched; gstat parity is unchanged.
+- GeoPackage raster tiles: `decode_png_u16` sized its output buffer from the
+  PNG header before checking it against the tile matrix, so a corrupt or
+  hostile tile declaring e.g. 60000x60000 requested ~7 GB up front (found by
+  the CI fuzz target as a libFuzzer out-of-memory). The header's size, bit
+  depth and colour type are now validated before allocating.
 
 ### Added
 - Unconditional sequential Gaussian simulation

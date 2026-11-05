@@ -761,24 +761,23 @@ pub fn decode_png_u16(blob: &[u8], tw: usize, th: usize) -> Result<Vec<u16>> {
     let mut reader = dec
         .read_info()
         .map_err(|e| anyhow::anyhow!("PNG header: {e}"))?;
+    // Validate the header BEFORE allocating: the output buffer is sized from
+    // the PNG's own (untrusted) width/height, so a corrupt or hostile tile
+    // declaring e.g. 60000x60000 would otherwise request ~7 GB up front.
+    let (pw, ph, depth, color) = {
+        let info = reader.info();
+        (info.width, info.height, info.bit_depth, info.color_type)
+    };
+    if depth != png::BitDepth::Sixteen || color != png::ColorType::Grayscale {
+        bail!("tile is {depth:?}/{color:?}; expected 16-bit grayscale");
+    }
+    if pw as usize != tw || ph as usize != th {
+        bail!("tile is {pw}x{ph} but the tile matrix declares {tw}x{th}");
+    }
     let mut buf = vec![0u8; reader.output_buffer_size()];
-    let info = reader
+    reader
         .next_frame(&mut buf)
         .map_err(|e| anyhow::anyhow!("PNG data: {e}"))?;
-    if info.bit_depth != png::BitDepth::Sixteen || info.color_type != png::ColorType::Grayscale {
-        bail!(
-            "tile is {:?}/{:?}; expected 16-bit grayscale",
-            info.bit_depth,
-            info.color_type
-        );
-    }
-    if info.width as usize != tw || info.height as usize != th {
-        bail!(
-            "tile is {}x{} but the tile matrix declares {tw}x{th}",
-            info.width,
-            info.height
-        );
-    }
     let pixels = (0..tw * th)
         .map(|i| u16::from_be_bytes([buf[i * 2], buf[i * 2 + 1]]))
         .collect();
@@ -856,6 +855,63 @@ pub fn decode_point(blob: &[u8]) -> Result<(f64, f64)> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Minimal PNG declaring `w x h`, 16-bit gray, with a 1-byte IDAT.
+    fn png_header_only(w: u32, h: u32) -> Vec<u8> {
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut c = 0xFFFF_FFFFu32;
+            for &b in bytes {
+                c ^= b as u32;
+                for _ in 0..8 {
+                    c = if c & 1 != 0 {
+                        0xEDB8_8320 ^ (c >> 1)
+                    } else {
+                        c >> 1
+                    };
+                }
+            }
+            !c
+        }
+        fn chunk(out: &mut Vec<u8>, ty: &[u8; 4], data: &[u8]) {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            let mut td = ty.to_vec();
+            td.extend_from_slice(data);
+            out.extend_from_slice(&td);
+            out.extend_from_slice(&crc32(&td).to_be_bytes());
+        }
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&[16, 0, 0, 0, 0]); // 16-bit, grayscale
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        chunk(&mut png, b"IHDR", &ihdr);
+        // One-byte zlib stream (stored block, Adler-32 of [0] = 0x00010001):
+        // read_info() needs an IDAT before it returns the header.
+        chunk(
+            &mut png,
+            b"IDAT",
+            &[
+                0x78, 0x01, 0x01, 0x01, 0x00, 0xFE, 0xFF, 0x00, 0x00, 0x01, 0x00, 0x01,
+            ],
+        );
+        chunk(&mut png, b"IEND", &[]);
+        png
+    }
+
+    /// Regression (CI fuzz OOM): a tile whose PNG header declares a huge size
+    /// must be rejected from the header alone, before the ~7 GB output buffer
+    /// is allocated -- the error must be the size mismatch, not a data error
+    /// raised after allocating.
+    #[test]
+    fn png_tile_with_huge_declared_size_is_rejected_before_allocating() {
+        let blob = png_header_only(60_000, 60_000);
+        let err = decode_png_u16(&blob, 4, 4).unwrap_err().to_string();
+        assert!(
+            err.contains("tile matrix declares 4x4"),
+            "unexpected error: {err}"
+        );
+    }
+
     use super::*;
 
     /// Builds a StandardGeoPackageBinary point blob (no envelope, little-endian
