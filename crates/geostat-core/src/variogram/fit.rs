@@ -123,12 +123,79 @@ pub fn fit_model_weighted(
         .map(|f| vec![nugget0.sqrt(), psill0.ln(), ln_range0 + f.ln()])
         .collect();
     let (xb, wsse) = nelder_mead_multistart(objective, &starts, 0.25, 1000);
+    // Power has no range to cap (the field is ignored for that kind).
+    let range_idx: &[usize] = if matches!(kind, ModelKind::Power(_)) {
+        &[]
+    } else {
+        &[2]
+    };
+    let (xb, wsse) = cap_ranges(&objective, xb, wsse, range_idx, max_h, 1000);
 
     let model = VariogramModel::new(
         xb[0] * xb[0],
         vec![Structure::new(kind, xb[1].exp(), xb[2].exp())],
     )?;
     Ok(FitResult { model, wsse })
+}
+
+/// Upper bound on a fitted range, as a multiple of the largest lag distance
+/// in the experimental variogram (see [`cap_ranges`]).
+pub const MAX_RANGE_FACTOR: f64 = 10.0;
+
+/// Bounds the log-parametrized ranges at `x[i]` for `i` in `range_idx` to
+/// `MAX_RANGE_FACTOR * max_h`, re-optimizing every other parameter with the
+/// offending ranges fixed at the bound.
+///
+/// The log-parametrization has no upper bound. When the empirical curve is
+/// still rising at the last lag (no sill in view), WLS can slide along a
+/// ridge where psill and range grow together without limit -- seen on real
+/// tailings residuals at range ~1e12 and psill ~1e15, where `c0 - gamma`
+/// then loses every significant digit and kriging returns NaN. Interior
+/// optima (every well-posed fit) never trigger the refit, so validated fits
+/// are returned unchanged.
+fn cap_ranges<F>(
+    objective: &F,
+    mut xb: Vec<f64>,
+    mut wsse: f64,
+    range_idx: &[usize],
+    max_h: f64,
+    max_iter: usize,
+) -> (Vec<f64>, f64)
+where
+    F: Fn(&[f64]) -> f64,
+{
+    let ln_max = (MAX_RANGE_FACTOR * max_h).ln();
+    let mut fixed: Vec<usize> = Vec::new();
+    // Each pass fixes at least one more range, so this ends after at most
+    // `range_idx.len()` refits.
+    loop {
+        let over: Vec<usize> = range_idx
+            .iter()
+            .copied()
+            .filter(|i| !fixed.contains(i) && xb[*i] > ln_max)
+            .collect();
+        if over.is_empty() {
+            return (xb, wsse);
+        }
+        for &i in &over {
+            xb[i] = ln_max;
+            fixed.push(i);
+        }
+        let free: Vec<usize> = (0..xb.len()).filter(|i| !fixed.contains(i)).collect();
+        let base = xb.clone();
+        let full = |y: &[f64]| -> Vec<f64> {
+            let mut x = base.clone();
+            for (k, &i) in free.iter().enumerate() {
+                x[i] = y[k];
+            }
+            x
+        };
+        let y0: Vec<f64> = free.iter().map(|&i| xb[i]).collect();
+        let (yb, w) =
+            nelder_mead_multistart(|y: &[f64]| objective(&full(y)), &[y0], 0.25, max_iter);
+        xb = full(&yb);
+        wsse = w;
+    }
 }
 
 /// `(h, gamma, n_pairs)` per non-empty lag bin.
@@ -213,6 +280,8 @@ pub fn fit_matern(exp_v: &ExperimentalVariogram) -> Result<FitResult> {
         })
         .collect();
     let (xb, wsse) = nelder_mead_multistart(objective, &starts, 0.25, 1500);
+    let max_h = pts.iter().fold(0.0_f64, |m, p| m.max(p.0));
+    let (xb, wsse) = cap_ranges(&objective, xb, wsse, &[2], max_h, 1500);
 
     let model = VariogramModel::new(
         xb[0] * xb[0],
@@ -261,6 +330,8 @@ pub fn fit_stable(exp_v: &ExperimentalVariogram) -> Result<FitResult> {
         })
         .collect();
     let (xb, wsse) = nelder_mead_multistart(objective, &starts, 0.25, 1500);
+    let max_h = pts.iter().fold(0.0_f64, |m, p| m.max(p.0));
+    let (xb, wsse) = cap_ranges(&objective, xb, wsse, &[2], max_h, 1500);
 
     let alpha = 1.0 + xb[3].tanh();
     let model = VariogramModel::new(
@@ -343,6 +414,11 @@ pub fn fit_nested(exp_v: &ExperimentalVariogram, kinds: &[ModelKind]) -> Result<
         })
         .collect();
     let (xb, wsse) = nelder_mead_multistart(objective, &starts, 0.25, 1500);
+    let range_idx: Vec<usize> = (0..n_struct)
+        .filter(|&i| !matches!(kinds[i], ModelKind::Power(_)))
+        .map(|i| 2 + 2 * i)
+        .collect();
+    let (xb, wsse) = cap_ranges(&objective, xb, wsse, &range_idx, max_h, 1500);
 
     let structures: Vec<Structure> = (0..n_struct)
         .map(|i| Structure::new(kinds[i], xb[1 + 2 * i].exp(), xb[2 + 2 * i].exp()))
@@ -648,6 +724,77 @@ mod tests {
             bins,
             max_dist,
             coincident_pairs: 0,
+        }
+    }
+
+    /// Regression: an empirical variogram still rising linearly at the last
+    /// lag used to drive psill/range along an unbounded ridge (range ~1e12,
+    /// psill ~1e15 on real tailings residuals), after which kriging returned
+    /// NaN. The range is now capped at `MAX_RANGE_FACTOR * max_h`.
+    #[test]
+    fn unbounded_rising_variogram_caps_range_instead_of_diverging() {
+        let n = 12;
+        let max_dist = 6000.0;
+        let width = max_dist / n as f64;
+        let bins = (0..n)
+            .map(|i| {
+                let h = (i as f64 + 0.5) * width;
+                LagBin {
+                    h,
+                    gamma: 30.0 + 0.01 * h,
+                    n_pairs: 200,
+                }
+            })
+            .collect();
+        let ev = ExperimentalVariogram {
+            bins,
+            max_dist,
+            coincident_pairs: 0,
+        };
+        let max_h = (n as f64 - 0.5) * width;
+        for kind in [
+            ModelKind::Matern15,
+            ModelKind::Gaussian,
+            ModelKind::Exponential,
+            ModelKind::Spherical,
+        ] {
+            let fit = fit_model(&ev, kind).unwrap();
+            let s = fit.model.structures[0];
+            assert!(
+                s.range <= MAX_RANGE_FACTOR * max_h * (1.0 + 1e-9),
+                "{kind:?}: range {} exceeds cap",
+                s.range
+            );
+            assert!(
+                s.sill.is_finite() && s.sill < 1e4,
+                "{kind:?}: psill {} diverged",
+                s.sill
+            );
+            // The fit must still describe the data over the lag range.
+            let g = fit.model.gamma(max_h);
+            assert!(
+                (g - (30.0 + 0.01 * max_h)).abs() < 15.0,
+                "{kind:?}: gamma(max_h) {g}"
+            );
+        }
+        // The free-shape and nested fitters share the same ridge.
+        let cap = MAX_RANGE_FACTOR * max_h * (1.0 + 1e-9);
+        for (name, fit) in [
+            ("matern", fit_matern(&ev).unwrap()),
+            ("stable", fit_stable(&ev).unwrap()),
+            (
+                "nested",
+                fit_nested(&ev, &[ModelKind::Spherical, ModelKind::Exponential]).unwrap(),
+            ),
+        ] {
+            for s in &fit.model.structures {
+                assert!(s.range <= cap, "{name}: range {} exceeds cap", s.range);
+                assert!(
+                    s.sill.is_finite() && s.sill < 1e4,
+                    "{name}: psill {}",
+                    s.sill
+                );
+            }
         }
     }
 

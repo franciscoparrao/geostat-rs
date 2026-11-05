@@ -6,6 +6,15 @@ before 0.7.0 predate this file and are reconstructed from commit history.
 
 ## [Unreleased]
 
+### Fixed
+- WLS variogram fits (`fit_model`/`fit_best`, `fit_matern`, `fit_stable`,
+  `fit_nested`) could diverge along an unbounded psill/range ridge when the
+  empirical variogram was still rising at the last lag (seen at range ~1e12,
+  psill ~1e15 on real data), after which kriging and regression kriging
+  returned NaN. Ranges are now capped at `MAX_RANGE_FACTOR` (10) times the
+  largest lag distance, refitting the other parameters at the cap. Interior
+  optima are untouched; gstat parity is unchanged.
+
 ### Added
 - Unconditional sequential Gaussian simulation
   (`unconditional_gaussian_simulation` in the core, `sgs_unconditional()` in
