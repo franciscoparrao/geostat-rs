@@ -26,3 +26,6 @@ paper/**/*.spl
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Tailings REE dataset (see data/relaves/provenance.json)
+data/relaves/*.pkl

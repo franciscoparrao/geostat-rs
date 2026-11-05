@@ -1,0 +1,12 @@
+{
+  "file": "tierras_raras.pkl",
+  "sha256": "aae3bf1abfbb0c4fb91eae537870fbf2beb260723763058237ee789f27e9f98f",
+  "bytes": 1110977,
+  "file_mtime": "2022-05-16",
+  "content": "pandas DataFrame, 2032 rows: geochemistry of Chilean mine-tailings deposits (columns Region, Faena, Deposito, IDQ, Coord. E/N, oxides and trace elements incl. REE)",
+  "origin": "Public geochemical registry of tailings deposits in Chile (SERNAGEOMIN); preprocessed pickle from the TGPY project",
+  "copied_from": "/mnt/kingston/proyectos/TGPY.tar.zst :: TGPY/Python/tierras_raras.pkl (archive of ~/proyectos/TGPY, 2026-09-28)",
+  "copied_on": "2026-11-05",
+  "in_git": false,
+  "note": "Not committed (gitignored). Scripts read it from here or from ."
+}

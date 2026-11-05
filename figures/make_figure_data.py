@@ -6,8 +6,10 @@ Outputs to figures/data/:
   parity.csv        geostat-rs vs gstat (OK and IDW) on the Meuse grid
   compare_vecv.csv  leave-one-out VEcv by method on Meuse log-zinc
   idw_tune.csv      IDW power tuning trace (VEcv vs power) on Meuse log-zinc
-  multielement.csv  REE hold-out VEcv by element x method (needs smelt + the
-                    tailings dataset; skipped if unavailable)
+  multielement.csv  REE hold-out VEcv by element x method, mean/SD over 20
+                    deposit-grouped splits (+ random splits as contrast);
+                    multielement_meta.json holds n, skew, versions. Needs
+                    smelt + data/relaves/tierras_raras.pkl; skipped otherwise.
 
 Run from the repo root, after `Rscript validation/gstat_reference.R` and
 `Rscript validation/idw_gstat.R`:
@@ -15,8 +17,10 @@ Run from the repo root, after `Rscript validation/gstat_reference.R` and
 """
 
 import csv
+import hashlib
 import json
 import math
+import os
 import random
 from pathlib import Path
 
@@ -224,11 +228,22 @@ def fig_anisotropy():
     print(f"  fitted anisotropy: azimuth {az:.1f} deg, ratio {ratio:.3f}")
 
 
-def fig_multielement():
-    """REE hold-out VEcv by element x method (publishable methods only).
+REE_PKL = Path(os.environ.get(
+    "GEOSTAT_REE_PKL", Path(__file__).resolve().parents[1] / "data" / "relaves" / "tierras_raras.pkl"))
+
+
+def fig_multielement(reps=20):
+    """REE hold-out VEcv by element x method, deposit-grouped hold-out.
 
     Data provenance: the public geochemical registry of tailings deposits in
-    Chile (SERNAGEOMIN, 2023), openly available. No transport kriging here.
+    Chile (SERNAGEOMIN, 2023); see data/relaves/provenance.json.
+
+    Validation: `reps` hold-out splits that put ~25% of the sampling locations
+    in the test set by whole deposits (Faena + Deposito), so no test point has
+    a same-deposit neighbour in training. The same number of purely random
+    location splits is run as a contrast (it leaks within-deposit
+    autocorrelation and is optimistic). Writes mean and SD over splits, plus
+    the descriptive statistics quoted in the paper (multielement_meta.json).
     """
     try:
         import numpy as np
@@ -237,9 +252,8 @@ def fig_multielement():
     except ImportError as e:
         print(f"  multielement skipped (missing {e.name})")
         return
-    data = Path.home() / "proyectos" / "TGPY" / "Python" / "tierras_raras.pkl"
-    if not data.exists():
-        print("  multielement skipped (dataset not found)")
+    if not REE_PKL.exists():
+        print(f"  multielement skipped (dataset not found: {REE_PKL})")
         return
 
     region = "COQUIMBO"
@@ -252,42 +266,104 @@ def fig_multielement():
         return pd.to_numeric(s.str.replace("<", "", regex=False).str.replace(">", "", regex=False),
                              errors="coerce")
 
-    d = pd.read_pickle(data)
+    def skew(v):
+        a = np.asarray(v, float)
+        return float(((a - a.mean()) ** 3).mean() / a.std() ** 3)
+
+    d = pd.read_pickle(REE_PKL)
     df = pd.DataFrame({"x": num(d["Coord. E"]), "y": num(d["Coord. N"])})
     for c in targets + covs:
         df[c] = num(d[c])
     df["r"] = d["Region"]
+    df["grp"] = d["Faena"].astype(str).str.strip() + "|" + d["Deposito"].astype(str).str.strip()
     df = df[(df.x > 0) & (df.y > 0) & (df.r == region)].drop(columns="r").dropna()
-    agg = {"x": "mean", "y": "mean", **{c: "mean" for c in targets + covs}}
-    df = df.assign(xr=df.x.round(0), yr=df.y.round(0)).groupby(["xr", "yr"], as_index=False).agg(agg)
+    n_samples, n_deposits = len(df), int(df.grp.nunique())
+    # Average collocated samples (same location, to the metre).
+    agg = {"x": "mean", "y": "mean", "grp": "first", **{c: "mean" for c in targets + covs}}
+    df = (df.assign(xr=df.x.round(0), yr=df.y.round(0))
+            .groupby(["xr", "yr"], as_index=False).agg(agg).reset_index(drop=True))
+    n, nt = len(df), len(df) // 4
+    groups = sorted(df.grp.unique())
+    sizes = df.groupby("grp").size()
 
-    rng = random.Random(seed)
-    idx = list(range(len(df)))
-    rng.shuffle(idx)
-    nt = len(df) // 4
-    tr, te = df.iloc[idx[nt:]], df.iloc[idx[:nt]]
-    trx, tryy = tr.x.tolist(), tr.y.tolist()
-    tex, tey = te.x.tolist(), te.y.tolist()
-    tr_cov, te_cov = tr[covs].values.tolist(), te[covs].values.tolist()
-    Xtr, Xte = np.array(tr_cov, float), np.array(te_cov, float)
+    def split_random(rep):
+        idx = list(range(n))
+        random.Random(seed + rep).shuffle(idx)
+        return idx[nt:], idx[:nt]
+
+    def split_grouped(rep):
+        g = groups[:]
+        random.Random(seed + rep).shuffle(g)
+        test, cnt = set(), 0
+        for x in g:
+            if cnt >= nt:
+                break
+            test.add(x)
+            cnt += sizes[x]
+        mask = df.grp.isin(test)
+        return df.index[~mask].tolist(), df.index[mask].tolist()
+
+    methods = ["ordinary kriging", "regression kriging", "random forest", "RF + residual kriging"]
+    scores = {}  # (scheme, element, method) -> [vecv per split]
+    nn_med, n_test = {}, {}
+    for scheme, split in [("deposit-grouped", split_grouped), ("random", split_random)]:
+        for rep in range(reps):
+            tri, tei = split(rep)
+            tr, te = df.iloc[tri], df.iloc[tei]
+            a, b = te[["x", "y"]].values, tr[["x", "y"]].values
+            nn = np.sqrt(((a[:, None, :] - b[None, :, :]) ** 2).sum(-1)).min(1)
+            nn_med.setdefault(scheme, []).append(float(np.median(nn)))
+            n_test.setdefault(scheme, []).append(len(te))
+            trx, tryy = tr.x.tolist(), tr.y.tolist()
+            tex, tey = te.x.tolist(), te.y.tolist()
+            tr_cov, te_cov = tr[covs].values.tolist(), te[covs].values.tolist()
+            Xtr, Xte = np.array(tr_cov, float), np.array(te_cov, float)
+            for tgt in targets:
+                trv, tev = tr[tgt].tolist(), te[tgt].tolist()
+                model = gs.fit_variogram(trx, tryy, trv, n_lags=12)
+                ok, _ = gs.krige(trx, tryy, trv, model, tex, tey, method="ordinary", max_neighbors=24)
+                rk = gs.regression_kriging(trx, tryy, trv, tr_cov, tex, tey, te_cov,
+                                           n_lags=12, max_neighbors=24)
+                rf = smelt.RandomForest(n_estimators=300, max_depth=12, seed=seed)
+                rf.fit(Xtr, np.array(trv, float))
+                rf_tr = np.asarray(rf.predict(Xtr)).tolist()
+                rf_te = np.asarray(rf.predict(Xte)).tolist()
+                hyb = gs.regression_kriging(trx, tryy, trv, tr_cov, tex, tey, te_cov,
+                                            trend_at_data=rf_tr, trend_at_targets=rf_te,
+                                            n_lags=12, max_neighbors=24)
+                el = tgt.split("(")[0]
+                for m, pred in zip(methods, [ok, rk["prediction"], rf_te, hyb["prediction"]]):
+                    v = vecv(tev, pred)
+                    if not math.isfinite(v):
+                        # Fail loudly: a mean over splits must never drop one.
+                        raise RuntimeError(f"non-finite VEcv: {scheme} split {rep} {el} {m}")
+                    scores.setdefault((scheme, el, m), []).append(v)
 
     rows = []
-    for tgt in targets:
-        trv, tev = tr[tgt].tolist(), te[tgt].tolist()
-        model = gs.fit_variogram(trx, tryy, trv, n_lags=12)
-        ok, _ = gs.krige(trx, tryy, trv, model, tex, tey, method="ordinary", max_neighbors=24)
-        rk = gs.regression_kriging(trx, tryy, trv, tr_cov, tex, tey, te_cov, n_lags=12, max_neighbors=24)
-        rf = smelt.RandomForest(n_estimators=300, max_depth=12, seed=seed)
-        rf.fit(Xtr, np.array(trv, float))
-        rf_tr, rf_te = np.asarray(rf.predict(Xtr)).tolist(), np.asarray(rf.predict(Xte)).tolist()
-        hyb = gs.regression_kriging(trx, tryy, trv, tr_cov, tex, tey, te_cov,
-                                    trend_at_data=rf_tr, trend_at_targets=rf_te,
-                                    n_lags=12, max_neighbors=24)
-        el = tgt.split("(")[0]
-        for method, pred in [("ordinary kriging", ok), ("regression kriging", rk["prediction"]),
-                             ("random forest", rf_te), ("RF + residual kriging", hyb["prediction"])]:
-            rows.append((el, method, vecv(tev, pred)))
-    write_csv(OUT / "multielement.csv", ["element", "method", "vecv"], rows)
+    for (scheme, el, m), v in scores.items():
+        v = np.asarray(v)
+        rows.append((scheme, el, m, float(v.mean()), float(v.std(ddof=1)), len(v)))
+    write_csv(OUT / "multielement.csv",
+              ["scheme", "element", "method", "vecv_mean", "vecv_sd", "n_splits"], rows)
+    gain = {}
+    for scheme in ("deposit-grouped", "random"):
+        for tgt in targets:
+            el = tgt.split("(")[0]
+            diff = (np.asarray(scores[(scheme, el, "RF + residual kriging")])
+                    - np.asarray(scores[(scheme, el, "random forest")]))
+            gain[f"{scheme}:{el}"] = {"mean": float(diff.mean()), "sd": float(diff.std(ddof=1))}
+    meta = {
+        "dataset_sha256": hashlib.sha256(REE_PKL.read_bytes()).hexdigest(),
+        "region": region, "n_samples": n_samples, "n_deposits": n_deposits, "n_locations": n,
+        "skew_by_element": {t.split("(")[0]: skew(df[t]) for t in targets},
+        "n_splits": reps, "seed": seed,
+        "n_test_median": {k: float(np.median(v)) for k, v in n_test.items()},
+        "nearest_train_distance_m_median": {k: float(np.median(v)) for k, v in nn_med.items()},
+        "hybrid_minus_rf_vecv": gain,
+        "geostat_rs_version": gs.__version__,
+        "smelt_version": getattr(smelt, "__version__", "unknown"),
+    }
+    (OUT / "multielement_meta.json").write_text(json.dumps(meta, indent=1) + "\n")
 
 
 def main():

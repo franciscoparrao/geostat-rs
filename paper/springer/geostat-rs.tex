@@ -300,18 +300,36 @@ log-zinc.}
 
 \section{Application: rare-earth grade prediction in Chilean mine tailings}\label{sec:application}
 
-We predict rare-earth grades on $\sim$1100 mine-tailings deposits in the
-Coquimbo region, drawn from the public geochemical registry of tailings
-deposits in Chile \citep{sernageomin2023}, from non-rare-earth
+We predict rare-earth grades in 1118 samples from 331 mine-tailings
+deposits in the Coquimbo region, drawn from the public geochemical registry of
+tailings deposits in Chile \citep{sernageomin2023}, from non-rare-earth
 host-mineral proxies (P$_2$O$_5$, Th for phosphates/monazite; TiO$_2$,
 Fe$_2$O$_3$, Zr for Ti--Fe oxides and zircon), deliberately excluding
 neighbouring rare-earth elements, which are co-measured and would constitute
-leakage. Hold-out VEcv (Table~\ref{tab:ree}, Fig.~\ref{fig:ree}) shows that
-covariate value tracks the geochemistry: light rare earths (Ce, Nd, Dy) follow
-the phosphate proxies, the heavy proxy set predicts Y, and La carries no signal
-in any predictor (all methods negative --- the engine does not manufacture
-signal). The random-forest-trend plus residual-kriging hybrid is best or tied
-wherever signal exists. The random-forest trend is supplied by a companion Rust
+leakage. Samples of one deposit lie close together: under a random hold-out the
+median distance from a test location to its nearest training location is
+31~m, so every method can borrow within-deposit autocorrelation. We therefore
+hold out whole deposits. Each of 20 splits sends about a quarter of the
+locations to the test set, deposit by deposit, which raises that median
+distance to 156~m; Table~\ref{tab:ree} and Fig.~\ref{fig:ree} report the mean
+and standard deviation of hold-out VEcv over the splits.
+
+Held out by deposit, ordinary kriging has no skill for Ce, Nd or Dy (mean VEcv
+between $-1.7$ and $-0.8$\%) and little for Y (18.1\%): the spatial correlation
+it exploits operates within deposits, not between them. The host-mineral
+proxies carry the signal --- the random forest explains 53.7\%, 63.2\%,
+36.6\% and 53.3\% of the variance of Ce, Nd, Dy and Y --- while La is predicted
+by no method (every mean is negative; the engine does not manufacture signal).
+The random-forest-trend plus residual-kriging hybrid outperforms regression
+kriging with a linear trend wherever signal exists (by 4.1 to 9.5 points), but
+it ties the random forest itself for Ce, Nd and Dy (paired differences of
+$-0.4$ to $+0.4$ points, standard deviation about 1) and gains only for Y
+($+1.8 \pm 0.9$ points). Random location splits, by contrast (crosses in
+Fig.~\ref{fig:ree}), inflate the VEcv of both kriging variants by 9 to 13
+points for Ce, Nd, Dy and Y and credit the hybrid with a 1.2 to 4.2 point gain
+over the random forest: residual kriging adds value only where same-deposit
+samples are near, and a random hold-out mistakes that proximity for
+predictive skill. The random-forest trend is supplied by a companion Rust
 machine-learning engine and the residual kriging by geostat-rs, giving an
 RFOK-style hybrid \citep{li2021} with no R or scikit-learn dependency.
 These proxy--target relationships are specific to the Coquimbo tailings'
@@ -323,17 +341,19 @@ geological settings.
 \begin{table}[t]
 \centering
 \caption{Hold-out VEcv (\%) by rare-earth element and method (Coquimbo
-tailings; host-mineral proxies). Skew of the grade is shown for context.}
+tailings; host-mineral proxies), held out by deposit: mean (standard
+deviation) over 20 splits. Skew of the grade is shown for context. Computed
+with geostat-rs 0.8.0 and smelt 0.8.1 (\texttt{figures/make\_figure\_data.py}).}
 \label{tab:ree}
 \begin{tabular}{@{}lrrrrr@{}}
 \toprule
 Element & skew & OK & RK (OLS) & RF & RF+res.\ krige \\
 \midrule
-La & 10.3 & $-10.5$ & $-5.6$ & $-12.4$ & $-7.5$ \\
-Ce & 5.9 & 13.3 & 39.9 & 49.9 & 51.0 \\
-Nd & 6.2 & 23.4 & 59.8 & 68.9 & 70.9 \\
-Dy & 3.0 & 10.1 & 35.2 & 46.1 & 52.1 \\
-Y  & 0.5 & 28.9 & 64.8 & 62.3 & 66.4 \\
+La & 10.3 & $-26.2$ (69) & $-12.4$ (64) & $-17.0$ (30) & $-16.6$ (40) \\
+Ce & 5.9 & $-1.7$ (19) & 47.8 (23) & 53.7 (18) & 54.1 (17) \\
+Nd & 6.2 & $-1.5$ (16) & 53.3 (20) & 63.2 (13) & 62.8 (14) \\
+Dy & 3.0 & $-0.8$ (7) & 32.7 (15) & 36.6 (13) & 36.8 (14) \\
+Y  & 0.5 & 18.1 (7) & 48.5 (6) & 53.3 (6) & 55.1 (6) \\
 \botrule
 \end{tabular}
 \end{table}
@@ -341,9 +361,12 @@ Y  & 0.5 & 28.9 & 64.8 & 62.3 & 66.4 \\
 \begin{figure}[t]
 \centering
 \includegraphics[width=\linewidth]{fig_multielement.pdf}
-\caption{Rare-earth grade prediction by element and method (hold-out VEcv).
-Covariate value tracks the host-mineral geochemistry; the ML-trend plus
-residual-kriging hybrid is best where signal exists.}
+\caption{Rare-earth grade prediction by element and method. Bars: hold-out
+VEcv held out by deposit, mean $\pm$ one standard deviation over 20 splits
+(axis truncated at $-45$\%; La's intervals extend further). Crosses: mean
+over random location splits, which leak within-deposit autocorrelation.
+Ordinary kriging loses most of its skill once deposits are held out; the
+residual-kriging hybrid then ties the random forest except for Y.}
 \label{fig:ree}
 \end{figure}
 
@@ -374,10 +397,11 @@ types and scales is left for future work, and the predictive-accuracy
 comparison is deliberately confined to the methods in the engine rather than
 surveying the wider machine-learning literature. The Meuse method comparison
 (Sect.~\ref{sec:accuracy}) reports bootstrap confidence intervals on VEcv; the
-rare-earth application (Sect.~\ref{sec:application}) reports a single
-train/test split, so its element-by-element VEcv values should be read as a
-demonstration of the regression-kriging bridge rather than as
-uncertainty-quantified estimates.
+rare-earth application (Sect.~\ref{sec:application}) reports the mean and
+standard deviation over 20 deposit-grouped splits; with a few hundred
+deposits those deviations stay large (13 to 23 points for Ce and Nd), so its
+element-by-element VEcv values should be read as a demonstration of the
+regression-kriging bridge rather than as precise estimates.
 
 Future directions include GPU and out-of-core execution for larger grids,
 additional input/output formats and full GeoPackage raster support for tighter

@@ -5,7 +5,7 @@ it was built for.
 
 Data: the national tailings geochemistry database (`tierras_raras.pkl`,
 2032 samples × 70 geochemical variables). We predict Nd (neodymium, g/t) in the
-densest region (Coquimbo, ~1100 deposits), which is heavily right-skewed
+densest region (Coquimbo, ~1100 sampling locations in ~330 deposits), which is heavily right-skewed
 (skew ~6). The covariates are deliberately NOT the neighbouring light REE
 (Ce, Pr are ~0.95–0.99 correlated with Nd — they are measured together, so
 using them is leakage, not a use case). Instead we use cheaper / more common
@@ -28,6 +28,7 @@ repo root (the data path is absolute):
 
 import math
 import random
+import os
 from pathlib import Path
 
 import numpy as np
@@ -36,7 +37,7 @@ import pandas as pd
 import geostat_rs as gs
 import smelt
 
-TGPY = Path.home() / "proyectos" / "TGPY" / "Python"
+REE_PKL = Path(os.environ.get("GEOSTAT_REE_PKL", Path(__file__).resolve().parents[1] / "data" / "relaves" / "tierras_raras.pkl"))
 REGION = "COQUIMBO"
 TARGET = "Nd(g/t)"
 COVARIATES = ["P2O5(%)", "Th(g/t)", "La(g/t)", "TiO2(%)"]
@@ -51,7 +52,7 @@ def numeric(s):
 
 
 def load():
-    d = pd.read_pickle(TGPY / "tierras_raras.pkl")
+    d = pd.read_pickle(REE_PKL)
     cols = {"x": "Coord. E", "y": "Coord. N", "v": TARGET}
     out = {k: numeric(d[c]) for k, c in cols.items()}
     for c in COVARIATES:
@@ -104,7 +105,7 @@ def main():
     sk = (sum((a - np.mean(v)) ** 3 for a in v) / len(v)) / np.std(v) ** 3
     print(f"geostat_rs {gs.__version__}  +  smelt {getattr(smelt,'__version__','?')}")
     print(
-        f"{TARGET} in {REGION}: {len(df)} deposits "
+        f"{TARGET} in {REGION}: {len(df)} sampling locations "
         f"(median={v[len(v)//2]:.1f}, max={v[-1]:.0f}, skew={sk:.1f}); "
         f"train={len(tr)}, test={len(te)}"
     )

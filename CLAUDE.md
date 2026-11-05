@@ -513,3 +513,15 @@ Computers & Geosciences.
     de kriging simple/OK/UK/KED), y exponer collocated cokriging/
     Markov-Bayes/block IRF-0 en CLI/Python (deliberadamente diferido,
     alcance de esas sesiones: el núcleo del motor).
+
+## Gotchas de la aplicación de relaves (paper, 2026-11-05)
+- Dataset en `data/relaves/tierras_raras.pkl` (gitignored; procedencia y sha256
+  en `data/relaves/provenance.json`; respaldo en `/mnt/kingston/proyectos/TGPY.tar.zst`).
+  Ruta alternativa por `$GEOSTAT_REE_PKL`.
+- Son 1118 **muestras** de 331 depósitos (par Faena+Deposito), no ~1100 depósitos.
+- Validar **por depósito**: la partición al azar deja vecinos del mismo depósito a
+  ~31 m e infla el kriging 9–13 puntos de VEcv; por depósito el kriging ordinario
+  queda en ~0 y el híbrido RF+kriging de residuos empata con RF salvo en Y.
+- La tabla depende de la versión de smelt (el RF cambió entre junio y 0.8.1):
+  declarar versiones al regenerar (`figures/make_figure_data.py` las guarda en
+  `figures/data/multielement_meta.json`).

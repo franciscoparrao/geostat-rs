@@ -21,6 +21,7 @@ Requires geostat_rs + smelt + numpy + pandas. Run from the repo root:
 
 import math
 import random
+import os
 from pathlib import Path
 
 import numpy as np
@@ -29,7 +30,7 @@ import pandas as pd
 import geostat_rs as gs
 import smelt
 
-TGPY = Path.home() / "proyectos" / "TGPY" / "Python"
+REE_PKL = Path(os.environ.get("GEOSTAT_REE_PKL", Path(__file__).resolve().parents[1] / "data" / "relaves" / "tierras_raras.pkl"))
 REGION = "COQUIMBO"
 TARGETS = ["La(g/t)", "Ce(g/t)", "Nd(g/t)", "Dy(g/t)", "Y(g/t)"]
 COVARIATES = ["P2O5(%)", "Th(g/t)", "TiO2(%)", "Fe2O3(%)", "Zr(g/t)"]
@@ -45,7 +46,7 @@ def numeric(s):
 
 
 def load():
-    d = pd.read_pickle(TGPY / "tierras_raras.pkl")
+    d = pd.read_pickle(REE_PKL)
     cols = {"x": "Coord. E", "y": "Coord. N"}
     out = {k: numeric(d[c]) for k, c in cols.items()}
     for c in TARGETS + COVARIATES:
@@ -85,7 +86,7 @@ def main():
     Xtr, Xte = np.array(tr_cov, float), np.array(te_cov, float)
 
     print(f"geostat_rs {gs.__version__}  +  smelt {getattr(smelt,'__version__','?')}")
-    print(f"{REGION}: {len(df)} deposits  (train={len(tr)}, test={len(te)})")
+    print(f"{REGION}: {len(df)} sampling locations  (train={len(tr)}, test={len(te)})")
     print(f"covariates (non-REE host proxies): {', '.join(COVARIATES)}\n")
     print("Predictive accuracy — VEcv % (higher is better):")
     print(f"  {'element':<9}{'skew':>6}{'OK':>8}{'RK-OLS':>8}{'RF':>8}{'hybrid':>8}")

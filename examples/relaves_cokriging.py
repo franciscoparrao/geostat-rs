@@ -30,13 +30,14 @@ Requires geostat_rs + numpy + pandas. Run from the repo root:
 
 import math
 import random
+import os
 from pathlib import Path
 
 import pandas as pd
 
 import geostat_rs as gs
 
-TGPY = Path.home() / "proyectos" / "TGPY" / "Python"
+REE_PKL = Path(os.environ.get("GEOSTAT_REE_PKL", Path(__file__).resolve().parents[1] / "data" / "relaves" / "tierras_raras.pkl"))
 REGION = "COQUIMBO"
 PRIMARY = "Nd(g/t)"
 SECONDARY = "La(g/t)"
@@ -52,7 +53,7 @@ def numeric(s):
 
 
 def load():
-    d = pd.read_pickle(TGPY / "tierras_raras.pkl")
+    d = pd.read_pickle(REE_PKL)
     df = pd.DataFrame(
         {
             "x": numeric(d["Coord. E"]),
@@ -103,7 +104,7 @@ def main():
         f"{REGION}: predict log {PRIMARY} (primary) from log {SECONDARY} (secondary), "
         f"corr≈{train.p.corr(train.s):.2f}"
     )
-    print(f"deposits={len(df)}  train={len(train)}  test={len(test)}\n")
+    print(f"locations={len(df)}  train={len(train)}  test={len(test)}\n")
 
     # Reference: ordinary kriging with the FULL primary (Nd dense everywhere).
     full_model = gs.fit_variogram(full_px, full_py, full_pv, n_lags=12)
