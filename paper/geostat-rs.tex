@@ -47,12 +47,7 @@ architecture costs no numerical fidelity: every deterministic method is
 cross-checked against gstat on the Meuse and Walker Lake benchmarks at machine
 precision, and simulation is validated distributionally. Regression kriging
 accepts an externally supplied trend, letting a machine-learning model provide
-the mean while geostat-rs kriges the residuals. On rare-earth grades in 1118
-samples from 331 Chilean mine-tailings deposits, holding out whole deposits
-shows that the signal lies in host-mineral covariates: ordinary kriging
-explains at most 18\% of the variance across deposits and residual kriging
-adds little to a random-forest trend, whereas a random hold-out inflates
-kriging VEcv (variance explained by cross-validation) by 9 to 13 points through within-deposit autocorrelation.
+the mean while geostat-rs kriges the residuals. On log rare-earth grades in 1118 samples from 331 Chilean mine-tailings deposits, holding out whole deposits shows that the signal lies in host-mineral covariates: ordinary kriging explains at most 22\% of the variance and kriging the residuals of a random-forest trend lowers accuracy, whereas a random hold-out inflates ordinary-kriging VEcv (variance explained by cross-validation) by 20 to 28 points through within-deposit autocorrelation.
 \end{abstract}
 
 \begin{keyword}
@@ -313,59 +308,81 @@ log-zinc.}
 \label{sec:application}
 
 We predict rare-earth grades in 1118 samples from 331 mine-tailings
-deposits in the Coquimbo region, drawn from the public geochemical registry of
-tailings deposits in Chile \citep{sernageomin2023}, from non-rare-earth
-host-mineral proxies (P$_2$O$_5$, Th for phosphates/monazite; TiO$_2$,
-Fe$_2$O$_3$, Zr for Ti--Fe oxides and zircon), deliberately excluding
-neighbouring rare-earth elements, which are co-measured and would constitute
-leakage. Samples of one deposit lie close together: under a random hold-out the
-median distance from a test location to its nearest training location is
-31~m, so every method can borrow within-deposit autocorrelation. We therefore
-hold out whole deposits. Each of 20 splits sends about a quarter of the
-locations to the test set, deposit by deposit, which raises that median
-distance to 156~m; Table~\ref{tab:ree} and Figure~\ref{fig:ree} report the mean
-and standard deviation of hold-out VEcv over the splits.
+deposits of 175 mining operations in the Coquimbo region, drawn from the public
+geochemical registry of tailings deposits in Chile \citep{sernageomin2023},
+from non-rare-earth host-mineral proxies (P$_2$O$_5$, Th for
+phosphates/monazite; TiO$_2$, Fe$_2$O$_3$, Zr for Ti--Fe oxides and zircon),
+deliberately excluding neighbouring rare-earth elements, which are co-measured
+and would constitute leakage. The covariates are assays of the same samples,
+so the task is collocated prediction: it asks whether kriging adds information
+to a covariate model at a sampled location, not how to map grades between
+samples. Grades are right-skewed (raw skew 0.5 to 10.3, Table~\ref{tab:ree})
+and some sit on substitution floors that look like below-detection codes ---
+Y equals 5~g/t in 14.6\% of the samples --- so grades and covariates are
+modelled on the natural-log scale, where VEcv is also computed, and the floors
+are kept as given. The subset used is published with the code
+(Sect.~\ref{sec:availability}).
 
-Held out by deposit, ordinary kriging has no skill for Ce, Nd or Dy (mean VEcv
-between $-1.7$ and $-0.8$\%) and little for Y (18.1\%): the spatial correlation
-it exploits operates within deposits, not between them. The host-mineral
-proxies carry the signal --- the random forest explains 53.7\%, 63.2\%,
-36.6\% and 53.3\% of the variance of Ce, Nd, Dy and Y --- while La is predicted
-by no method (every mean is negative; the engine does not manufacture signal).
-The random-forest-trend plus residual-kriging hybrid outperforms regression
-kriging with a linear trend wherever signal exists (by 4.1 to 9.5 points), but
-it ties the random forest itself for Ce, Nd and Dy (paired differences of
-$-0.4$ to $+0.4$ points, standard deviation about 1) and gains only for Y
-($+1.8 \pm 0.9$ points). Random location splits, by contrast (crosses in
-Figure~\ref{fig:ree}), inflate the VEcv of both kriging variants by 9 to 13
-points for Ce, Nd, Dy and Y and credit the hybrid with a 1.2 to 4.2 point gain
-over the random forest: residual kriging adds value only where same-deposit
-samples are near, and a random hold-out mistakes that proximity for
-predictive skill. The random-forest trend is supplied by a companion Rust
-machine-learning engine and the residual kriging by geostat-rs, giving an
-RFOK-style hybrid \citep{li2021} with no \textsf{R} or scikit-learn dependency.
-These proxy--target relationships are specific to the Coquimbo tailings'
-mineralogy and this single regional dataset; we report them as a demonstration
-of the engine's regression-kriging bridge to machine learning; they are not a
-general claim about rare-earth prediction from host-mineral proxies in other
-geological settings.
+The log grades are correlated over short distances only: fitted with 100~m lags
+up to 2~km, their variograms have a nugget of 28 to 59\% of the sill and ranges
+of 57 to 224~m. Samples of one deposit lie close together, and under a random
+hold-out the median distance from a test location to its nearest training
+location is 31~m, well inside those ranges. We therefore hold out whole
+deposits (median distance 156~m) and, as a sensitivity check, whole operations
+(651~m); each of 20 splits per scheme sends about a quarter of the locations
+to the test set. We compare ordinary kriging, regression kriging with a linear
+trend, a random forest on the covariates \citep{smelt}, the same forest with
+the coordinates added as predictors, in the spirit of \citet{hengl2018}, and
+the forest trend plus kriging of its residuals. The residuals are
+cross-fitted: the trend at each training point comes from a forest fitted
+without that point's deposit (five grouped folds). In-sample forest residuals
+have 5 to 6 times less variance and would leave the kriging step almost nothing
+to model.
+
+Held out by deposit (Table~\ref{tab:ree}, Figure~\ref{fig:ree}), ordinary
+kriging explains at most 21.6\% of the variance (Y) and under 9\% for the other
+elements. The covariates carry the signal: the random forest explains 21.0 to
+61.8\%, adding the coordinates raises it by 2.3 to 6.8 points, and that forest
+is the best method for Ce, Nd, Dy and Y; for La, linear regression kriging is
+best (25.3\%). Kriging the cross-fitted forest residuals lowers VEcv by 1.1 to
+4.4 points relative to the forest alone, because the residual correlation does
+not reach from one deposit to the next; under random splits the same hybrid
+gains 3.9 to 5.9 points. Random splits also inflate ordinary kriging by 19.5 to
+27.7 points and linear regression kriging by 10.6 to 19.6 points, enough to
+make kriging look competitive. Holding out whole operations changes VEcv by
+$-12.4$ to $+0.4$ points and keeps the best method for every element. The
+kriging variances are well calibrated on the log scale: nominal 80\% intervals
+cover 78 to 86\% of the test values, and the goodness statistic of
+\citet{deutsch1997} is 0.89 to 0.96. The standard deviations over splits (6 to
+14 points) describe split-to-split variation, not confidence intervals,
+because the splits share training data. The forests come from a companion Rust
+machine-learning engine \citep{smelt} and the variography and kriging from
+geostat-rs, so the workflow needs no \textsf{R} or scikit-learn dependency. These
+relationships are specific to the Coquimbo tailings' mineralogy and this single
+regional dataset; we report them as a demonstration of the engine's
+regression-kriging bridge to machine learning, not as a general claim about
+rare-earth prediction from host-mineral proxies in other geological
+settings.
 
 \begin{table}[t]
 \centering
-\caption{Hold-out VEcv (\%) by rare-earth element and method (Coquimbo
-tailings; host-mineral proxies), held out by deposit: mean (standard
-deviation) over 20 splits. Skew of the grade is shown for context. Computed
-with geostat-rs 0.8.0 and smelt 0.8.1 (\texttt{figures/make\_figure\_data.py}).}
+\small
+\caption{Hold-out VEcv (\%) on log grade by rare-earth element and
+method (Coquimbo tailings; host-mineral proxies), held out by deposit: mean
+(standard deviation) over 20 splits. Skew is that of the raw grade. RF: random
+forest; RF$+xy$: with coordinates; RF$+$res.\ krige: forest trend plus kriging
+of cross-fitted residuals. Computed with geostat-rs 0.8.0 and smelt 0.8.1
+(\texttt{figures/make\_figure\_data.py}).}
 \label{tab:ree}
-\begin{tabular}{@{}lrrrrr@{}}
+\begin{tabular}{@{}lrrrrrr@{}}
 \toprule
-Element & skew & OK & RK (OLS) & RF & RF+res.\ krige \\
+Element & skew & OK & RK (OLS) & RF & RF$+xy$ & RF$+$res.\ krige \\
 \midrule
-La & 10.3 & $-26.2$ (69) & $-12.4$ (64) & $-17.0$ (30) & $-16.6$ (40) \\
-Ce & 5.9 & $-1.7$ (19) & 47.8 (23) & 53.7 (18) & 54.1 (17) \\
-Nd & 6.2 & $-1.5$ (16) & 53.3 (20) & 63.2 (13) & 62.8 (14) \\
-Dy & 3.0 & $-0.8$ (7) & 32.7 (15) & 36.6 (13) & 36.8 (14) \\
-Y  & 0.5 & 18.1 (7) & 48.5 (6) & 53.3 (6) & 55.1 (6) \\
+La & 10.3 & 0.9 (14) & 25.3 (12) & 21.0 (10) & 23.6 (10) & 20.0 (13) \\
+Ce & 5.9 & 8.4 (8) & 54.2 (8) & 57.9 (7) & 60.2 (6) & 56.2 (8) \\
+Nd & 6.2 & 7.9 (9) & 55.3 (9) & 61.8 (6) & 64.1 (6) & 60.4 (8) \\
+Dy & 3.0 & 2.7 (7) & 32.6 (11) & 41.0 (7) & 45.5 (6) & 39.9 (8) \\
+Y  & 0.5 & 21.6 (10) & 46.0 (12) & 52.7 (7) & 59.5 (6) & 48.3 (10) \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -373,12 +390,13 @@ Y  & 0.5 & 18.1 (7) & 48.5 (6) & 53.3 (6) & 55.1 (6) \\
 \begin{figure}[t]
 \centering
 \includegraphics[width=\linewidth]{fig_multielement.pdf}
-\caption{Rare-earth grade prediction by element and method. Bars: hold-out
-VEcv held out by deposit, mean $\pm$ one standard deviation over 20 splits
-(axis truncated at $-45$\%; La's intervals extend further). Crosses: mean
-over random location splits, which leak within-deposit autocorrelation.
-Ordinary kriging loses most of its skill once deposits are held out; the
-residual-kriging hybrid then ties the random forest except for Y.}
+\caption{Rare-earth grade prediction by element and method (VEcv on log
+grade). Bars: held out by deposit, mean $\pm$ one standard deviation over 20
+splits. Circles: held out by mining operation. Crosses: random location
+splits, which leak within-deposit autocorrelation. Ordinary kriging keeps
+little skill once deposits are held out, the forest with coordinates is best
+for four of the five elements, and kriging the forest residuals helps only
+under random splits.}
 \label{fig:ree}
 \end{figure}
 
@@ -412,7 +430,7 @@ surveying the wider machine-learning literature. The Meuse method comparison
 (Sect.~\ref{sec:accuracy}) reports bootstrap confidence intervals on VEcv; the
 rare-earth application (Sect.~\ref{sec:application}) reports the mean and
 standard deviation over 20 deposit-grouped splits; with a few hundred
-deposits those deviations stay large (13 to 23 points for Ce and Nd), so its
+deposits those deviations stay at 6 to 14 points, so its
 element-by-element VEcv values should be read as a demonstration of the
 regression-kriging bridge rather than as precise estimates.
 
@@ -435,8 +453,7 @@ repository, and all figures by the provided data-generation and plotting
 scripts. Results are deterministic and platform-independent. The Meuse and
 Walker Lake benchmark datasets are distributed with \textsf{gstat}; the
 rare-earth application uses the public geochemical registry of tailings
-deposits in Chile \citep{sernageomin2023}, openly available from the national
-geology and mining service.
+deposits in Chile \citep{sernageomin2023}, openly available from the national geology and mining service; the subset it uses (1118 samples and the columns the analysis reads) is distributed in the repository as \texttt{data/relaves/coquimbo\_ree.csv}.
 
 %% Bibliography
 \bibliographystyle{elsarticle-harv}

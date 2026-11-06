@@ -230,20 +230,43 @@ def fig_anisotropy():
 
 REE_PKL = Path(os.environ.get(
     "GEOSTAT_REE_PKL", Path(__file__).resolve().parents[1] / "data" / "relaves" / "tierras_raras.pkl"))
+# Published subset of the registry (data/relaves/export_csv.py); preferred when present.
+REE_CSV = Path(__file__).resolve().parents[1] / "data" / "relaves" / "coquimbo_ree.csv"
+
+
+def load_ree():
+    """Registry rows as a DataFrame and the path they came from (CSV first)."""
+    import pandas as pd
+    if REE_CSV.exists():
+        return pd.read_csv(REE_CSV), REE_CSV
+    return pd.read_pickle(REE_PKL), REE_PKL
 
 
 def fig_multielement(reps=20):
-    """REE hold-out VEcv by element x method, deposit-grouped hold-out.
+    """REE hold-out VEcv by element x method on log grades.
 
     Data provenance: the public geochemical registry of tailings deposits in
     Chile (SERNAGEOMIN, 2023); see data/relaves/provenance.json.
 
-    Validation: `reps` hold-out splits that put ~25% of the sampling locations
-    in the test set by whole deposits (Faena + Deposito), so no test point has
-    a same-deposit neighbour in training. The same number of purely random
-    location splits is run as a contrast (it leaks within-deposit
-    autocorrelation and is optimistic). Writes mean and SD over splits, plus
-    the descriptive statistics quoted in the paper (multielement_meta.json).
+    Modelling choices (each answers a flaw found in review):
+    * Grades and covariates are log-transformed (skew up to 10 on the raw
+      scale); VEcv and interval coverage are computed on the log scale. Values
+      sitting on a substitution floor (e.g. Y = 5 g/t, a below-detection code)
+      are kept as given and counted in the meta file.
+    * Variography uses explicit short lags (VARIO_LAGS over VARIO_MAX_M), the
+      scale at which the hold-out distances live, not a default of a third of
+      the 300-km bounding-box diagonal.
+    * The RF + residual-kriging hybrid kriges cross-fitted residuals: the trend
+      at each training point comes from a forest that did not see that
+      point's deposit (CROSSFIT_K grouped folds inside the training set).
+    * Baselines add an RF with coordinates (RFsp-style) to the OK, linear
+      regression kriging and covariate-only RF.
+    * Three hold-out schemes, `reps` splits each: whole deposits
+      (Faena + Deposito, primary), whole operations (Faena, sensitivity) and
+      random locations (leaky contrast). ~25% of locations go to test.
+    Writes mean/SD per cell, 80%-interval coverage and Deutsch goodness for
+    the kriging-based methods, and multielement_meta.json with n, censoring,
+    skew, fitted variograms, distances, paired gains and package versions.
     """
     try:
         import numpy as np
@@ -252,14 +275,18 @@ def fig_multielement(reps=20):
     except ImportError as e:
         print(f"  multielement skipped (missing {e.name})")
         return
-    if not REE_PKL.exists():
-        print(f"  multielement skipped (dataset not found: {REE_PKL})")
+    if not (REE_CSV.exists() or REE_PKL.exists()):
+        print(f"  multielement skipped (dataset not found: {REE_CSV} or {REE_PKL})")
         return
 
     region = "COQUIMBO"
     targets = ["La(g/t)", "Ce(g/t)", "Nd(g/t)", "Dy(g/t)", "Y(g/t)"]
     covs = ["P2O5(%)", "Th(g/t)", "TiO2(%)", "Fe2O3(%)", "Zr(g/t)"]
     seed = 20260618
+    VARIO_LAGS, VARIO_MAX_M = 20, 2000.0
+    CROSSFIT_K = 5
+    NB = 24
+    rf_args = dict(n_estimators=300, max_depth=12, seed=seed)
 
     def num(s):
         s = s.astype(str).str.replace(",", ".", regex=False)
@@ -270,43 +297,80 @@ def fig_multielement(reps=20):
         a = np.asarray(v, float)
         return float(((a - a.mean()) ** 3).mean() / a.std() ** 3)
 
-    d = pd.read_pickle(REE_PKL)
+    d, src = load_ree()
     df = pd.DataFrame({"x": num(d["Coord. E"]), "y": num(d["Coord. N"])})
     for c in targets + covs:
         df[c] = num(d[c])
     df["r"] = d["Region"]
     df["grp"] = d["Faena"].astype(str).str.strip() + "|" + d["Deposito"].astype(str).str.strip()
+    df["op"] = d["Faena"].astype(str).str.strip()
     df = df[(df.x > 0) & (df.y > 0) & (df.r == region)].drop(columns="r").dropna()
-    n_samples, n_deposits = len(df), int(df.grp.nunique())
-    # Average collocated samples (same location, to the metre).
-    agg = {"x": "mean", "y": "mean", "grp": "first", **{c: "mean" for c in targets + covs}}
+    n_samples, n_deposits, n_ops = len(df), int(df.grp.nunique()), int(df.op.nunique())
+    floor = {}
+    for c in targets + covs:
+        lo = df[c].min()
+        floor[c.split("(")[0]] = {"value": float(lo), "count": int((df[c] == lo).sum()),
+                                  "fraction": float((df[c] == lo).mean())}
+    raw_skew = {t.split("(")[0]: skew(df[t]) for t in targets}
+    for c in targets + covs:
+        df[c] = np.log(df[c])
+    # Average collocated samples (same location, to the metre) on the log scale.
+    agg = {"x": "mean", "y": "mean", "grp": "first", "op": "first",
+           **{c: "mean" for c in targets + covs}}
     df = (df.assign(xr=df.x.round(0), yr=df.y.round(0))
             .groupby(["xr", "yr"], as_index=False).agg(agg).reset_index(drop=True))
     n, nt = len(df), len(df) // 4
-    groups = sorted(df.grp.unique())
-    sizes = df.groupby("grp").size()
 
     def split_random(rep):
         idx = list(range(n))
         random.Random(seed + rep).shuffle(idx)
         return idx[nt:], idx[:nt]
 
-    def split_grouped(rep):
-        g = groups[:]
-        random.Random(seed + rep).shuffle(g)
-        test, cnt = set(), 0
-        for x in g:
-            if cnt >= nt:
-                break
-            test.add(x)
-            cnt += sizes[x]
-        mask = df.grp.isin(test)
-        return df.index[~mask].tolist(), df.index[mask].tolist()
+    def grouped(col):
+        groups = sorted(df[col].unique())
+        sizes = df.groupby(col).size()
 
-    methods = ["ordinary kriging", "regression kriging", "random forest", "RF + residual kriging"]
-    scores = {}  # (scheme, element, method) -> [vecv per split]
+        def split(rep):
+            g = groups[:]
+            random.Random(seed + rep).shuffle(g)
+            test, cnt = set(), 0
+            for x in g:
+                if cnt >= nt:
+                    break
+                test.add(x)
+                cnt += sizes[x]
+            mask = df[col].isin(test)
+            return df.index[~mask].tolist(), df.index[mask].tolist()
+        return split
+
+    def crossfit(tr, X, y, extra=None):
+        """Grouped K-fold out-of-deposit RF predictions at the training points."""
+        g = sorted(tr.grp.unique())
+        random.Random(seed).shuffle(g)
+        fold_of = {x: i % CROSSFIT_K for i, x in enumerate(g)}
+        folds = tr.grp.map(fold_of).values
+        out = np.empty(len(tr))
+        for k in range(CROSSFIT_K):
+            m = folds == k
+            rf = smelt.RandomForest(**rf_args)
+            rf.fit(X[~m], y[~m])
+            out[m] = np.asarray(rf.predict(X[m]))
+        return out
+
+    def model_dict(m):
+        j = json.loads(m.to_json())
+        st = j.get("structures", [{}])[0]
+        return {"nugget": j.get("nugget"), "kind": st.get("kind"), "psill": st.get("sill"),
+                "range": st.get("range"), "total_sill": m.total_sill()}
+
+    methods = ["ordinary kriging", "regression kriging", "random forest",
+               "random forest + coordinates", "RF + residual kriging"]
+    kriged = {"ordinary kriging", "regression kriging", "RF + residual kriging"}
+    scores, cover, good = {}, {}, {}
     nn_med, n_test = {}, {}
-    for scheme, split in [("deposit-grouped", split_grouped), ("random", split_random)]:
+    schemes = [("deposit-grouped", grouped("grp")), ("operation-grouped", grouped("op")),
+               ("random", split_random)]
+    for scheme, split in schemes:
         for rep in range(reps):
             tri, tei = split(rep)
             tr, te = df.iloc[tri], df.iloc[tei]
@@ -318,48 +382,105 @@ def fig_multielement(reps=20):
             tex, tey = te.x.tolist(), te.y.tolist()
             tr_cov, te_cov = tr[covs].values.tolist(), te[covs].values.tolist()
             Xtr, Xte = np.array(tr_cov, float), np.array(te_cov, float)
+            Xtr_c = np.column_stack([Xtr, tr[["x", "y"]].values])
+            Xte_c = np.column_stack([Xte, te[["x", "y"]].values])
             for tgt in targets:
-                trv, tev = tr[tgt].tolist(), te[tgt].tolist()
-                model = gs.fit_variogram(trx, tryy, trv, n_lags=12)
-                ok, _ = gs.krige(trx, tryy, trv, model, tex, tey, method="ordinary", max_neighbors=24)
+                ytr = tr[tgt].values
+                trv, tev = ytr.tolist(), te[tgt].tolist()
+                model = gs.fit_variogram(trx, tryy, trv, n_lags=VARIO_LAGS, max_dist=VARIO_MAX_M)
+                ok, ok_var = gs.krige(trx, tryy, trv, model, tex, tey, method="ordinary",
+                                      max_neighbors=NB)
                 rk = gs.regression_kriging(trx, tryy, trv, tr_cov, tex, tey, te_cov,
-                                           n_lags=12, max_neighbors=24)
-                rf = smelt.RandomForest(n_estimators=300, max_depth=12, seed=seed)
-                rf.fit(Xtr, np.array(trv, float))
-                rf_tr = np.asarray(rf.predict(Xtr)).tolist()
-                rf_te = np.asarray(rf.predict(Xte)).tolist()
+                                           n_lags=VARIO_LAGS, max_dist=VARIO_MAX_M,
+                                           max_neighbors=NB)
+                rf = smelt.RandomForest(**rf_args)
+                rf.fit(Xtr, ytr)
+                rf_te = np.asarray(rf.predict(Xte))
+                rfc = smelt.RandomForest(**rf_args)
+                rfc.fit(Xtr_c, ytr)
+                rfc_te = np.asarray(rfc.predict(Xte_c))
+                rf_cf = crossfit(tr, Xtr, ytr)
                 hyb = gs.regression_kriging(trx, tryy, trv, tr_cov, tex, tey, te_cov,
-                                            trend_at_data=rf_tr, trend_at_targets=rf_te,
-                                            n_lags=12, max_neighbors=24)
+                                            trend_at_data=rf_cf.tolist(),
+                                            trend_at_targets=rf_te.tolist(),
+                                            n_lags=VARIO_LAGS, max_dist=VARIO_MAX_M,
+                                            max_neighbors=NB)
                 el = tgt.split("(")[0]
-                for m, pred in zip(methods, [ok, rk["prediction"], rf_te, hyb["prediction"]]):
+                preds = {"ordinary kriging": (ok, ok_var),
+                         "regression kriging": (rk["prediction"], rk["variance"]),
+                         "random forest": (rf_te, None),
+                         "random forest + coordinates": (rfc_te, None),
+                         "RF + residual kriging": (hyb["prediction"], hyb["variance"])}
+                for m in methods:
+                    pred, var = preds[m]
                     v = vecv(tev, pred)
                     if not math.isfinite(v):
                         # Fail loudly: a mean over splits must never drop one.
                         raise RuntimeError(f"non-finite VEcv: {scheme} split {rep} {el} {m}")
                     scores.setdefault((scheme, el, m), []).append(v)
+                    if m in kriged:
+                        sd = np.sqrt(np.maximum(np.asarray(var, float), 0.0))
+                        ap = gs.accuracy_plot(tev, list(map(float, pred)), sd.tolist())
+                        nom = list(ap["nominal"])
+                        i80 = min(range(len(nom)), key=lambda i: abs(nom[i] - 0.8))
+                        cover.setdefault((scheme, el, m), []).append(float(ap["observed"][i80]))
+                        good.setdefault((scheme, el, m), []).append(float(ap["goodness"]))
+        print(f"  multielement: {scheme} done", flush=True)
 
     rows = []
     for (scheme, el, m), v in scores.items():
         v = np.asarray(v)
-        rows.append((scheme, el, m, float(v.mean()), float(v.std(ddof=1)), len(v)))
+        c = cover.get((scheme, el, m))
+        g = good.get((scheme, el, m))
+        rows.append((scheme, el, m, float(v.mean()), float(v.std(ddof=1)),
+                     float(np.mean(c)) if c else "", float(np.mean(g)) if g else "", len(v)))
     write_csv(OUT / "multielement.csv",
-              ["scheme", "element", "method", "vecv_mean", "vecv_sd", "n_splits"], rows)
+              ["scheme", "element", "method", "vecv_mean", "vecv_sd",
+               "coverage80_mean", "goodness_mean", "n_splits"], rows)
+
+    # Paired gains and descriptive variography on the full dataset.
     gain = {}
-    for scheme in ("deposit-grouped", "random"):
+    for scheme, _ in schemes:
         for tgt in targets:
             el = tgt.split("(")[0]
-            diff = (np.asarray(scores[(scheme, el, "RF + residual kriging")])
-                    - np.asarray(scores[(scheme, el, "random forest")]))
-            gain[f"{scheme}:{el}"] = {"mean": float(diff.mean()), "sd": float(diff.std(ddof=1))}
+            for other in ("random forest", "regression kriging"):
+                diff = (np.asarray(scores[(scheme, el, "RF + residual kriging")])
+                        - np.asarray(scores[(scheme, el, other)]))
+                gain[f"{scheme}:{el}:hybrid-minus-{other}"] = {
+                    "mean": float(diff.mean()), "sd": float(diff.std(ddof=1))}
+    xs, ys = df.x.tolist(), df.y.tolist()
+    X_all = df[covs].values.astype(float)
+    vario = {}
+    for tgt in targets:
+        el = tgt.split("(")[0]
+        yv = df[tgt].values
+        rf = smelt.RandomForest(**rf_args)
+        rf.fit(X_all, yv)
+        res_in = yv - np.asarray(rf.predict(X_all))
+        res_cf = yv - crossfit(df, X_all, yv)
+        vario[el] = {
+            "grade": model_dict(gs.fit_variogram(xs, ys, yv.tolist(), n_lags=VARIO_LAGS,
+                                                 max_dist=VARIO_MAX_M)),
+            "rf_residual_in_sample": model_dict(gs.fit_variogram(
+                xs, ys, res_in.tolist(), n_lags=VARIO_LAGS, max_dist=VARIO_MAX_M)),
+            "rf_residual_cross_fitted": model_dict(gs.fit_variogram(
+                xs, ys, res_cf.tolist(), n_lags=VARIO_LAGS, max_dist=VARIO_MAX_M)),
+            "var_in_sample_residual": float(res_in.var()),
+            "var_cross_fitted_residual": float(res_cf.var()),
+            "var_grade": float(yv.var()),
+        }
     meta = {
-        "dataset_sha256": hashlib.sha256(REE_PKL.read_bytes()).hexdigest(),
-        "region": region, "n_samples": n_samples, "n_deposits": n_deposits, "n_locations": n,
-        "skew_by_element": {t.split("(")[0]: skew(df[t]) for t in targets},
+        "dataset_file": src.name, "dataset_sha256": hashlib.sha256(src.read_bytes()).hexdigest(),
+        "region": region, "n_samples": n_samples, "n_deposits": n_deposits,
+        "n_operations": n_ops, "n_locations": n, "scale": "natural log of grade and covariates",
+        "raw_skew_by_element": raw_skew, "floor_values": floor,
+        "variography": {"n_lags": VARIO_LAGS, "max_dist_m": VARIO_MAX_M,
+                        "lag_width_m": VARIO_MAX_M / VARIO_LAGS},
+        "crossfit_folds": CROSSFIT_K, "max_neighbors": NB, "rf": rf_args,
         "n_splits": reps, "seed": seed,
         "n_test_median": {k: float(np.median(v)) for k, v in n_test.items()},
         "nearest_train_distance_m_median": {k: float(np.median(v)) for k, v in nn_med.items()},
-        "hybrid_minus_rf_vecv": gain,
+        "paired_gains": gain, "variograms_full_data": vario,
         "geostat_rs_version": gs.__version__,
         "smelt_version": getattr(smelt, "__version__", "unknown"),
     }

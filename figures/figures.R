@@ -136,26 +136,28 @@ if (file.exists(me_path)) {
   me <- read.csv(me_path)
   me$element <- factor(me$element, levels = c("La", "Ce", "Nd", "Dy", "Y"))
   me$method <- factor(me$method, levels = c(
-    "ordinary kriging", "regression kriging", "random forest", "RF + residual kriging"))
+    "ordinary kriging", "regression kriging", "random forest",
+    "random forest + coordinates", "RF + residual kriging"))
   grp <- subset(me, scheme == "deposit-grouped")
   rnd <- subset(me, scheme == "random")
-  dodge <- position_dodge(width = 0.8)
+  ops <- subset(me, scheme == "operation-grouped")
+  dodge <- position_dodge(width = 0.85)
   p4 <- ggplot(grp, aes(element, vecv_mean, fill = method)) +
-    geom_col(position = dodge, width = 0.75) +
+    geom_col(position = dodge, width = 0.8) +
     geom_errorbar(aes(ymin = vecv_mean - vecv_sd, ymax = vecv_mean + vecv_sd),
                   position = dodge, width = 0.2, linewidth = 0.35) +
     geom_point(data = rnd, aes(element, vecv_mean, group = method),
-               position = dodge, shape = 4, size = 1.6, stroke = 0.6,
+               position = dodge, shape = 4, size = 1.5, stroke = 0.6,
+               colour = "grey15", show.legend = FALSE) +
+    geom_point(data = ops, aes(element, vecv_mean, group = method),
+               position = dodge, shape = 1, size = 1.5, stroke = 0.6,
                colour = "grey15", show.legend = FALSE) +
     geom_hline(yintercept = 0, colour = "grey50", linewidth = 0.3) +
-    coord_cartesian(ylim = c(-45, 80)) +
     scale_fill_brewer(palette = "Set2") +
-    labs(title = "Rare-earth grade prediction: covariates + ML-geostat hybrid",
-         subtitle = paste0("Bars: deposit-grouped hold-out, ",
-                           "mean \u00b1 SD over ", grp$n_splits[1], " splits.\n",
-                           "\u00d7: mean of random location splits (optimistic contrast)."),
-         x = NULL, y = "VEcv (%)", fill = NULL) +
-    theme_paper
+    guides(fill = guide_legend(nrow = 2)) +
+    labs(x = NULL, y = "VEcv on log grade (%)", fill = NULL) +
+    theme_paper +
+    theme(legend.position = "bottom")
   save_fig(p4, "fig_multielement.pdf", w = 7, h = 4.3)
 } else {
   cat("multielement figure skipped (no data)\n")
