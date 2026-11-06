@@ -22,32 +22,32 @@
 
 \affil*[1]{\orgaddress{\country{Chile}}}
 
-\abstract{Geostatistical methods are implemented independently across at
-least six actively maintained tools --- gstat (R), GSLIB (Fortran), GSTools,
-SciKit-GStat and PyKrige (Python), and GeoStats.jl (Julia) --- each tied to a
-single language runtime and deployment target, with no core shared between
-server, desktop and in-browser execution. We present geostat-rs, architected
-to close this fragmentation: a single Rust core, generic over spatial
-dimension (2-D and 3-D from one const-generic code path, with no
-per-dimension code duplication), compiles unchanged to three deployment
-targets --- a dependency-light native binary, a Python extension module
-(PyO3, zero-copy NumPy arrays) and WebAssembly for in-browser execution with
-no server --- and uses a deterministic random-number generator so stochastic
-simulation is bit-identical across all three. The engine covers experimental
-and theoretical variography; the kriging family
+\abstract{Geostatistical methods are implemented independently across at least six
+actively maintained tools --- gstat (R), GSLIB (Fortran),
+GSTools, SciKit-GStat and PyKrige (Python), and GeoStats.jl (Julia)
+--- each tied to a single language runtime and deployment target, with no core
+shared between server, desktop and in-browser execution. We present
+geostat-rs, architected to close this fragmentation: a single Rust
+core, generic over spatial dimension (2-D and 3-D from one const-generic code
+path), compiles unchanged to three deployment targets --- a dependency-light
+native binary, a Python extension module (zero-copy NumPy arrays) and
+WebAssembly for in-browser execution --- and uses a
+deterministic random-number generator so stochastic simulation is
+bit-identical across all three. The engine covers
+variography; the kriging family
 (simple/ordinary/universal/external-drift, co-kriging, indicator and block
 kriging); inverse-distance and $k$-nearest-neighbour baselines; regression
-kriging; and conditional sequential Gaussian and indicator simulation. We
-show this architecture costs no numerical fidelity: every deterministic
-method is cross-checked against gstat on the Meuse and Walker Lake
-benchmarks at machine precision, and simulation is validated
-distributionally. Accuracy is assessed by VEcv (variance explained by
-cross-validation), and regression kriging accepts an externally supplied
-trend --- letting a machine-learning model provide the mean while geostat-rs
-kriges the residuals. We demonstrate the engine on a Chilean national
-mine-tailings geochemistry dataset, predicting rare-earth grades from
-host-mineral proxies. The engine reads and writes OGC GeoPackage without
-GDAL, for native interchange with GIS tools.}
+kriging; and conditional sequential Gaussian and indicator simulation. This
+architecture costs no numerical fidelity: every deterministic method is
+cross-checked against gstat on the Meuse and Walker Lake benchmarks at machine
+precision, and simulation is validated distributionally. Regression kriging
+accepts an externally supplied trend, letting a machine-learning model provide
+the mean while geostat-rs kriges the residuals. On rare-earth grades in 1118
+samples from 331 Chilean mine-tailings deposits, holding out whole deposits
+shows that the signal lies in host-mineral covariates: ordinary kriging
+explains at most 18\% of the variance across deposits and residual kriging
+adds little to a random-forest trend, whereas a random hold-out inflates
+kriging VEcv (variance explained by cross-validation) by 9 to 13 points through within-deposit autocorrelation.}
 
 \keywords{geostatistics, kriging, Rust, cross-validation, regression kriging, GeoPackage}
 
