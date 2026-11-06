@@ -8,5 +8,13 @@
   "copied_from": "/mnt/kingston/proyectos/TGPY.tar.zst :: TGPY/Python/tierras_raras.pkl (archive of ~/proyectos/TGPY, 2026-09-28)",
   "copied_on": "2026-11-05",
   "in_git": false,
-  "note": "Not committed (gitignored). Scripts read it from here or from ."
+  "note": "The pickle is not committed. Whether the derived CSV is committed (public repository) is the author's decision.",
+  "derived_subset": {
+    "file": "coquimbo_ree.csv",
+    "sha256": "a134a6fdaa2a71a90b7ebc9ac33080780e0466c73fdcc9d615e4b0b68a113b39",
+    "rows": 1118,
+    "made_by": "data/relaves/export_csv.py (Region == COQUIMBO, positive coordinates; identifiers, UTM coordinates, 5 REE targets, 5 host-mineral covariates)",
+    "equivalence": "figures/make_figure_data.py builds an identical prepared table from this CSV and from the pickle (checked 2026-11-06, DataFrame.equals)",
+    "read_order": "the pipeline reads this CSV when present, else the pickle"
+  }
 }

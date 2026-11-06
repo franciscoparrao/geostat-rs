@@ -29,3 +29,4 @@ __pycache__/
 
 # Tailings REE dataset (see data/relaves/provenance.json)
 data/relaves/*.pkl
+!data/relaves/coquimbo_ree.csv
