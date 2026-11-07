@@ -3,6 +3,8 @@
 //! Uses xoshiro256++ seeded via splitmix64. All operations are pure `f64`
 //! arithmetic, so streams are reproducible across platforms and runs —
 //! a hard requirement for reproducible stochastic simulation.
+#[allow(unused_imports)]
+use crate::pmath::PortableF64;
 
 /// splitmix64 step, used for seeding and seed derivation.
 pub(crate) fn splitmix64(state: &mut u64) -> u64 {
@@ -66,8 +68,8 @@ impl Rng {
             let u1 = self.uniform();
             if u1 > 0.0 {
                 let u2 = self.uniform();
-                let r = (-2.0 * u1.ln()).sqrt();
-                let (s, c) = (2.0 * std::f64::consts::PI * u2).sin_cos();
+                let r = (-2.0 * u1.ln_p()).sqrt();
+                let (s, c) = (2.0 * std::f64::consts::PI * u2).sin_cos_p();
                 self.spare_normal = Some(r * s);
                 return r * c;
             }

@@ -49,6 +49,36 @@ jobs:
       - name: Check wasm target
         run: cargo check -p geostat-wasm --target wasm32-unknown-unknown
 
+  wasm-native-bitident:
+    name: native vs WebAssembly simulation, bit for bit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install wasm-pack and maturin
+        run: |
+          curl -sSf https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
+          python -m venv .venv && .venv/bin/pip install maturin numpy
+      - name: Build native Python module and WebAssembly package
+        run: |
+          source .venv/bin/activate
+          maturin develop --release -m crates/geostat-python/Cargo.toml
+          wasm-pack build crates/geostat-wasm --target nodejs --release --out-dir "$RUNNER_TEMP/wasm"
+      - name: Compare SGS realizations bit for bit
+        run: |
+          source .venv/bin/activate
+          node validation/bitident/wasm_sgs.js "$RUNNER_TEMP/wasm" "$RUNNER_TEMP/wasm_sgs.json"
+          python validation/bitident/compare.py "$RUNNER_TEMP/wasm_sgs.json"
+
   msrv:
     name: MSRV (1.88)
     runs-on: ubuntu-latest

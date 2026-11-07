@@ -1,5 +1,7 @@
 //! Small derivative-free optimizers shared across the crate (variogram
 //! fitting) and by downstream crates (e.g. marginal-transport fitting).
+#[allow(unused_imports)]
+use crate::pmath::PortableF64;
 
 /// Standard Nelder–Mead simplex minimization. Returns the best parameter
 /// vector found and its objective value.
@@ -312,7 +314,7 @@ mod tests {
         let f = |x: &[f64]| {
             let a = x[0] + 3.0;
             let b = x[0] - 3.0;
-            -2.0 * (-0.5 * a * a).exp() - 3.0 * (-0.5 * b * b).exp()
+            -2.0 * (-0.5 * a * a).exp_p() - 3.0 * (-0.5 * b * b).exp_p()
         };
         let (_, single) = nelder_mead(f, &[-3.0], 0.1, 500);
         assert!(single > -2.5, "expected the shallow well, got {single}");
@@ -359,12 +361,12 @@ mod tests {
         let f = |x: &[f64]| {
             let a = x[0] + 3.0;
             let b = x[0] - 3.0;
-            -2.0 * (-0.5 * a * a).exp() - 3.0 * (-0.5 * b * b).exp()
+            -2.0 * (-0.5 * a * a).exp_p() - 3.0 * (-0.5 * b * b).exp_p()
         };
         let grad = |x: &[f64]| -> Vec<f64> {
             let a = x[0] + 3.0;
             let b = x[0] - 3.0;
-            vec![2.0 * a * (-0.5 * a * a).exp() + 3.0 * b * (-0.5 * b * b).exp()]
+            vec![2.0 * a * (-0.5 * a * a).exp_p() + 3.0 * b * (-0.5 * b * b).exp_p()]
         };
         let (single, single_fx) = bfgs(f, grad, &[-3.0], 100);
         assert!(

@@ -7,6 +7,14 @@ before 0.7.0 predate this file and are reconstructed from commit history.
 ## [Unreleased]
 
 ### Fixed
+- Native and WebAssembly builds did not produce bit-identical simulations:
+  `f64::ln/exp/sin/cos/...` call the platform libm, which rounds the last bit
+  differently on each target (134 of 12 000 SGS values differed, by 1 ulp).
+  Every transcendental call in `geostat-core` now goes through the pure-Rust
+  `libm` crate (`pmath::PortableF64`), and a CI job
+  (`validation/bitident/`) checks that conditional SGS is bit-identical
+  between the native and WebAssembly builds and at 1 and 16 threads
+  (36 000 values; spherical, exponential and Gaussian models).
 - WLS variogram fits (`fit_model`/`fit_best`, `fit_matern`, `fit_stable`,
   `fit_nested`) could diverge along an unbounded psill/range ridge when the
   empirical variogram was still rising at the last lag (seen at range ~1e12,
@@ -21,6 +29,12 @@ before 0.7.0 predate this file and are reconstructed from commit history.
   depth and colour type are now validated before allocating.
 
 ### Added
+- Moving-neighbourhood parity with gstat (`validation/moving_gstat.R`,
+  `validation/compare_moving.py`): OK with nmax 8/16/32 and a search radius,
+  SK, UK with a linear drift and LOO CV agree to 1e-14 (UK 5.6e-10).
+- Benchmark v2 (`bench/bench_v2.py`, `bench/bench_gstat_v2.R`): repeated
+  timings against gstat, PyKrige (C backend) and GSTools with the GSTools-Core
+  Rust backend, data-size scaling to 10^5 points, global neighbourhood and SGS.
 - Unconditional sequential Gaussian simulation
   (`unconditional_gaussian_simulation` in the core, `sgs_unconditional()` in
   Python): draws from the stationary Gaussian random function itself — no

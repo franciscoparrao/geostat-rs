@@ -6,6 +6,8 @@
 //! GSLIB interpolation options (Deutsch & Journel 1998, §V.1.6): linear or
 //! power in the cdf between the extreme and a bound, plus a hyperbolic
 //! (Pareto) model for the upper tail.
+#[allow(unused_imports)]
+use crate::pmath::PortableF64;
 
 use crate::error::{GeostatError, Result};
 
@@ -85,7 +87,7 @@ impl std::str::FromStr for TailModel {
 /// Power-interval draw `a + (b - a) t^(1/omega)` for `t` in `[0, 1]`
 /// (Linear is `omega = 1`).
 fn power_draw(a: f64, b: f64, omega: f64, t: f64) -> f64 {
-    a + (b - a) * t.clamp(0.0, 1.0).powf(1.0 / omega)
+    a + (b - a) * t.clamp(0.0, 1.0).powf_p(1.0 / omega)
 }
 
 /// `(E[Z], E[Z^2])` of the power-interval distribution on `[a, b]`.
@@ -118,7 +120,7 @@ pub(crate) fn draw_upper(model: TailModel, zk: f64, zmax: f64, t: f64) -> f64 {
             // t is the cdf position within the class; u = 1 - t is the
             // Pareto survival fraction.
             let u = (1.0 - t).max(f64::MIN_POSITIVE);
-            (zk * u.powf(-1.0 / w)).min(zmax)
+            (zk * u.powf_p(-1.0 / w)).min(zmax)
         }
     }
 }
@@ -143,18 +145,18 @@ pub(crate) fn upper_moments(model: TailModel, zk: f64, zmax: f64) -> (f64, f64) 
         TailModel::Hyperbolic(w) => {
             // z(u) = zk u^(-1/w) for the survival fraction u ~ U(0, 1],
             // capped at zmax; the cap is active for u < u0.
-            let u0 = (zk / zmax).powf(w).clamp(0.0, 1.0);
+            let u0 = (zk / zmax).powf_p(w).clamp(0.0, 1.0);
             let mean = zmax * u0
                 + if (w - 1.0).abs() < 1e-12 {
-                    zk * (1.0 / u0).ln()
+                    zk * (1.0 / u0).ln_p()
                 } else {
-                    zk * (w / (w - 1.0)) * (1.0 - u0.powf((w - 1.0) / w))
+                    zk * (w / (w - 1.0)) * (1.0 - u0.powf_p((w - 1.0) / w))
                 };
             let m2 = zmax * zmax * u0
                 + if (w - 2.0).abs() < 1e-12 {
-                    zk * zk * (1.0 / u0).ln()
+                    zk * zk * (1.0 / u0).ln_p()
                 } else {
-                    zk * zk * (w / (w - 2.0)) * (1.0 - u0.powf((w - 2.0) / w))
+                    zk * zk * (w / (w - 2.0)) * (1.0 - u0.powf_p((w - 2.0) / w))
                 };
             (mean, m2)
         }

@@ -3,6 +3,8 @@
 //! Kriging systems with Lagrange multipliers are symmetric but indefinite,
 //! so Cholesky is not applicable; LU with partial pivoting is robust and
 //! avoids pulling in a LAPACK dependency.
+#[allow(unused_imports)]
+use crate::pmath::PortableF64;
 
 use ndarray::Array2;
 
@@ -79,7 +81,7 @@ impl Lu {
     /// Log of the absolute value of the determinant, `ln|det A| = Σ ln|U_ii|`.
     /// For a symmetric positive-definite matrix this is `ln(det A)`.
     pub fn ln_det_abs(&self) -> f64 {
-        (0..self.n).map(|i| self.lu[[i, i]].abs().ln()).sum()
+        (0..self.n).map(|i| self.lu[[i, i]].abs().ln_p()).sum()
     }
 
     /// Solves `A x = b` by reusing the factorization. `b` must have length `n`.

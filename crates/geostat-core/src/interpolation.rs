@@ -7,6 +7,8 @@
 //! Both run over `PointSet<D>` (2-D or 3-D) and reuse the kd-tree moving
 //! neighborhood, and both expose a leave-one-out cross-validation that returns
 //! a [`CvResult`], so they score on the same VEcv/RMSE footing as kriging.
+#[allow(unused_imports)]
+use crate::pmath::PortableF64;
 
 use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
@@ -71,7 +73,7 @@ impl<'a, const D: usize> Idw<'a, D> {
             if d <= 1e-12 {
                 return self.data.value(i); // exact interpolation at a datum
             }
-            let w = d.powf(-self.power);
+            let w = d.powf_p(-self.power);
             num += w * self.data.value(i);
             den += w;
         }
@@ -200,7 +202,7 @@ mod tests {
             let x = rng.uniform() * 100.0;
             let y = rng.uniform() * 100.0;
             coords.push([x, y]);
-            values.push((x / 20.0).sin() + (y / 25.0).cos());
+            values.push((x / 20.0).sin_p() + (y / 25.0).cos_p());
         }
         PointSet::new(coords, values).unwrap()
     }

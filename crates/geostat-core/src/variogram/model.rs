@@ -1,4 +1,6 @@
 //! Theoretical variogram models.
+#[allow(unused_imports)]
+use crate::pmath::PortableF64;
 
 use std::fmt;
 
@@ -129,23 +131,23 @@ impl ModelKind {
                     1.5 * d - 0.5 * d * d * d
                 }
             }
-            ModelKind::Exponential => 1.0 - (-d).exp(),
-            ModelKind::Gaussian => 1.0 - (-(d * d)).exp(),
+            ModelKind::Exponential => 1.0 - (-d).exp_p(),
+            ModelKind::Gaussian => 1.0 - (-(d * d)).exp_p(),
             ModelKind::Matern15 => {
                 let s = 3.0_f64.sqrt() * d;
-                1.0 - (1.0 + s) * (-s).exp()
+                1.0 - (1.0 + s) * (-s).exp_p()
             }
             ModelKind::Matern25 => {
                 let s = 5.0_f64.sqrt() * d;
-                1.0 - (1.0 + s + s * s / 3.0) * (-s).exp()
+                1.0 - (1.0 + s + s * s / 3.0) * (-s).exp_p()
             }
             ModelKind::Matern(nu) => {
                 if d <= 0.0 {
                     0.0
                 } else {
                     let s = (2.0 * nu).sqrt() * d;
-                    let corr = 2f64.powf(1.0 - nu) / bessel::gamma(nu)
-                        * s.powf(nu)
+                    let corr = 2f64.powf_p(1.0 - nu) / bessel::gamma(nu)
+                        * s.powf_p(nu)
                         * bessel::bessel_k(nu, s);
                     // The Bessel-K quadrature (AUDIT-2026-07-v3.md §1.3) has
                     // ~2e-8 relative error; a true Matern correlation is
@@ -158,23 +160,23 @@ impl ModelKind {
             }
             ModelKind::Circular => {
                 let d = d.min(1.0);
-                1.0 - (2.0 / std::f64::consts::PI) * (d.acos() - d * (1.0 - d * d).sqrt())
+                1.0 - (2.0 / std::f64::consts::PI) * (d.acos_p() - d * (1.0 - d * d).sqrt())
             }
-            ModelKind::Stable(alpha) => 1.0 - (-d.powf(alpha)).exp(),
+            ModelKind::Stable(alpha) => 1.0 - (-d.powf_p(alpha)).exp_p(),
             ModelKind::Hole => {
                 if d <= 0.0 {
                     0.0
                 } else {
-                    1.0 - d.sin() / d
+                    1.0 - d.sin_p() / d
                 }
             }
-            ModelKind::Power(theta) => h.abs().powf(theta),
+            ModelKind::Power(theta) => h.abs().powf_p(theta),
             ModelKind::Wave => {
                 if d <= 0.0 {
                     0.0
                 } else {
                     let pd = std::f64::consts::PI * d;
-                    1.0 - pd.sin() / pd
+                    1.0 - pd.sin_p() / pd
                 }
             }
         }
@@ -359,7 +361,7 @@ impl Anisotropy {
             out[1] = rot[1][0] * h0 + rot[1][1] * h1 + rot[1][2] * h2;
             out[2] = rot[2][0] * h0 + rot[2][1] * h1 + rot[2][2] * h2;
         } else {
-            let (s, c) = self.azimuth_deg.to_radians().sin_cos();
+            let (s, c) = self.azimuth_deg.to_radians().sin_cos_p();
             out[0] = dh[0] * s + dh[1] * c;
             out[1] = (dh[0] * c - dh[1] * s) / self.ratio;
         }
@@ -412,9 +414,9 @@ impl Anisotropy {
         };
         let beta = (-self.dip_deg).to_radians();
         let theta = self.rake_deg.to_radians();
-        let (sina, cosa) = alpha.sin_cos();
-        let (sinb, cosb) = beta.sin_cos();
-        let (sint, cost) = theta.sin_cos();
+        let (sina, cosa) = alpha.sin_cos_p();
+        let (sinb, cosb) = beta.sin_cos_p();
+        let (sint, cost) = theta.sin_cos_p();
         let afac1 = 1.0 / self.ratio;
         let afac2 = 1.0 / self.ratio_z;
         [
@@ -1011,13 +1013,13 @@ mod tests {
         // would be caught even though `with_anisotropy` no longer builds a
         // 3-D structure directly.
         let az = 55.0_f64.to_radians();
-        let (s, c) = az.sin_cos();
+        let (s, c) = az.sin_cos_p();
         for &(x, y, z) in &[(10.0, 20.0, 5.0), (-30.0, 15.0, -8.0), (40.0, -25.0, 0.0)] {
             let h_major = x * s + y * c;
             let h_minor = (x * c - y * s) / 0.4;
             let h_z = z / 0.6;
             let old_eff = (h_major * h_major + h_minor * h_minor + h_z * h_z).sqrt();
-            let old_gamma = 0.05 + 0.9 * (1.0 - (-old_eff / 80.0).exp());
+            let old_gamma = 0.05 + 0.9 * (1.0 - (-old_eff / 80.0).exp_p());
             let new_gamma = full.gamma_dh([x, y, z]);
             assert!(
                 (old_gamma - new_gamma).abs() < 1e-12,

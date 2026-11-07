@@ -1,4 +1,6 @@
 //! Simple, ordinary, universal and external-drift kriging.
+#[allow(unused_imports)]
+use crate::pmath::PortableF64;
 
 use ndarray::Array2;
 
@@ -1422,7 +1424,7 @@ mod tests {
             for j in 0..5 {
                 let x = i as f64 * 10.0;
                 let y = j as f64 * 10.0;
-                let d = (x * 0.13 + y * 0.07).sin();
+                let d = (x * 0.13 + y * 0.07).sin_p();
                 coords.push([x, y]);
                 drift.push(vec![d]);
                 values.push(2.0 + 3.0 * d);

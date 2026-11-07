@@ -2,6 +2,8 @@
 //!
 //! Weights follow gstat's default (`fit.method = 7`): `N_j / h_j^2`, which
 //! emphasizes short lags and well-populated bins.
+#[allow(unused_imports)]
+use crate::pmath::PortableF64;
 
 use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
@@ -92,8 +94,8 @@ pub fn fit_model_weighted(
     // needed — see AUDIT-2026-07.md §2.6.
     let objective = |x: &[f64]| -> f64 {
         let nugget = x[0] * x[0];
-        let psill = x[1].exp();
-        let range = x[2].exp();
+        let psill = x[1].exp_p();
+        let range = x[2].exp_p();
         let model = VariogramModel {
             nugget,
             structures: vec![Structure::new(kind, psill, range)],
@@ -117,10 +119,10 @@ pub fn fit_model_weighted(
 
     // Range is the classic multimodal parameter (short- vs long-range local
     // optima); multi-start around the empirical guess.
-    let ln_range0 = range0.ln();
+    let ln_range0 = range0.ln_p();
     let starts: Vec<Vec<f64>> = [0.3_f64, 1.0, 3.0]
         .into_iter()
-        .map(|f| vec![nugget0.sqrt(), psill0.ln(), ln_range0 + f.ln()])
+        .map(|f| vec![nugget0.sqrt(), psill0.ln_p(), ln_range0 + f.ln_p()])
         .collect();
     let (xb, wsse) = nelder_mead_multistart(objective, &starts, 0.25, 1000);
     // Power has no range to cap (the field is ignored for that kind).
@@ -133,7 +135,7 @@ pub fn fit_model_weighted(
 
     let model = VariogramModel::new(
         xb[0] * xb[0],
-        vec![Structure::new(kind, xb[1].exp(), xb[2].exp())],
+        vec![Structure::new(kind, xb[1].exp_p(), xb[2].exp_p())],
     )?;
     Ok(FitResult { model, wsse })
 }
@@ -164,7 +166,7 @@ fn cap_ranges<F>(
 where
     F: Fn(&[f64]) -> f64,
 {
-    let ln_max = (MAX_RANGE_FACTOR * max_h).ln();
+    let ln_max = (MAX_RANGE_FACTOR * max_h).ln_p();
     let mut fixed: Vec<usize> = Vec::new();
     // Each pass fixes at least one more range, so this ends after at most
     // `range_idx.len()` refits.
@@ -250,13 +252,13 @@ pub fn fit_matern(exp_v: &ExperimentalVariogram) -> Result<FitResult> {
 
     let objective = |x: &[f64]| -> f64 {
         let nugget = x[0] * x[0];
-        let psill = x[1].exp();
-        let range = x[2].exp();
+        let psill = x[1].exp_p();
+        let range = x[2].exp_p();
         // Clamp, don't let the search wander past MATERN_NU_MAX: beyond it
         // the correlation silently evaluates to NaN (AUDIT-2026-07-v2.md
         // §1.8), and nu that large is indistinguishable from Gaussian
         // anyway, so clamping costs no real fitting power.
-        let nu = x[3].exp().min(super::MATERN_NU_MAX);
+        let nu = x[3].exp_p().min(super::MATERN_NU_MAX);
         let model = VariogramModel {
             nugget,
             structures: vec![Structure::new(ModelKind::Matern(nu), psill, range)],
@@ -269,14 +271,19 @@ pub fn fit_matern(exp_v: &ExperimentalVariogram) -> Result<FitResult> {
             .sum()
     };
 
-    let ln_range0 = range0.ln();
+    let ln_range0 = range0.ln_p();
     let starts: Vec<Vec<f64>> = [0.5_f64, 1.5, 3.5]
         .into_iter()
         .flat_map(|nu0| {
             let (nugget0, psill0, ln_range0) = (nugget0, psill0, ln_range0);
-            [0.5_f64, 1.0, 2.0]
-                .into_iter()
-                .map(move |rf| vec![nugget0.sqrt(), psill0.ln(), ln_range0 + rf.ln(), nu0.ln()])
+            [0.5_f64, 1.0, 2.0].into_iter().map(move |rf| {
+                vec![
+                    nugget0.sqrt(),
+                    psill0.ln_p(),
+                    ln_range0 + rf.ln_p(),
+                    nu0.ln_p(),
+                ]
+            })
         })
         .collect();
     let (xb, wsse) = nelder_mead_multistart(objective, &starts, 0.25, 1500);
@@ -286,9 +293,9 @@ pub fn fit_matern(exp_v: &ExperimentalVariogram) -> Result<FitResult> {
     let model = VariogramModel::new(
         xb[0] * xb[0],
         vec![Structure::new(
-            ModelKind::Matern(xb[3].exp().min(super::MATERN_NU_MAX)),
-            xb[1].exp(),
-            xb[2].exp(),
+            ModelKind::Matern(xb[3].exp_p().min(super::MATERN_NU_MAX)),
+            xb[1].exp_p(),
+            xb[2].exp_p(),
         )],
     )?;
     Ok(FitResult { model, wsse })
@@ -303,9 +310,9 @@ pub fn fit_stable(exp_v: &ExperimentalVariogram) -> Result<FitResult> {
 
     let objective = |x: &[f64]| -> f64 {
         let nugget = x[0] * x[0];
-        let psill = x[1].exp();
-        let range = x[2].exp();
-        let alpha = 1.0 + x[3].tanh(); // (-inf,inf) -> (0,2)
+        let psill = x[1].exp_p();
+        let range = x[2].exp_p();
+        let alpha = 1.0 + x[3].tanh_p(); // (-inf,inf) -> (0,2)
         let model = VariogramModel {
             nugget,
             structures: vec![Structure::new(ModelKind::Stable(alpha), psill, range)],
@@ -318,28 +325,28 @@ pub fn fit_stable(exp_v: &ExperimentalVariogram) -> Result<FitResult> {
             .sum()
     };
 
-    let ln_range0 = range0.ln();
+    let ln_range0 = range0.ln_p();
     let starts: Vec<Vec<f64>> = [0.5_f64, 1.0, 1.5]
         .into_iter()
         .flat_map(|alpha0| {
             let (nugget0, psill0, ln_range0) = (nugget0, psill0, ln_range0);
-            let atanh0 = (alpha0 - 1.0_f64).clamp(-0.999, 0.999).atanh();
+            let atanh0 = (alpha0 - 1.0_f64).clamp(-0.999, 0.999).atanh_p();
             [0.5_f64, 1.0, 2.0]
                 .into_iter()
-                .map(move |rf| vec![nugget0.sqrt(), psill0.ln(), ln_range0 + rf.ln(), atanh0])
+                .map(move |rf| vec![nugget0.sqrt(), psill0.ln_p(), ln_range0 + rf.ln_p(), atanh0])
         })
         .collect();
     let (xb, wsse) = nelder_mead_multistart(objective, &starts, 0.25, 1500);
     let max_h = pts.iter().fold(0.0_f64, |m, p| m.max(p.0));
     let (xb, wsse) = cap_ranges(&objective, xb, wsse, &[2], max_h, 1500);
 
-    let alpha = 1.0 + xb[3].tanh();
+    let alpha = 1.0 + xb[3].tanh_p();
     let model = VariogramModel::new(
         xb[0] * xb[0],
         vec![Structure::new(
             ModelKind::Stable(alpha),
-            xb[1].exp(),
-            xb[2].exp(),
+            xb[1].exp_p(),
+            xb[2].exp_p(),
         )],
     )?;
     Ok(FitResult { model, wsse })
@@ -375,12 +382,12 @@ pub fn fit_nested(exp_v: &ExperimentalVariogram, kinds: &[ModelKind]) -> Result<
     let n_struct = kinds.len();
 
     // `nugget = x[0]^2`; each structure's `(sill, range)` is
-    // `(x[1+2i].exp(), x[2+2i].exp())` — same smooth non-negative/log
+    // `(x[1+2i].exp_p(), x[2+2i].exp_p())` — same smooth non-negative/log
     // parametrization as `fit_model_weighted`, extended across structures.
     let objective = |x: &[f64]| -> f64 {
         let nugget = x[0] * x[0];
         let structures: Vec<Structure> = (0..n_struct)
-            .map(|i| Structure::new(kinds[i], x[1 + 2 * i].exp(), x[2 + 2 * i].exp()))
+            .map(|i| Structure::new(kinds[i], x[1 + 2 * i].exp_p(), x[2 + 2 * i].exp_p()))
             .collect();
         let model = VariogramModel { nugget, structures };
         pts.iter()
@@ -397,8 +404,8 @@ pub fn fit_nested(exp_v: &ExperimentalVariogram, kinds: &[ModelKind]) -> Result<
     let mut base = vec![nugget0.sqrt()];
     for i in 0..n_struct {
         let range_i0 = (max_h * (i + 1) as f64 / (n_struct + 1) as f64).max(1e-9);
-        base.push(sill_each0.ln());
-        base.push(range_i0.ln());
+        base.push(sill_each0.ln_p());
+        base.push(range_i0.ln_p());
     }
     // Multi-start over an overall range-spread factor (short-vs-long local
     // optima, the same concern as the single-structure fit, now compounded
@@ -408,7 +415,7 @@ pub fn fit_nested(exp_v: &ExperimentalVariogram, kinds: &[ModelKind]) -> Result<
         .map(|f| {
             let mut x0 = base.clone();
             for i in 0..n_struct {
-                x0[2 + 2 * i] += f.ln();
+                x0[2 + 2 * i] += f.ln_p();
             }
             x0
         })
@@ -421,7 +428,7 @@ pub fn fit_nested(exp_v: &ExperimentalVariogram, kinds: &[ModelKind]) -> Result<
     let (xb, wsse) = cap_ranges(&objective, xb, wsse, &range_idx, max_h, 1500);
 
     let structures: Vec<Structure> = (0..n_struct)
-        .map(|i| Structure::new(kinds[i], xb[1 + 2 * i].exp(), xb[2 + 2 * i].exp()))
+        .map(|i| Structure::new(kinds[i], xb[1 + 2 * i].exp_p(), xb[2 + 2 * i].exp_p()))
         .collect();
     let model = VariogramModel::new(xb[0] * xb[0], structures)?;
     Ok(FitResult { model, wsse })
@@ -535,7 +542,7 @@ fn directional_samples(
             direction: Some(DirectionConfig::horizontal(az, tol)),
         };
         let ev = experimental_variogram(data, &cfg)?;
-        let (sin, cos) = az.to_radians().sin_cos();
+        let (sin, cos) = az.to_radians().sin_cos_p();
         for b in &ev.bins {
             if b.n_pairs > 0 && b.h > 0.0 && b.gamma.is_finite() {
                 samples.push(DirSample {
@@ -567,9 +574,9 @@ fn fit_anisotropic_kind(
         // via a smooth tanh transform. No boundary for Nelder-Mead, so no
         // penalty branch is needed (AUDIT-2026-07.md §2.6).
         let nugget = x[0] * x[0];
-        let psill = x[1].exp();
-        let range = x[2].exp();
-        let ratio = 0.5 * (1.0 + x[3].tanh());
+        let psill = x[1].exp_p();
+        let range = x[2].exp_p();
+        let ratio = 0.5 * (1.0 + x[3].tanh_p());
         let az = x[4];
         let model = VariogramModel {
             nugget,
@@ -597,23 +604,23 @@ fn fit_anisotropic_kind(
 
     // Azimuth is the multimodal parameter; start the simplex from four seeds.
     let nugget0_sqrt = (0.25 * sill0).sqrt();
-    let ln_psill0 = ((sill0 - 0.25 * sill0).max(1e-9 * sill0)).ln();
-    let ln_range0 = range0.ln();
+    let ln_psill0 = ((sill0 - 0.25 * sill0).max(1e-9 * sill0)).ln_p();
+    let ln_range0 = range0.ln_p();
     let starts: Vec<Vec<f64>> = [0.0, 45.0, 90.0, 135.0]
         .into_iter()
         .map(|az0| vec![nugget0_sqrt, ln_psill0, ln_range0, 0.0, az0]) // ratio = 0.5
         .collect();
     let (xb, wsse) = nelder_mead_multistart(objective, &starts, 0.3, 2000);
 
-    let ratio = 0.5 * (1.0 + xb[3].tanh());
+    let ratio = 0.5 * (1.0 + xb[3].tanh_p());
     // Normalize azimuth to [0, 180): the major axis is sign- and π-agnostic.
     let az = xb[4].rem_euclid(180.0);
     let model = VariogramModel::new(
         xb[0] * xb[0],
         vec![Structure::with_anisotropy(
             kind,
-            xb[1].exp(),
-            xb[2].exp(),
+            xb[1].exp_p(),
+            xb[2].exp_p(),
             az,
             ratio.clamp(1e-6, 1.0),
         )],
@@ -1032,7 +1039,7 @@ mod tests {
         let width = max_dist / n_lags as f64;
         let mut s = Vec::new();
         for &az in dirs {
-            let (sin, cos) = az.to_radians().sin_cos();
+            let (sin, cos) = az.to_radians().sin_cos_p();
             for i in 0..n_lags {
                 let h = (i as f64 + 0.5) * width;
                 s.push(DirSample {
@@ -1101,7 +1108,7 @@ mod tests {
             let y = rng.uniform() * 200.0;
             let v: f64 = modes
                 .iter()
-                .map(|&(ox, oy, ph)| (ox * x + oy * y + ph).cos())
+                .map(|&(ox, oy, ph)| (ox * x + oy * y + ph).cos_p())
                 .sum();
             coords.push([x, y]);
             values.push(v);
@@ -1148,7 +1155,7 @@ mod tests {
             let x = rng.uniform() * 100.0;
             let y = rng.uniform() * 100.0;
             coords.push([x, y]);
-            values.push((x / 25.0).sin() * 2.0 + (y / 30.0).cos() + 0.2 * rng.normal());
+            values.push((x / 25.0).sin_p() * 2.0 + (y / 30.0).cos_p() + 0.2 * rng.normal());
         }
         let data = PointSet::new(coords, values).unwrap();
         let mut sorted = data.values().to_vec();

@@ -15,6 +15,8 @@
 //! OK to 1e-13. Note `gstat::krigeTg` uses a *different*, GLS-based
 //! trans-Gaussian correction, so it is not a bit-for-bit oracle for the OK
 //! case here.
+#[allow(unused_imports)]
+use crate::pmath::PortableF64;
 
 use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
@@ -75,7 +77,7 @@ pub fn lognormal_kriging<const D: usize>(
     // For simple kriging the mean must be given in log units; if the user
     // passed the original-scale mean, that is their responsibility. We krige
     // the logs directly with the supplied config.
-    let logs: Vec<f64> = data.values().iter().map(|&v| v.ln()).collect();
+    let logs: Vec<f64> = data.values().iter().map(|&v| v.ln_p()).collect();
     let log_data = PointSet::new(data.coords().to_vec(), logs)?;
     let kriging = Kriging::new(&log_data, log_model, config.clone())?;
 
@@ -92,7 +94,7 @@ pub fn lognormal_kriging<const D: usize>(
                 // back-transform exp() overflows to +inf. That is not a usable
                 // estimate, so report it as NaN (matching the predict-error
                 // branch) rather than silently returning an infinity.
-                let value = (est.value + correction).exp();
+                let value = (est.value + correction).exp_p();
                 LognormalEstimate {
                     value: if value.is_finite() { value } else { f64::NAN },
                     log_mean: est.value,
@@ -122,9 +124,9 @@ mod tests {
             let x = rng.uniform() * 100.0;
             let y = rng.uniform() * 100.0;
             // Smooth log field -> lognormal values.
-            let logv = (x / 30.0).sin() + (y / 25.0).cos() + 0.2 * rng.normal();
+            let logv = (x / 30.0).sin_p() + (y / 25.0).cos_p() + 0.2 * rng.normal();
             coords.push([x, y]);
-            values.push(logv.exp());
+            values.push(logv.exp_p());
         }
         PointSet::new(coords, values).unwrap()
     }
@@ -162,7 +164,7 @@ mod tests {
             lognormal_kriging(&data, &[[50.0, 50.0]], &model, &KrigingConfig::default()).unwrap();
         let e = est[0];
         assert!(e.log_variance > 0.0);
-        assert!(e.value > e.log_mean.exp(), "correction must inflate");
+        assert!(e.value > e.log_mean.exp_p(), "correction must inflate");
     }
 
     #[test]

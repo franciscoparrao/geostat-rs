@@ -15,6 +15,8 @@
 //! "bring-your-own-trend" contract that works with an external model. For
 //! convenience, [`OlsTrend`] fits a plain linear trend on covariates so the
 //! whole pipeline is self-contained when no external model is supplied.
+#[allow(unused_imports)]
+use crate::pmath::PortableF64;
 
 use ndarray::Array2;
 
@@ -269,7 +271,7 @@ mod tests {
             let x = rng.uniform() * 100.0;
             let y = rng.uniform() * 100.0;
             // Trend in a covariate (here: x itself) + smooth correlated noise.
-            let resid = (x / 25.0).sin() + (y / 30.0).cos() + 0.2 * rng.normal();
+            let resid = (x / 25.0).sin_p() + (y / 30.0).cos_p() + 0.2 * rng.normal();
             let v = 5.0 + 0.4 * x + resid;
             coords.push([x, y]);
             values.push(v);

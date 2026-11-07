@@ -7,6 +7,8 @@
 //! tunes things WLS cannot: the IDW power, the k-NN `k`, and the kriging search
 //! neighborhood size, all on the same predictive footing used to compare
 //! methods ([`crate::interpolation`], [`crate::validation`]).
+#[allow(unused_imports)]
+use crate::pmath::PortableF64;
 
 use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
@@ -138,7 +140,7 @@ mod tests {
             let x = rng.uniform() * 100.0;
             let y = rng.uniform() * 100.0;
             coords.push([x, y]);
-            values.push((x / 20.0).sin() + (y / 25.0).cos() + 0.1 * rng.normal());
+            values.push((x / 20.0).sin_p() + (y / 25.0).cos_p() + 0.1 * rng.normal());
         }
         PointSet::new(coords, values).unwrap()
     }

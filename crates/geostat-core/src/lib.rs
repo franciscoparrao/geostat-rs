@@ -56,6 +56,7 @@ pub mod kriging;
 pub mod linalg;
 pub mod optim;
 mod parallel;
+pub(crate) mod pmath;
 pub mod regression;
 pub mod rng;
 mod search;

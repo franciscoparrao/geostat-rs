@@ -18,6 +18,8 @@
 //! already a nearest-neighbour approximate kriging): here the contribution is a
 //! scalable *likelihood* for fitting covariance parameters, which the
 //! variogram-WLS path does not provide.
+#[allow(unused_imports)]
+use crate::pmath::PortableF64;
 
 use std::f64::consts::PI;
 
@@ -330,7 +332,7 @@ fn loglik_with_plan<const D: usize>(
             (mu, (sill - reduction).max(1e-12))
         };
         let r = z[i] - mu;
-        loglik += -0.5 * ((2.0 * PI).ln() + var.ln() + r * r / var);
+        loglik += -0.5 * ((2.0 * PI).ln_p() + var.ln_p() + r * r / var);
     }
     Ok(loglik)
 }
@@ -360,21 +362,21 @@ fn g_and_dg(kind: ModelKind, d: f64) -> Option<(f64, f64)> {
             }
         }
         ModelKind::Exponential => {
-            let e = (-d).exp();
+            let e = (-d).exp_p();
             Some((1.0 - e, e))
         }
         ModelKind::Gaussian => {
-            let e = (-(d * d)).exp();
+            let e = (-(d * d)).exp_p();
             Some((1.0 - e, 2.0 * d * e))
         }
         ModelKind::Matern15 => {
             let s = 3.0_f64.sqrt() * d;
-            let e = (-s).exp();
+            let e = (-s).exp_p();
             Some((1.0 - (1.0 + s) * e, 3.0 * d * e))
         }
         ModelKind::Matern25 => {
             let s = 5.0_f64.sqrt() * d;
-            let e = (-s).exp();
+            let e = (-s).exp_p();
             Some((
                 1.0 - (1.0 + s + s * s / 3.0) * e,
                 5.0 * d * (1.0 + s) / 3.0 * e,
@@ -457,7 +459,7 @@ fn loglik_grad_inner<const D: usize>(
             // First point: marginal N(0, sill); only nugget/psill move sill.
             let var = sill;
             let r = z[i];
-            loglik += -0.5 * ((2.0 * PI).ln() + var.ln() + r * r / var);
+            loglik += -0.5 * ((2.0 * PI).ln_p() + var.ln_p() + r * r / var);
             let common = -0.5 / var + 0.5 * r * r / (var * var);
             grad[0] += common; // dsill/dnugget = 1
             grad[1] += common; // dsill/dpsill = 1
@@ -521,7 +523,7 @@ fn loglik_grad_inner<const D: usize>(
         // fragile.
         let clamped = raw_var <= 1e-12;
         let r = z[i] - mu;
-        loglik += -0.5 * ((2.0 * PI).ln() + var.ln() + r * r / var);
+        loglik += -0.5 * ((2.0 * PI).ln_p() + var.ln_p() + r * r / var);
 
         // Shared tail of the per-parameter derivative:
         // d(loglik_k)/dp = -0.5 dvar/p/var + r*dmu/dp/var + 0.5 r^2/var^2 * dvar/dp.
@@ -709,7 +711,7 @@ fn loglik_with_blocks<const D: usize>(
             let l_tt = kvv[t * vn + t];
             let var = l_tt * l_tt;
             let wt = w[t];
-            loglik += -0.5 * ((2.0 * PI).ln() + var.ln() + wt * wt);
+            loglik += -0.5 * ((2.0 * PI).ln_p() + var.ln_p() + wt * wt);
         }
     }
     Ok(loglik)
@@ -994,8 +996,8 @@ fn mle_fit_with_plan<const D: usize>(
     };
     let objective = |x: &[f64]| -> f64 {
         let nugget = x[0] * x[0];
-        let psill = x[1].exp();
-        let range = x[2].exp();
+        let psill = x[1].exp_p();
+        let range = x[2].exp_p();
         let model = VariogramModel {
             nugget,
             structures: vec![Structure::new(kind, psill, range)],
@@ -1013,10 +1015,16 @@ fn mle_fit_with_plan<const D: usize>(
 
     // Range is the classic multimodal parameter for covariance MLE
     // (short-vs-long-range local optima); multi-start around the initial guess.
-    let ln_range0 = range0.ln();
+    let ln_range0 = range0.ln_p();
     let starts: Vec<Vec<f64>> = [0.3_f64, 1.0, 3.0]
         .into_iter()
-        .map(|f| vec![(0.1 * var0).sqrt(), (0.9 * var0).ln(), ln_range0 + f.ln()])
+        .map(|f| {
+            vec![
+                (0.1 * var0).sqrt(),
+                (0.9 * var0).ln_p(),
+                ln_range0 + f.ln_p(),
+            ]
+        })
         .collect();
 
     // Analytical-gradient BFGS when available (AUDIT-2026-07-v2.md §5.1,
@@ -1030,8 +1038,8 @@ fn mle_fit_with_plan<const D: usize>(
     let (xb, neg_ll) = if blocks.is_none() && g_and_dg(kind, 0.5).is_some() {
         let objective_grad = |x: &[f64]| -> Vec<f64> {
             let nugget = x[0] * x[0];
-            let psill = x[1].exp();
-            let range = x[2].exp();
+            let psill = x[1].exp_p();
+            let range = x[2].exp_p();
             match loglik_grad_with_plan(data, kind, nugget, psill, range, plan) {
                 Some(Ok((_, g))) => {
                     let mut gx = vec![-g[0] * 2.0 * x[0], -g[1] * psill, -g[2] * range];
@@ -1068,7 +1076,7 @@ fn mle_fit_with_plan<const D: usize>(
     }
     let model = VariogramModel::new(
         xb[0] * xb[0],
-        vec![Structure::new(kind, xb[1].exp(), xb[2].exp())],
+        vec![Structure::new(kind, xb[1].exp_p(), xb[2].exp_p())],
     )?;
     Ok(VecchiaFit {
         model,
@@ -1113,13 +1121,13 @@ pub fn vecchia_mle_matern<const D: usize>(
 
     let objective = |x: &[f64]| -> f64 {
         let nugget = x[0] * x[0];
-        let psill = x[1].exp();
-        let range = x[2].exp();
+        let psill = x[1].exp_p();
+        let range = x[2].exp_p();
         // Clamp, don't let the search wander past MATERN_NU_MAX: beyond it
         // the correlation silently evaluates to NaN (AUDIT-2026-07-v2.md
         // §1.8), and nu that large is indistinguishable from Gaussian
         // anyway, so clamping costs no real fitting power.
-        let nu = x[3].exp().min(crate::variogram::MATERN_NU_MAX);
+        let nu = x[3].exp_p().min(crate::variogram::MATERN_NU_MAX);
         let range_max = 10.0 * extent;
         let reg = if range > range_max {
             ((range - range_max) / range_max).powi(2)
@@ -1140,16 +1148,16 @@ pub fn vecchia_mle_matern<const D: usize>(
     // over every conditioning pair, each needing a K_nu Bessel quadrature)
     // up to `max_iter` times, unlike a fixed-kind fit -- keep the (nu0,
     // range0) grid modest so a joint fit stays practical.
-    let ln_range0 = range0.ln();
+    let ln_range0 = range0.ln_p();
     let starts: Vec<Vec<f64>> = [0.7_f64, 2.5]
         .into_iter()
         .flat_map(|nu0| {
             [0.5_f64, 2.0].into_iter().map(move |f| {
                 vec![
                     (0.1 * var0).sqrt(),
-                    (0.9 * var0).ln(),
-                    ln_range0 + f.ln(),
-                    nu0.ln(),
+                    (0.9 * var0).ln_p(),
+                    ln_range0 + f.ln_p(),
+                    nu0.ln_p(),
                 ]
             })
         })
@@ -1158,9 +1166,9 @@ pub fn vecchia_mle_matern<const D: usize>(
     let model = VariogramModel::new(
         xb[0] * xb[0],
         vec![Structure::new(
-            ModelKind::Matern(xb[3].exp().min(crate::variogram::MATERN_NU_MAX)),
-            xb[1].exp(),
-            xb[2].exp(),
+            ModelKind::Matern(xb[3].exp_p().min(crate::variogram::MATERN_NU_MAX)),
+            xb[1].exp_p(),
+            xb[2].exp_p(),
         )],
     )?;
     Ok(VecchiaFit {
@@ -1331,7 +1339,7 @@ fn reml_loglik_with_plan<const D: usize>(
                 .collect();
             (uz, uf, d)
         };
-        logdet += d.ln();
+        logdet += d.ln_p();
         uz_uz += uz * uz;
         for aa in 0..p {
             c[aa] += uf[aa] * uz;
@@ -1349,7 +1357,7 @@ fn reml_loglik_with_plan<const D: usize>(
     let resid = uz_uz - c.iter().zip(&beta).map(|(&ci, &bi)| ci * bi).sum::<f64>();
 
     let nm = (n - p) as f64;
-    Ok(-0.5 * (nm * (2.0 * PI).ln() + logdet + ln_det_a + resid))
+    Ok(-0.5 * (nm * (2.0 * PI).ln_p() + logdet + ln_det_a + resid))
 }
 
 /// Grouped counterpart of [`reml_loglik_with_plan`] (Guinness 2018 blocks,
@@ -1425,7 +1433,7 @@ fn reml_loglik_with_blocks<const D: usize>(
             let l_tt = kvv[t * vn + t];
             let d = l_tt * l_tt;
             let uz = wz[t];
-            logdet += d.ln();
+            logdet += d.ln_p();
             uz_uz += uz * uz;
             for aa in 0..p {
                 let ufa = wf[aa][t];
@@ -1444,7 +1452,7 @@ fn reml_loglik_with_blocks<const D: usize>(
     let resid = uz_uz - c.iter().zip(&beta).map(|(&ci, &bi)| ci * bi).sum::<f64>();
 
     let nm = (n - p) as f64;
-    Ok(-0.5 * (nm * (2.0 * PI).ln() + logdet + ln_det_a + resid))
+    Ok(-0.5 * (nm * (2.0 * PI).ln_p() + logdet + ln_det_a + resid))
 }
 
 /// Fits a single-structure model by **restricted/trend maximum likelihood**:
@@ -1608,8 +1616,8 @@ fn reml_fit_with_basis<const D: usize>(
     // comment there); no boundary penalty needed.
     let objective = |x: &[f64]| -> f64 {
         let nugget = x[0] * x[0];
-        let psill = x[1].exp();
-        let range = x[2].exp();
+        let psill = x[1].exp_p();
+        let range = x[2].exp_p();
         // A range far beyond the domain is unidentifiable (indistinguishable
         // from a trend); regularize it back rather than letting it run away.
         let range_max = 10.0 * extent;
@@ -1632,15 +1640,21 @@ fn reml_fit_with_basis<const D: usize>(
         }
     };
 
-    let ln_range0 = range0.ln();
+    let ln_range0 = range0.ln_p();
     let starts: Vec<Vec<f64>> = [0.3_f64, 1.0, 3.0]
         .into_iter()
-        .map(|f| vec![(0.1 * var0).sqrt(), (0.9 * var0).ln(), ln_range0 + f.ln()])
+        .map(|f| {
+            vec![
+                (0.1 * var0).sqrt(),
+                (0.9 * var0).ln_p(),
+                ln_range0 + f.ln_p(),
+            ]
+        })
         .collect();
     let (xb, neg_ll) = nelder_mead_multistart(objective, &starts, 0.3, 2000);
     let model = VariogramModel::new(
         xb[0] * xb[0],
-        vec![Structure::new(kind, xb[1].exp(), xb[2].exp())],
+        vec![Structure::new(kind, xb[1].exp_p(), xb[2].exp_p())],
     )?;
     Ok(VecchiaFit {
         model,
@@ -1948,7 +1962,7 @@ mod tests {
             let x = rng.uniform() * 100.0;
             let y = rng.uniform() * 100.0;
             coords.push([x, y]);
-            values.push((x / 25.0).sin() + (y / 30.0).cos() + 0.1 * rng.normal());
+            values.push((x / 25.0).sin_p() + (y / 30.0).cos_p() + 0.1 * rng.normal());
         }
         PointSet::new(coords, values).unwrap()
     }
@@ -1970,7 +1984,7 @@ mod tests {
         let lu = crate::linalg::lu_factor(arr).unwrap();
         let x = lu.solve(z.clone());
         let quad: f64 = z.iter().zip(&x).map(|(&zi, &xi)| zi * xi).sum();
-        -0.5 * (n as f64 * (2.0 * PI).ln() + lu.ln_det_abs() + quad)
+        -0.5 * (n as f64 * (2.0 * PI).ln_p() + lu.ln_det_abs() + quad)
     }
 
     #[test]
@@ -2459,7 +2473,7 @@ mod tests {
         let beta = lu_a.solve(cvec.clone());
         let ztsiz: f64 = (0..n).map(|r| z[r] * siz[r]).sum();
         let resid = ztsiz - cvec.iter().zip(&beta).map(|(&c, &b)| c * b).sum::<f64>();
-        -0.5 * ((n - p) as f64 * (2.0 * PI).ln() + lu_s.ln_det_abs() + lu_a.ln_det_abs() + resid)
+        -0.5 * ((n - p) as f64 * (2.0 * PI).ln_p() + lu_s.ln_det_abs() + lu_a.ln_det_abs() + resid)
     }
 
     #[test]
@@ -2557,7 +2571,7 @@ mod tests {
         // Covariate: distance-to-centre style feature (non-polynomial effect).
         let cov: Vec<f64> = coords
             .iter()
-            .map(|p| (-((p[0] - 30.0).powi(2) + (p[1] - 30.0).powi(2)) / 200.0).exp())
+            .map(|p| (-((p[0] - 30.0).powi(2) + (p[1] - 30.0).powi(2)) / 200.0).exp_p())
             .collect();
         let truth = VariogramModel::new(
             0.05,
@@ -2604,7 +2618,7 @@ mod tests {
             .collect();
         let cov_raw: Vec<f64> = coords
             .iter()
-            .map(|p| (-((p[0] - 30.0).powi(2) + (p[1] - 30.0).powi(2)) / 200.0).exp())
+            .map(|p| (-((p[0] - 30.0).powi(2) + (p[1] - 30.0).powi(2)) / 200.0).exp_p())
             .collect();
         // Same *shape* as the covariate above, but UTM-scale units: a
         // monotone affine map (600_000 + 1e4 * cov_raw) so the underlying

@@ -24,6 +24,7 @@ ndarray = { workspace = true }
 rayon = { workspace = true, optional = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+libm = "0.2"
 
 [lib]
 bench = false

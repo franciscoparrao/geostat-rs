@@ -1,0 +1,45 @@
+{
+  "bbox": [
+    178600.0,
+    329600.0,
+    181400.0,
+    333700.0
+  ],
+  "nx": 40,
+  "ny": 60,
+  "n_realizations": 5,
+  "seed": 20261106,
+  "max_neighbors": 16,
+  "models_ns": [
+    {
+      "nugget": 0.1,
+      "structures": [
+        {
+          "kind": "spherical",
+          "sill": 0.9,
+          "range": 900.0
+        }
+      ]
+    },
+    {
+      "nugget": 0.05,
+      "structures": [
+        {
+          "kind": "exponential",
+          "sill": 0.95,
+          "range": 400.0
+        }
+      ]
+    },
+    {
+      "nugget": 0.0,
+      "structures": [
+        {
+          "kind": "gaussian",
+          "sill": 1.0,
+          "range": 700.0
+        }
+      ]
+    }
+  ]
+}

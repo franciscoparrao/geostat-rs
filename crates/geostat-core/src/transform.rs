@@ -1,4 +1,6 @@
 //! Normal score transform and inverse normal CDF.
+#[allow(unused_imports)]
+use crate::pmath::PortableF64;
 
 use crate::error::{GeostatError, Result};
 use crate::tails::{self, TailModel};
@@ -16,7 +18,7 @@ pub fn norm_cdf(z: f64) -> f64 {
     const P: f64 = 0.231_641_9;
     let x = z.abs();
     let t = 1.0 / (1.0 + P * x);
-    let pdf = (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt();
+    let pdf = (-0.5 * x * x).exp_p() / (2.0 * std::f64::consts::PI).sqrt();
     let poly = t * (B[0] + t * (B[1] + t * (B[2] + t * (B[3] + t * B[4]))));
     let upper = 1.0 - pdf * poly;
     if z >= 0.0 { upper } else { 1.0 - upper }
@@ -75,7 +77,7 @@ pub fn inv_norm_cdf(p: f64) -> f64 {
     let p = p.clamp(1e-300, 1.0 - 1e-16);
 
     let tail = |p: f64| -> f64 {
-        let q = (-2.0 * p.ln()).sqrt();
+        let q = (-2.0 * p.ln_p()).sqrt();
         (((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
             / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
     };

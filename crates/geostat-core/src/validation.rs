@@ -1,4 +1,6 @@
 //! Leave-one-out cross-validation for kriging models.
+#[allow(unused_imports)]
+use crate::pmath::PortableF64;
 
 use crate::parallel::par_try_map;
 
@@ -701,7 +703,8 @@ pub fn leave_one_out_lognormal<const D: usize>(
             .into_iter()
             .next()
             .expect("exactly one target");
-        let var = (est.log_variance.exp() - 1.0) * (2.0 * est.log_mean + est.log_variance).exp();
+        let var =
+            (est.log_variance.exp_p() - 1.0) * (2.0 * est.log_mean + est.log_variance).exp_p();
         Ok((est.value, var))
     })?;
     let (predicted, variance) = estimates.into_iter().unzip();
@@ -912,7 +915,7 @@ mod tests {
             let x = rng.uniform() * 100.0;
             let y = rng.uniform() * 100.0;
             coords.push([x, y]);
-            values.push((x / 20.0).sin() + (y / 20.0).cos());
+            values.push((x / 20.0).sin_p() + (y / 20.0).cos_p());
         }
         let data = PointSet::new(coords, values).unwrap();
         let model =
@@ -996,7 +999,7 @@ mod tests {
             let x = rng.uniform() * 100.0;
             let y = rng.uniform() * 100.0;
             coords.push([x, y]);
-            values.push((x / 20.0).sin() + (y / 20.0).cos());
+            values.push((x / 20.0).sin_p() + (y / 20.0).cos_p());
         }
         PointSet::new(coords, values).unwrap()
     }
@@ -1079,7 +1082,7 @@ mod tests {
             let x = rng.uniform() * 100.0;
             let y = rng.uniform() * 100.0;
             coords.push([x, y]);
-            values.push((x / 200.0).sin() + (y / 200.0).cos());
+            values.push((x / 200.0).sin_p() + (y / 200.0).cos_p());
         }
         let data = PointSet::new(coords, values).unwrap();
         let model =
@@ -1343,9 +1346,9 @@ mod tests {
             let x = rng.uniform() * 100.0;
             let y = rng.uniform() * 100.0;
             coords.push([x, y]);
-            logs.push((x / 20.0).sin() + (y / 20.0).cos());
+            logs.push((x / 20.0).sin_p() + (y / 20.0).cos_p());
         }
-        let values: Vec<f64> = logs.iter().map(|&l| l.exp()).collect();
+        let values: Vec<f64> = logs.iter().map(|&l| l.exp_p()).collect();
         let data = PointSet::new(coords, values).unwrap();
         let log_model =
             VariogramModel::new(0.02, vec![Structure::new(ModelKind::Spherical, 1.0, 25.0)])

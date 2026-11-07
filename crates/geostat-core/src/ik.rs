@@ -5,6 +5,8 @@
 //! corrections are applied, and an E-type estimate plus conditional
 //! variance are derived from the corrected ccdf assuming intra-class
 //! uniformity (consistent with the SIS sampler).
+#[allow(unused_imports)]
+use crate::pmath::PortableF64;
 
 use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
@@ -461,7 +463,7 @@ mod tests {
             let x = rng.uniform() * 100.0;
             let y = rng.uniform() * 100.0;
             coords.push([x, y]);
-            values.push((x / 25.0).sin() * 2.0 + (y / 30.0).cos() + 0.2 * rng.normal());
+            values.push((x / 25.0).sin_p() * 2.0 + (y / 30.0).cos_p() + 0.2 * rng.normal());
         }
         let data = PointSet::new(coords, values).unwrap();
         let mut sorted = data.values().to_vec();

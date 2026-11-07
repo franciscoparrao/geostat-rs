@@ -6,6 +6,8 @@
 //! corrections are applied (average of upward/downward passes), and the
 //! simulated value is drawn from the corrected ccdf with linear
 //! interpolation within classes and linear tails to `[tail_min, tail_max]`.
+#[allow(unused_imports)]
+use crate::pmath::PortableF64;
 
 use ndarray::Array2;
 
@@ -819,7 +821,7 @@ mod tests {
             let x = rng.uniform() * 100.0;
             let y = rng.uniform() * 100.0;
             coords.push([x, y]);
-            values.push((x / 30.0).sin() * 2.0 + (y / 25.0).cos() + 0.3 * rng.normal());
+            values.push((x / 30.0).sin_p() * 2.0 + (y / 25.0).cos_p() + 0.3 * rng.normal());
         }
         let data = PointSet::new(coords, values).unwrap();
         let mut sorted = data.values().to_vec();

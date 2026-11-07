@@ -1,4 +1,6 @@
 //! Experimental (empirical) variogram estimation.
+#[allow(unused_imports)]
+use crate::pmath::PortableF64;
 
 use crate::data::PointSet;
 use crate::error::{GeostatError, Result};
@@ -51,10 +53,10 @@ pub(crate) fn direction_unit_vector<const D: usize>(azimuth_deg: f64, dip_deg: f
     let az = azimuth_deg.to_radians();
     let dip = dip_deg.to_radians();
     let mut u = [0.0; D];
-    u[0] = dip.cos() * az.sin();
-    u[1] = dip.cos() * az.cos();
+    u[0] = dip.cos_p() * az.sin_p();
+    u[1] = dip.cos_p() * az.cos_p();
     if D == 3 {
-        u[2] = dip.sin();
+        u[2] = dip.sin_p();
     }
     u
 }
@@ -185,7 +187,7 @@ fn validate_and_setup<const D: usize>(
     let width = cfg.max_dist / cfg.n_lags as f64;
     let dir = cfg.direction.as_ref().map(|d| {
         let u: [f64; D] = direction_unit_vector(d.azimuth_deg, d.dip_deg);
-        (u, d.tolerance_deg.to_radians().cos())
+        (u, d.tolerance_deg.to_radians().cos_p())
     });
     Ok((width, dir))
 }

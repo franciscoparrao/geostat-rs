@@ -358,3 +358,45 @@ python3 validation/compare_v07.py
   on identical bins).
 - Wall-clock for the 1000-realization SGS run: gstat ~18 s, geostat-rs
   ~2.4 s (same neighborhood settings, 8 threads).
+
+## Moving-neighbourhood parity (2026-11-06)
+
+The parity scripts above use a global neighbourhood; the benchmarks and the
+application use moving neighbourhoods, where implementations can diverge
+(neighbour search, ties, search radius). `validation/moving_gstat.R` writes
+gstat references on the 3103 Meuse grid cells for OK with `nmax` 8/16/32, OK
+with `nmax = 32` and `maxdist = 600`, SK with `nmax = 16` and UK (linear drift)
+with `nmax = 32`, plus leave-one-out CV with `nmax = 32`.
+
+```sh
+Rscript validation/moving_gstat.R
+python3 validation/compare_moving.py
+```
+
+| Case | max abs diff, prediction | max abs diff, variance |
+|---|---|---|
+| OK, nmax 8 | 7.1e-15 | 8.2e-16 |
+| OK, nmax 16 | 7.1e-15 | 9.2e-16 |
+| OK, nmax 32 | 1.1e-14 | 1.3e-15 |
+| OK, nmax 32, radius 600 m | 9.8e-15 | 1.3e-15 |
+| SK, nmax 16 | 8.9e-15 | 8.9e-16 |
+| UK (linear drift), nmax 32 | 5.6e-10 | 4.6e-11 |
+| LOO CV, nmax 32 | 8.0e-15 | 1.1e-15 |
+
+## Re-running all parity checks against the current code
+
+The comparators read geostat-rs outputs (`validation/out/rust_*`) written by
+the CLI; they do not regenerate them. `validation/run_all.sh` rebuilds the CLI,
+moves every existing `rust_*` output aside, regenerates them all from the
+current code and runs every comparator, so a stale output cannot pass
+silently. (Until 2026-11-06 most outputs dated from June-July 2026, so
+"parity re-confirmed" after later core changes had re-checked old results;
+the first full regeneration, after the range cap and the libm change, passes
+every comparator.)
+
+```sh
+bash validation/run_all.sh
+```
+
+Native-versus-WebAssembly bit identity of simulation: see `validation/bitident/`
+(also run in CI).

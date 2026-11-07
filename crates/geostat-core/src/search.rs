@@ -5,6 +5,8 @@
 //! optionally restricted to a search radius. Distances are Euclidean
 //! (anisotropy applies to covariances, not to the search, matching
 //! gstat/GSLIB behavior).
+#[allow(unused_imports)]
+use crate::pmath::PortableF64;
 
 use std::collections::BinaryHeap;
 
@@ -148,8 +150,8 @@ impl<const D: usize> BucketGrid<D> {
                 volume *= extents[d];
             }
         }
-        let mut cell = volume.powf(1.0 / n_active as f64).max(1e-12)
-            * (1.0 / (expected.max(1) as f64).powf(1.0 / n_active as f64));
+        let mut cell = volume.powf_p(1.0 / n_active as f64).max(1e-12)
+            * (1.0 / (expected.max(1) as f64).powf_p(1.0 / n_active as f64));
 
         // Defensive cap: however `cell` was derived, never materialize more
         // than a small multiple of the expected point count worth of

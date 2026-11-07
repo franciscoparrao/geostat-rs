@@ -2,6 +2,8 @@
 //! for plugging a custom, non-catalog covariance function into
 //! [`crate::kriging::Kriging`] without going through [`VariogramModel`]'s
 //! fixed set of [`crate::variogram::ModelKind`]s.
+#[allow(unused_imports)]
+use crate::pmath::PortableF64;
 
 use crate::variogram::VariogramModel;
 
@@ -117,7 +119,7 @@ mod tests {
             if h == 0.0 {
                 0.0
             } else {
-                self.nugget + self.sill * (1.0 - (-h / self.range).exp())
+                self.nugget + self.sill * (1.0 - (-h / self.range).exp_p())
             }
         }
 

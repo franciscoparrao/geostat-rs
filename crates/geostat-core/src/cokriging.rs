@@ -4,6 +4,8 @@
 //! variables; each structure carries a symmetric positive semi-definite
 //! matrix of (co)sills. Unbiasedness follows the traditional convention:
 //! primary weights sum to 1, each secondary variable's weights sum to 0.
+#[allow(unused_imports)]
+use crate::pmath::PortableF64;
 
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
@@ -1149,7 +1151,7 @@ mod tests {
         for _ in 0..150 {
             let x = rng.uniform() * 100.0;
             let y = rng.uniform() * 100.0;
-            let base = (x / 25.0).sin() + (y / 25.0).cos();
+            let base = (x / 25.0).sin_p() + (y / 25.0).cos_p();
             coords.push([x, y]);
             va.push(base + 0.1 * rng.normal());
             vb.push(2.0 * base + 0.2 * rng.normal());

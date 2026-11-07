@@ -20,6 +20,8 @@
 //! [0.05, 15]`, `x ∈ [1e-6, 150]` to a relative error ≤ ~2e-8 (≤ ~1e-9 over
 //! the practically relevant fitting range); see
 //! `variogram::model::tests::matern_matches_closed_form_special_cases`.
+#[allow(unused_imports)]
+use crate::pmath::PortableF64;
 
 use std::sync::OnceLock;
 
@@ -31,7 +33,7 @@ fn gauss_legendre(n: usize) -> (Vec<f64>, Vec<f64>) {
     let mut w = vec![0.0; n];
     let m = n.div_ceil(2);
     for i in 0..m {
-        let mut z = ((std::f64::consts::PI * (i as f64 + 0.75)) / (n as f64 + 0.5)).cos();
+        let mut z = ((std::f64::consts::PI * (i as f64 + 0.75)) / (n as f64 + 0.5)).cos_p();
         loop {
             let mut p1 = 1.0;
             let mut p2 = 0.0;
@@ -69,7 +71,7 @@ fn gl_far() -> &'static (Vec<f64>, Vec<f64>) {
 /// and any real `ν` (`K_{-ν} = K_ν`). See the module docs for the method.
 pub(crate) fn bessel_k(nu: f64, x: f64) -> f64 {
     let nu = nu.abs();
-    let f = |t: f64| (-x * t.cosh()).exp() * (nu * t).cosh();
+    let f = |t: f64| (-x * t.cosh_p()).exp_p() * (nu * t).cosh_p();
 
     // Panel [0, 1]: covers the integrand's peak for any x in the range this
     // crate evaluates (h/a scaled by sqrt(2*nu), practically well under 1e2).
@@ -110,7 +112,7 @@ pub(crate) fn gamma(x: f64) -> f64 {
         1.505_632_735_149_312e-7,
     ];
     if x < 0.5 {
-        std::f64::consts::PI / ((std::f64::consts::PI * x).sin() * gamma(1.0 - x))
+        std::f64::consts::PI / ((std::f64::consts::PI * x).sin_p() * gamma(1.0 - x))
     } else {
         let xm1 = x - 1.0;
         let mut a = COEF[0];
@@ -118,7 +120,7 @@ pub(crate) fn gamma(x: f64) -> f64 {
         for (i, &c) in COEF.iter().enumerate().skip(1) {
             a += c / (xm1 + i as f64);
         }
-        (2.0 * std::f64::consts::PI).sqrt() * t.powf(xm1 + 0.5) * (-t).exp() * a
+        (2.0 * std::f64::consts::PI).sqrt() * t.powf_p(xm1 + 0.5) * (-t).exp_p() * a
     }
 }
 
