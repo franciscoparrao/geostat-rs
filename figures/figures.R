@@ -39,8 +39,7 @@ p1 <- ggplot(parity, aes(gstat, rust)) +
   geom_text(data = lab, aes(x = -Inf, y = Inf, label = txt),
             hjust = -0.1, vjust = 1.6, size = 3.2, inherit.aes = FALSE) +
   facet_wrap(~method, scales = "free") +
-  labs(title = "geostat-rs vs gstat (Meuse grid)",
-       x = "gstat prediction", y = "geostat-rs prediction") +
+  labs(x = "gstat prediction", y = "geostat-rs prediction") +
   theme_paper
 save_fig(p1, "fig_parity.pdf", w = 7, h = 3.6)
 
@@ -50,13 +49,11 @@ cmp$method <- factor(cmp$method, levels = cmp$method[order(cmp$vecv)])
 p2 <- ggplot(cmp, aes(method, vecv, fill = method)) +
   geom_col(width = 0.7, show.legend = FALSE) +
   geom_errorbar(aes(ymin = vecv_lo, ymax = vecv_hi), width = 0.15, linewidth = 0.4) +
-  geom_text(aes(y = vecv_hi, label = sprintf("%.1f", vecv)), hjust = -0.15, size = 3.3) +
+  geom_text(aes(y = vecv_hi + 2, label = sprintf("%.1f", vecv)), hjust = 0, size = 3.3) +
   coord_flip(clip = "off") +
   scale_fill_brewer(palette = "Blues") +
-  expand_limits(y = max(cmp$vecv_hi) * 1.12) +
-  labs(title = "Method comparison by leave-one-out VEcv (Meuse log-zinc)",
-       subtitle = "Error bars: 95% bootstrap CI (2000 resamples)",
-       x = NULL, y = "VEcv (%)") +
+  expand_limits(y = max(cmp$vecv_hi) + 12) +
+  labs(x = NULL, y = "leave-one-out VEcv (%)") +
   theme_paper
 save_fig(p2, "fig_compare.pdf", w = 6, h = 3.2)
 
@@ -68,9 +65,8 @@ p3 <- ggplot(tune, aes(power, vecv)) +
   geom_point(colour = "#2c6fbb") +
   geom_point(data = best, colour = "#d1495b", size = 3) +
   geom_text(data = best, aes(label = sprintf("best: power %.1f", power)),
-            vjust = -1, size = 3.2, colour = "#d1495b") +
-  labs(title = "IDW power tuned by predictive accuracy (Meuse log-zinc)",
-       x = "IDW power", y = "leave-one-out VEcv (%)") +
+            vjust = 2.2, size = 3.2, colour = "#d1495b") +
+  labs(x = "IDW power", y = "leave-one-out VEcv (%)") +
   theme_paper
 save_fig(p3, "fig_idw_tune.pdf", w = 6, h = 3.6)
 

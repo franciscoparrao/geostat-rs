@@ -18,9 +18,9 @@
 
 \title[Unifying native, Python and WebAssembly geostatistics]{geostat-rs: unifying native, Python and WebAssembly geostatistics from a single const-generic Rust core}
 
-\author*[1]{\fnm{Francisco} \sur{Parra-O.}}\email{}
+\author*[1]{\fnm{Francisco} \sur{Parra-O.}}\email{francisco.parra.o@usach.cl}
 
-\affil*[1]{\orgaddress{\country{Chile}}}
+\affil*[1]{\orgdiv{Departamento de Ingenier\'{\i}a Inform\'atica}, \orgname{Universidad de Santiago de Chile}, \orgaddress{\city{Santiago}, \country{Chile}}}
 
 \abstract{Geostatistical methods are implemented independently across at least six
 actively maintained tools --- gstat (R), GSLIB (Fortran),
@@ -30,17 +30,17 @@ shared between server, desktop and in-browser execution. We present
 geostat-rs, architected to close this fragmentation: a single Rust
 core, generic over spatial dimension (2-D and 3-D from one const-generic code
 path), compiles unchanged to three deployment targets --- a dependency-light
-native binary, a Python extension module (zero-copy NumPy arrays) and
+native binary, a Python extension module and
 WebAssembly for in-browser execution --- and uses a
 deterministic random-number generator so stochastic simulation is
 bit-identical across all three. The engine covers
 variography; the kriging family
 (simple/ordinary/universal/external-drift, co-kriging, indicator and block
 kriging); inverse-distance and $k$-nearest-neighbour baselines; regression
-kriging; and conditional sequential Gaussian and indicator simulation. This
-architecture costs no numerical fidelity: every deterministic method is
-cross-checked against gstat on the Meuse and Walker Lake benchmarks at machine
-precision, and simulation is validated distributionally. Regression kriging
+kriging; and conditional sequential Gaussian and indicator simulation. This architecture costs no numerical fidelity: every kriging and
+interpolation method with a gstat counterpart agrees with gstat to nine or more
+significant digits on the
+Meuse and Walker Lake benchmarks, and simulation is validated distributionally. Regression kriging
 accepts an externally supplied trend, letting a machine-learning model provide
 the mean while geostat-rs kriges the residuals. On log rare-earth grades in 1118 samples from 331 Chilean mine-tailings deposits, holding out whole deposits shows that the signal lies in host-mineral covariates: ordinary kriging explains at most 22\% of the variance and kriging the residuals of a random-forest trend lowers accuracy, whereas a random hold-out inflates ordinary-kriging VEcv (variance explained by cross-validation) by 20 to 28 points through within-deposit autocorrelation.}
 
@@ -64,13 +64,17 @@ heavy runtime.
 
 The consequence is that the same methods are implemented independently at
 least six times over. gstat \citep{pebesma2004} is comprehensive and the
-de-facto reference, but is bound to the R runtime, single-threaded in its
-hot paths, and offers no single-binary or in-browser deployment; GSLIB
+de-facto reference, but is bound to the R runtime, runs its kriging loop on a
+single thread, and offers no single-binary or in-browser deployment; GSLIB
 \citep{deutsch1998} is fast, canonical Fortran but arcane and without modern
 packaging, bindings or a Python/WebAssembly interface. The Python
 geostatistics ecosystem --- GSTools \citep{mueller2022}, SciKit-GStat
-\citep{maelicke2022} and PyKrige \citep{pykrige} --- is convenient and
-scriptable but pure-Python in performance and tied to the Python runtime;
+\citep{maelicke2022} and PyKrige \citep{pykrige} --- is convenient and scriptable and has compiled hot paths --- Cython in PyKrige,
+and in GSTools an optional Rust backend, GSTools-Core \citep{gstoolscore},
+built with PyO3 --- but it is reached only through the Python runtime, and
+GSTools solves one global kriging system (a pseudo-inverse of the full
+covariance matrix) with no moving neighbourhood and conditions random fields by
+kriging rather than by sequential simulation;
 GeoStats.jl \citep{hoffimann2018} closes much of the performance gap with a
 compiled, high-performance core in Julia, but offers neither single-binary
 deployment nor Python or WebAssembly bindings. No shared numerical core spans
@@ -109,12 +113,19 @@ geostat-core (the library, with no I/O and only light dependencies),
 geostat-cli (a command-line tool), geostat-python (a PyO3
 module, abi3 $\geq$ 3.9) and geostat-wasm (WebAssembly with a browser
 demo). The core is generic over the spatial dimension through a const-generic
-PointSet<const D>, so variography, kriging, cross-validation and
+\texttt{PointSet<const D>}, so variography, kriging, cross-validation and
 simulation run unchanged in 2-D and 3-D. Moving neighbourhoods use a $k$-d tree;
 sequential simulation uses an incremental bucket grid. A deterministic
-random-number generator (xoshiro256++) makes simulation reproducible:
-the same seed yields identical realizations on any platform. Native parallelism
-(rayon) is behind a feature flag that is disabled for the wasm32 target. The
+random-number generator (xoshiro256++) makes simulation reproducible, and
+every transcendental function (logarithm, exponential, trigonometric, power)
+goes through the pure-Rust libm port rather than the platform library, whose
+last-bit rounding differs between targets: before this change 134 of 12\,000
+simulated values differed in the last bit between the native and WebAssembly
+builds. A continuous-integration test now checks that conditional sequential
+Gaussian simulation gives bit-identical realizations in both builds and at 1 and
+16 threads (36\,000 values, spherical, exponential and Gaussian models).
+Native parallelism (rayon) is behind a feature flag that is disabled for the
+wasm32 target. The
 Python module reproduces the CLI bit-for-bit, and the WebAssembly build runs
 the same engine in the browser with no server (Fig.~\ref{fig:wasm}).
 
@@ -132,14 +143,19 @@ rendering the prediction surface on a canvas with a colour-scale legend.}
 \textbf{Variography.} Experimental variograms (omnidirectional, directional with
 azimuth and a 3-D dip cone), a 2-D variogram map for diagnosing anisotropy, and
 cross-variograms; theoretical models (spherical,
-exponential, Gaussian, Mat\'ern $\nu=3/2,5/2$), nested with a nugget and with
+exponential, Gaussian, circular, stable, Mat\'ern with any smoothness $\nu$,
+hole-effect and power), nested with a nugget and with
 geometric anisotropy; weighted-least-squares fitting with gstat's default
 $N_j/h_j^2$ weights via Nelder--Mead, with automatic best-family selection and
 optional joint fitting of geometric anisotropy (major-axis azimuth and
 minor/major ratio) across directional variograms. On Meuse log-zinc
-(Fig.~\ref{fig:anis}) the fit recovers the textbook NE--SW continuity of the
-river floodplain (major azimuth $\approx 36^\circ$, minor/major ratio
-$\approx0.24$), consistent with the elongation of the variogram map.
+(Fig.~\ref{fig:anis}) the joint fit places the major axis NE--SW (azimuth $\approx 36^\circ$),
+consistent with the elongation of the variogram map. The minor axis reaches its
+sill within ${\sim}950$\,m, but the fitted major range (${\approx}4$\,km) lies
+beyond the 1.6\,km lag cut-off, so the range ratio ($\approx0.24$) is not
+identified by these data, and part of the directional contrast reflects the
+known decrease of zinc with distance to the river, a drift rather than
+geometric anisotropy.
 
 \begin{figure}[t]
 \centering
@@ -148,14 +164,17 @@ $\approx0.24$), consistent with the elongation of the variogram map.
 line marks the fitted major axis. (b) Directional experimental variograms along
 the fitted major and minor axes (point size proportional to pair count) with the
 jointly fitted anisotropic model. The major axis (NE--SW, $\approx 36^\circ$)
-has the longer range; the minor axis reaches the sill within ${\sim}900$\,m.}
+has the longer range, but its fitted range lies beyond the largest lag; the
+minor axis reaches the sill within ${\sim}950$\,m.}
 \label{fig:anis}
 \end{figure}
 
 \textbf{Kriging.} Simple, ordinary, universal (polynomial drift) and
 external-drift kriging, following the classical formulations of
-\citet{journel1978} and \citet{chiles2012}; ordinary co-kriging (collocated and
-heterotopic) under a linear model of coregionalization \citep{chiles2012};
+\citet{journel1978} and \citet{chiles2012}; ordinary co-kriging under a linear
+model of coregionalization, with isotopic or heterotopic data \citep{chiles2012};
+simple collocated co-kriging under the Markov models MM1 and MM2
+\citep{journel1999};
 block kriging and block co-kriging; indicator kriging (local ccdf, E-type
 estimate, conditional variance); and lognormal kriging.
 
@@ -187,8 +206,12 @@ covariate (e.g.\ a DEM) for external-drift or regression kriging.
 
 \section{Validation against gstat}\label{sec:validation}
 
-Every deterministic method is cross-checked against gstat on the Meuse and
-Walker Lake benchmarks. Table~\ref{tab:parity} lists headline parities; the full
+Every deterministic method that has a gstat counterpart is cross-checked
+against gstat on the Meuse and Walker Lake benchmarks, with global and moving
+neighbourhoods. Regression kriging with an external trend and collocated
+co-kriging under Markov models have no deterministic gstat counterpart and are
+tested by self-consistency (for example, both reduce exactly to simple kriging
+when the secondary information is uninformative). Table~\ref{tab:parity} lists headline parities; the full
 tables are in the repository. Conventions are aligned with gstat where they
 matter: the semivariance estimator, right-closed lag bins, $N_j/h_j^2$ fit
 weights, azimuth measured clockwise from north and nugget-free within-block
@@ -196,8 +219,7 @@ covariance. Figure~\ref{fig:parity} shows geostat-rs against gstat on the Meuse
 grid for ordinary kriging and IDW: predictions lie on the identity line to
 machine precision. Simulation is validated distributionally --- a
 1000-realization sequential Gaussian ensemble reproduces the theoretical
-simple-kriging mean and standard-deviation fields and the pooled quantiles,
-while running about $7\times$ faster than gstat.
+simple-kriging mean and standard-deviation fields and the pooled quantiles.
 
 \begin{table}[t]
 \centering
@@ -209,11 +231,13 @@ Method & Check & Max difference \\
 \midrule
 Experimental variogram & $\gamma$ (relative), 15 lags & \num{1.6e-15} \\
 Ordinary kriging & meuse.grid, 3103 cells & \num{1.5e-12} \\
+OK/SK/UK, moving nbhd. & $n_{\max}$ 8--32 & $\leq$\,\num{5.6e-10} \\
+Variogram fit (WLS) & parameters (rel.) & \num{1e-6}--\num{2e-5} \\
 LOO cross-validation & 155 points & \num{9.7e-13} \\
 KED / anisotropy / co-kriging & predictions & $\leq$\,\num{1.5e-12} \\
 Block / 3-D / heterotopic co-kriging & predictions & $\leq$\,\num{4e-14} \\
 Indicator kriging (in range) & $F(\text{cutoff})$ & \num{7.4e-10} \\
-Lognormal (simple) kriging & vs gstat SK + analytic & \num{1.2e-9} \\
+Lognormal (simple) kriging & vs SK + back-transform & \num{1.2e-9} \\
 Inverse-distance weighting & power 2, global & \num{1.9e-14} \\
 \botrule
 \end{tabular}
@@ -237,23 +261,25 @@ operation is timed (data preloaded, best of three runs); geostat-rs is timed
 through its Python binding (a thin wrapper over the Rust compute) against
 gstat~2.1.4. Single-threaded, geostat-rs is already faster than gstat at grid
 kriging ($1.2$--$2\times$); with its parallel moving-neighbourhood predictor on
-16 cores it is $6$--$12\times$ faster. Leave-one-out cross-validation is far
-faster still, as gstat's krige.cv carries per-fold R-level overhead
-that the parallel Rust implementation avoids. For a global neighbourhood the
-kriging-system matrix is identical for every target, so geostat-rs factorizes it
-once (LU) and only back-substitutes per target, an order-of-magnitude saving on
-large grids.
+16 threads (12 physical cores) it is $6$--$12\times$ faster, a speed-up of
+4.7 to 7.9 over its own single-threaded run. The leave-one-out
+ratio does not compare kriging implementations: gstat's krige.cv calls predict
+once per fold from an R loop, so it mostly measures per-call interpreter
+overhead. For a global neighbourhood the kriging-system matrix is identical for
+every target, so geostat-rs factorizes it once (LU) and only back-substitutes
+per target.
 
 \begin{table}[t]
 \centering
 \caption{Wall-clock time (ms, best of 3) for ordinary kriging and
 leave-one-out cross-validation. Hardware: 12th-gen Intel Core i7-1270P
-(16 logical cores); gstat 2.1.4 single-threaded.}
+(12 cores, 16 threads); gstat 2.1.4 single-threaded. The leave-one-out
+ratio is dominated by gstat's per-fold R overhead (see text).}
 \label{tab:bench}
 \begin{tabular}{@{}lrrrr@{}}
 \toprule
-Task & gstat & \shortstack[r]{geostat-rs\\(1 core)} &
-\shortstack[r]{geostat-rs\\(16 cores)} & speedup \\
+Task & gstat & \shortstack[r]{geostat-rs\\(1 thread)} &
+\shortstack[r]{geostat-rs\\(16 threads)} & speedup \\
 \midrule
 OK grid, 2\,500 cells   & 184  & 89   & 15  & $12\times$ \\
 OK grid, 10\,000 cells  & 570  & 472  & 60  & $10\times$ \\
@@ -265,31 +291,40 @@ LOO cross-validation (155 pts) & 1368 & 8.9 & 5.2 & $263\times$ \\
 
 \section{Predictive accuracy, comparison and tuning}\label{sec:accuracy}
 
-On Meuse log-zinc, leave-one-out VEcv ranks ordinary kriging
-($\approx 71$, 95\% bootstrap CI $[60, 79]$) above IDW ($\approx 55$, CI
-$[44, 63]$), $k$-NN ($\approx 54$, CI $[41, 65]$) and nearest-neighbour
-($\approx 38$, CI $[15, 57]$) (Fig.~\ref{fig:compare}; CIs from 2000
-resamples of the leave-one-out pairs). Ordinary kriging's advantage over IDW
-and $k$-NN is robust to this resampling, but IDW and $k$-NN's own CIs overlap
-almost entirely --- their point estimates are close enough that this dataset
-cannot distinguish between them. No method dominates universally, so the
-comparison is by measured predictive accuracy rather than assumption.
-Hyperparameters are tuned the same way: Figure~\ref{fig:idwtune} shows IDW power
-selected by VEcv, with an optimum near power~3.5 on this dataset.
+On Meuse log-zinc every method uses the same 32-point neighbourhood and has its
+parameters chosen without the left-out point: the ordinary-kriging variogram is
+refitted in each leave-one-out fold, and the IDW power and the $k$-NN $k$ are
+tuned by an inner leave-one-out (nested cross-validation; power 3.5 in 153 of
+155 folds, $k=3$ in all). Leave-one-out VEcv ranks ordinary kriging (70.5, 95\%
+interval $[58.7, 80.0]$) above $k$-NN (62.0, $[47.0, 73.0]$), IDW (60.2,
+$[44.7, 71.5]$) and nearest-neighbour (38.2, $[7.8, 60.0]$)
+(Fig.~\ref{fig:compare}). The intervals come from a paired spatial block
+bootstrap (25 blocks of 500\,m, 2000 resamples), which resamples neighbouring
+points together instead of treating leave-one-out pairs as independent. Ordinary
+kriging's advantage holds in paired comparison: its VEcv exceeds IDW's by 3.3 to
+18.8 points and $k$-NN's by 3.6 to 15.1 points (95\% intervals of the
+difference), whereas IDW and $k$-NN differ by 1.8 points, well inside either
+interval. The kriging variance is checked as well: the leave-one-out
+standardized errors have mean 0.008 and variance 0.79, so the kriging variance
+slightly overstates the error. Hyperparameters are tuned the same way:
+Fig.~\ref{fig:idwtune} shows the IDW power selected by VEcv on the full data,
+with an optimum near power~3.5.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=0.85\linewidth]{fig_compare.pdf}
-\caption{Leave-one-out VEcv by method on Meuse log-zinc, with 95\% bootstrap
-confidence intervals.}
+\caption{Leave-one-out VEcv by method on Meuse log-zinc. Every method uses a
+32-point neighbourhood and parameters chosen without the left-out point (refitted
+variogram; IDW power and $k$-NN $k$ by nested cross-validation). Bars: 95\%
+intervals from a paired spatial block bootstrap.}
 \label{fig:compare}
 \end{figure}
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=0.85\linewidth]{fig_idw_tune.pdf}
-\caption{IDW power tuned by predictive accuracy (leave-one-out VEcv) on Meuse
-log-zinc.}
+\caption{IDW power tuned by predictive accuracy (leave-one-out VEcv,
+32-point neighbourhood) on Meuse log-zinc.}
 \label{fig:idwtune}
 \end{figure}
 

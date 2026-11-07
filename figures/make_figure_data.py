@@ -78,97 +78,91 @@ def fig_parity():
     write_csv(OUT / "parity.csv", ["method", "gstat", "rust"], rows)
 
 
-def _loo_idw(x, y, v, power, max_neighbors):
-    """Manual leave-one-out IDW predictions (per-point, for the bootstrap --
-    `compare_methods` only returns the aggregate VEcv/RMSE, not per-point
-    arrays)."""
-    n = len(x)
+MEUSE_NB = 32  # moving neighbourhood shared by every Meuse method
+IDW_POWERS = [0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5]
+KNN_KS = list(range(1, 17))
+
+
+def _knn_loo_vecv(x, y, v, k):
     preds = []
-    for i in range(n):
-        xs = x[:i] + x[i + 1 :]
-        ys = y[:i] + y[i + 1 :]
-        vs = v[:i] + v[i + 1 :]
-        p = gs.idw(xs, ys, vs, [x[i]], [y[i]], power=power, max_neighbors=max_neighbors)
-        preds.append(float(p[0]))
-    return preds
+    for i in range(len(x)):
+        xs, ys, vs = x[:i] + x[i + 1:], y[:i] + y[i + 1:], v[:i] + v[i + 1:]
+        preds.append(float(gs.knn(xs, ys, vs, [x[i]], [y[i]], k=k)[0]))
+    return vecv(v, preds)
 
 
-def _loo_knn(x, y, v, k, max_neighbors):
-    """Manual leave-one-out k-NN predictions (see `_loo_idw`)."""
-    n = len(x)
-    preds = []
-    for i in range(n):
-        xs = x[:i] + x[i + 1 :]
-        ys = y[:i] + y[i + 1 :]
-        vs = v[:i] + v[i + 1 :]
-        p = gs.knn(xs, ys, vs, [x[i]], [y[i]], k=k)
-        preds.append(float(p[0]))
-    return preds
-
-
-def bootstrap_vecv_ci(obs, preds_by_method, n_boot=2000, seed=42):
-    """95% CI for VEcv per method via a nonparametric bootstrap: resample
-    point indices with replacement (the SAME resample for every method each
-    iteration, for a fair paired comparison), recompute VEcv on the
-    resampled observed/predicted pairs, and take the 2.5/97.5 percentiles
-    of the resulting distribution."""
+def block_bootstrap(x, y, obs, preds_by_method, block=500.0, n_boot=2000, seed=42):
+    """Paired spatial block bootstrap: resample 500 m blocks (not points) with
+    replacement, the same resample for every method, and return per-method
+    VEcv CIs and CIs of the pairwise differences against ordinary kriging."""
     rng = random.Random(seed)
-    n = len(obs)
-    obs = list(obs)
+    bx0, by0 = min(x), min(y)
+    blocks = {}
+    for i, (a, b) in enumerate(zip(x, y)):
+        blocks.setdefault((int((a - bx0) // block), int((b - by0) // block)), []).append(i)
+    keys = list(blocks)
     boot = {m: [] for m in preds_by_method}
     for _ in range(n_boot):
-        idx = [rng.randrange(n) for _ in range(n)]
+        idx = [i for _ in keys for i in blocks[rng.choice(keys)]]
         o = [obs[i] for i in idx]
-        for m, preds in preds_by_method.items():
-            p = [preds[i] for i in idx]
-            boot[m].append(vecv(o, p))
-    out = {}
-    for m, vals in boot.items():
-        vals.sort()
-        lo = vals[int(0.025 * n_boot)]
-        hi = vals[min(int(0.975 * n_boot), n_boot - 1)]
-        out[m] = (lo, hi)
-    return out
+        for m, pr in preds_by_method.items():
+            boot[m].append(vecv(o, [pr[i] for i in idx]))
+    q = lambda vals: (sorted(vals)[int(0.025 * n_boot)], sorted(vals)[min(int(0.975 * n_boot), n_boot - 1)])
+    ci = {m: q(vals) for m, vals in boot.items()}
+    ref = "ordinary kriging"
+    diff = {m: q([a - b for a, b in zip(boot[ref], boot[m])]) for m in boot if m != ref}
+    return ci, diff, len(keys)
 
 
 def fig_compare():
-    """Leave-one-out VEcv by method on Meuse log-zinc, with a bootstrap 95%
-    CI (AUDIT/review follow-up: point-estimate rankings alone do not show
-    whether e.g. IDW and k-NN's near-tied VEcv exceeds LOO sampling noise)."""
+    """Leave-one-out VEcv by method on Meuse log-zinc, every method with the
+    same 32-point neighbourhood and its own parameters chosen without the
+    left-out point: the OK variogram is refitted in each fold, and the IDW
+    power and the k-NN k are tuned by an inner leave-one-out (nested CV).
+    CIs come from a paired 500 m spatial block bootstrap; OK standardized
+    errors assess the kriging variance."""
     x, y, v = meuse()
-    cmp = gs.compare_methods(x, y, v, max_neighbors=32, knn_k=8)
-    label = {
-        "ordinary_kriging": "ordinary kriging",
-        "idw": "IDW",
-        "knn": "k-NN",
-        "nearest_neighbor": "nearest neighbour",
-    }
-
-    # Per-point LOO predictions for the bootstrap, matching compare_methods'
-    # internal configuration exactly (max_neighbors=32, IDW power 2, k=8/1).
-    model = gs.fit_variogram(x, y, v, n_lags=15)
-    ok_cv = gs.loo_cv(x, y, v, model, method="ordinary", max_neighbors=32)
-    preds_by_method = {
-        "ordinary kriging": [float(p) for p in ok_cv["predicted"]],
-        "IDW": _loo_idw(x, y, v, power=2.0, max_neighbors=32),
-        "k-NN": _loo_knn(x, y, v, k=8, max_neighbors=32),
-        "nearest neighbour": _loo_knn(x, y, v, k=1, max_neighbors=32),
-    }
-    ci = bootstrap_vecv_ci(v, preds_by_method)
-
-    rows = [(label[k], m["vecv"], m["rmse"], *ci[label[k]]) for k, m in cmp.items()]
+    n = len(x)
+    pred = {m: [] for m in ("ordinary kriging", "IDW", "k-NN", "nearest neighbour")}
+    z, powers, ks = [], [], []
+    for i in range(n):
+        xs, ys, vs = x[:i] + x[i + 1:], y[:i] + y[i + 1:], v[:i] + v[i + 1:]
+        model = gs.fit_variogram(xs, ys, vs, n_lags=15, max_dist=1500.0)
+        p, var = gs.krige(xs, ys, vs, model, [x[i]], [y[i]], method="ordinary",
+                          max_neighbors=MEUSE_NB)
+        pred["ordinary kriging"].append(float(p[0]))
+        z.append((v[i] - float(p[0])) / math.sqrt(float(var[0])))
+        t = gs.tune_idw_power(xs, ys, vs, powers=IDW_POWERS, max_neighbors=MEUSE_NB)
+        powers.append(t["best"])
+        pred["IDW"].append(float(gs.idw(xs, ys, vs, [x[i]], [y[i]], power=t["best"],
+                                        max_neighbors=MEUSE_NB)[0]))
+        k = max(KNN_KS, key=lambda kk: _knn_loo_vecv(xs, ys, vs, kk))
+        ks.append(k)
+        pred["k-NN"].append(float(gs.knn(xs, ys, vs, [x[i]], [y[i]], k=k)[0]))
+        pred["nearest neighbour"].append(float(gs.knn(xs, ys, vs, [x[i]], [y[i]], k=1)[0]))
+    ci, diff, n_blocks = block_bootstrap(x, y, v, pred)
+    rows = [(m, vecv(v, pr), math.sqrt(sum((a - b) ** 2 for a, b in zip(v, pr)) / n), *ci[m])
+            for m, pr in pred.items()]
     rows.sort(key=lambda r: -r[1])
-    write_csv(
-        OUT / "compare_vecv.csv",
-        ["method", "vecv", "rmse", "vecv_lo", "vecv_hi"],
-        rows,
-    )
+    write_csv(OUT / "compare_vecv.csv", ["method", "vecv", "rmse", "vecv_lo", "vecv_hi"], rows)
+    zm = sum(z) / n
+    meta = {
+        "neighbourhood": MEUSE_NB, "n_blocks": n_blocks, "block_m": 500.0,
+        "diff_vs_ok_ci95": {m: list(c) for m, c in diff.items()},
+        "ok_standardized_error": {"mean": zm, "variance": sum((a - zm) ** 2 for a in z) / (n - 1)},
+        "idw_power_chosen": {str(p_): powers.count(p_) for p_ in sorted(set(powers))},
+        "knn_k_chosen": {str(k_): ks.count(k_) for k_ in sorted(set(ks))},
+    }
+    (OUT / "compare_meta.json").write_text(json.dumps(meta, indent=1) + "\n")
+    print("  compare:", {r[0]: round(r[1], 1) for r in rows}, "| z", round(zm, 3),
+          round(meta["ok_standardized_error"]["variance"], 3))
 
 
 def fig_idw_tune():
-    """IDW power tuning trace (VEcv vs power)."""
+    """IDW power tuning trace (VEcv vs power), same 32-point neighbourhood
+    as the comparison."""
     x, y, v = meuse()
-    res = gs.tune_idw_power(x, y, v, powers=[0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5])
+    res = gs.tune_idw_power(x, y, v, powers=IDW_POWERS, max_neighbors=MEUSE_NB)
     rows = [(p, s) for p, s in res["trace"]]
     write_csv(OUT / "idw_tune.csv", ["power", "vecv"], rows)
     print(f"  best IDW power = {res['best']} (VEcv {res['best_vecv']:.1f})")
