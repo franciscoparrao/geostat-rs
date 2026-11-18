@@ -525,3 +525,18 @@ Computers & Geosciences.
 - La tabla depende de la versión de smelt (el RF cambió entre junio y 0.8.1):
   declarar versiones al regenerar (`figures/make_figure_data.py` las guarda en
   `figures/data/multielement_meta.json`).
+
+## Estrategia de publicación vigente (2026-11-11)
+- Reviews simulados: Mathematical Geosciences → Major/borderline Reject (sin método
+  nuevo); Computers & Geosciences → Reject unánime (criterio 4 de C&G y gstlearn, que
+  ya es un núcleo C++ compartido con Python y R). Reviews en
+  `~/vault/journals/{mathematical-geosciences,computers-geosciences}/reviews-generated/`.
+- Plan: (1) el motor como paper de software (JOSS o SoftwareX); (2) un paper
+  metodológico aparte sobre SGS como aproximación de Vecchia (camino max-min, regla
+  para el número de vecinos con objetivo de KL, KL escalable de configuraciones SGS).
+  La validación agrupada de relaves NO es el paper metodológico: se superpone con
+  `paradoja-sintetica`, sometido a MG el 2026-09-23.
+- Literatura de terceros (PDFs) va en `docs/literatura/` (gitignored, no publicar).
+- Errores del manuscrito ya detectados y aún sin corregir: la CI de bit-identidad no
+  fija hilos (la prueba con 1 y 16 hilos fue manual); los alcances 57-224 m del
+  variograma de relaves son parámetros de escala (Y exponencial ≈ 613 m práctico).

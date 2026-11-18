@@ -34,3 +34,6 @@ data/relaves/*.pkl
 bench/synth_model.json
 bench/agreement_v2.json
 validation/out/stale_*/
+
+# PDFs de literatura con derechos de autor (no publicar)
+docs/literatura/
